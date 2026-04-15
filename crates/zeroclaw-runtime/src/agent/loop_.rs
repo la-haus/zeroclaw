@@ -999,6 +999,7 @@ pub async fn run_tool_call_loop(
             provider: active_provider_name.to_string(),
             model: active_model.to_string(),
             messages_count: history.len(),
+            prompt_content: None,
         });
         runtime_trace::record_event(
             "llm_request",
@@ -1189,6 +1190,7 @@ pub async fn run_tool_call_loop(
                     error_message: None,
                     input_tokens: resp_input_tokens,
                     output_tokens: resp_output_tokens,
+                    response_content: None,
                 });
 
                 // Record cost via task-local tracker (no-op when not scoped)
@@ -1304,6 +1306,7 @@ pub async fn run_tool_call_loop(
                     error_message: Some(safe_error.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    response_content: None,
                 });
                 runtime_trace::record_event(
                     "llm_response",
