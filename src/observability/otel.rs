@@ -7,7 +7,15 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use parking_lot::Mutex;
 use std::any::Any;
+use std::sync::OnceLock;
 use std::time::SystemTime;
+
+/// Cached OTLP providers — initialized once, reused across all OtelObserver
+/// instances. ZeroClaw creates a new observer per agent session (gateway
+/// webhook, WebSocket, CLI), which previously replaced the global tracer/meter
+/// providers each time, causing buffered spans to be lost.
+static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
+static METER_PROVIDER: OnceLock<SdkMeterProvider> = OnceLock::new();
 
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
 pub struct OtelObserver {
@@ -57,49 +65,61 @@ impl OtelObserver {
     /// Falls back to `http://localhost:4318` if no endpoint is provided.
     pub fn new(endpoint: Option<&str>, service_name: Option<&str>) -> Result<Self, String> {
         let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
-        let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
-        let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
         let service_name = service_name.unwrap_or("zeroclaw");
 
-        // ── Trace exporter ──────────────────────────────────────
-        let span_exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_endpoint(&traces_endpoint)
-            .build()
-            .map_err(|e| format!("Failed to create OTLP span exporter: {e}"))?;
+        // ── OTLP providers (singleton) ──────────────────────────
+        // ZeroClaw creates a new OtelObserver per agent session. Without
+        // this guard, each session replaces the global tracer/meter provider,
+        // flushing the batch exporter pipeline and losing buffered spans.
+        let tracer_provider = TRACER_PROVIDER
+            .get_or_init(|| {
+                let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
+                let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+                    .with_http()
+                    .with_endpoint(&traces_endpoint)
+                    .build()
+                    .expect("Failed to create OTLP span exporter");
 
-        let tracer_provider = SdkTracerProvider::builder()
-            .with_batch_exporter(span_exporter)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name(service_name.to_string())
-                    .build(),
-            )
-            .build();
+                let provider = SdkTracerProvider::builder()
+                    .with_batch_exporter(span_exporter)
+                    .with_resource(
+                        opentelemetry_sdk::Resource::builder()
+                            .with_service_name(service_name.to_string())
+                            .build(),
+                    )
+                    .build();
 
-        global::set_tracer_provider(tracer_provider.clone());
+                global::set_tracer_provider(provider.clone());
+                provider
+            })
+            .clone();
 
-        // ── Metric exporter ─────────────────────────────────────
-        let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
-            .with_http()
-            .with_endpoint(&metrics_endpoint)
-            .build()
-            .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
+        let meter_provider = METER_PROVIDER
+            .get_or_init(|| {
+                let metrics_endpoint =
+                    format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
+                let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+                    .with_http()
+                    .with_endpoint(&metrics_endpoint)
+                    .build()
+                    .expect("Failed to create OTLP metric exporter");
 
-        let metric_reader =
-            opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
+                let metric_reader =
+                    opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
 
-        let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-            .with_reader(metric_reader)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name(service_name.to_string())
-                    .build(),
-            )
-            .build();
+                let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+                    .with_reader(metric_reader)
+                    .with_resource(
+                        opentelemetry_sdk::Resource::builder()
+                            .with_service_name(service_name.to_string())
+                            .build(),
+                    )
+                    .build();
 
-        let meter_provider_clone = meter_provider.clone();
-        global::set_meter_provider(meter_provider);
+                global::set_meter_provider(provider.clone());
+                provider
+            })
+            .clone();
 
         // ── Create metric instruments ────────────────────────────
         let meter = global::meter("zeroclaw");
@@ -191,7 +211,7 @@ impl OtelObserver {
 
         Ok(Self {
             tracer_provider,
-            meter_provider: meter_provider_clone,
+            meter_provider,
             agent_starts,
             agent_duration,
             llm_calls,
