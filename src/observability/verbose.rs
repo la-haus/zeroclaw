@@ -20,6 +20,7 @@ impl Observer for VerboseObserver {
                 provider,
                 model,
                 messages_count,
+                ..
             } => {
                 eprintln!("> Thinking");
                 eprintln!(
@@ -40,6 +41,7 @@ impl Observer for VerboseObserver {
                 tool,
                 duration,
                 success,
+                ..
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 eprintln!("< Tool {tool} (success={success}, duration_ms={ms})");
@@ -80,6 +82,7 @@ mod tests {
             provider: "openrouter".into(),
             model: "claude".into(),
             messages_count: 3,
+            prompt_content: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             provider: "openrouter".into(),
@@ -89,6 +92,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(50),
             output_tokens: Some(25),
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),
@@ -98,6 +102,7 @@ mod tests {
             tool: "shell".into(),
             duration: Duration::from_millis(2),
             success: true,
+            output: None,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
     }

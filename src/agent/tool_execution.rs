@@ -62,6 +62,7 @@ pub(crate) async fn execute_one_tool(
             tool: call_name.to_string(),
             duration,
             success: false,
+            output: None,
         });
         return Ok(ToolExecutionOutcome {
             output: reason.clone(),
@@ -88,6 +89,7 @@ pub(crate) async fn execute_one_tool(
                 tool: call_name.to_string(),
                 duration,
                 success: r.success,
+                output: None,
             });
             if r.success {
                 Ok(ToolExecutionOutcome {
@@ -112,6 +114,7 @@ pub(crate) async fn execute_one_tool(
                 tool: call_name.to_string(),
                 duration,
                 success: false,
+                output: None,
             });
             let reason = format!("Error executing {call_name}: {e}");
             Ok(ToolExecutionOutcome {

@@ -18,6 +18,28 @@ use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Whether optional prompt/response content should be included in OTEL traces.
+///
+/// Controlled by `ZEROCLAW_OTEL_TRACE_CONTENT=true|1`. Disabled by default
+/// to avoid leaking sensitive data into telemetry backends.
+fn trace_content_enabled() -> bool {
+    std::env::var("ZEROCLAW_OTEL_TRACE_CONTENT")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
+/// Truncate a string to at most `max_bytes`, respecting UTF-8 char boundaries.
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
+}
+
 /// Events emitted during a streamed agent turn.
 ///
 /// Consumers receive these through a `tokio::sync::mpsc::Sender<TurnEvent>`
@@ -689,28 +711,45 @@ impl Agent {
         }
 
         // First try to find tool in static registry, then in activated MCP tools.
+        let trace_content = trace_content_enabled();
         let (result, success) =
             if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
                 match tool.execute(tool_args.clone()).await {
                     Ok(r) => {
+                        let output_text = if r.success {
+                            r.output.clone()
+                        } else {
+                            format!("Error: {}", r.error.as_deref().unwrap_or(&r.output))
+                        };
                         self.observer.record_event(&ObserverEvent::ToolCall {
                             tool: tool_name.clone(),
                             duration: start.elapsed(),
                             success: r.success,
+                            output: if trace_content {
+                                Some(truncate_utf8(&output_text, 4096))
+                            } else {
+                                None
+                            },
                         });
                         if r.success {
                             (r.output, true)
                         } else {
-                            (format!("Error: {}", r.error.unwrap_or(r.output)), false)
+                            (output_text, false)
                         }
                     }
                     Err(e) => {
+                        let err_msg = format!("Error executing {}: {e}", tool_name);
                         self.observer.record_event(&ObserverEvent::ToolCall {
                             tool: tool_name.clone(),
                             duration: start.elapsed(),
                             success: false,
+                            output: if trace_content {
+                                Some(truncate_utf8(&err_msg, 4096))
+                            } else {
+                                None
+                            },
                         });
-                        (format!("Error executing {}: {e}", tool_name), false)
+                        (err_msg, false)
                     }
                 }
             } else if let Some(activated_arc) = self.activated_tools.as_ref() {
@@ -718,24 +757,40 @@ impl Agent {
                 if let Some(tool) = activated_opt {
                     match tool.execute(tool_args.clone()).await {
                         Ok(r) => {
+                            let output_text = if r.success {
+                                r.output.clone()
+                            } else {
+                                format!("Error: {}", r.error.as_deref().unwrap_or(&r.output))
+                            };
                             self.observer.record_event(&ObserverEvent::ToolCall {
                                 tool: tool_name.clone(),
                                 duration: start.elapsed(),
                                 success: r.success,
+                                output: if trace_content {
+                                    Some(truncate_utf8(&output_text, 4096))
+                                } else {
+                                    None
+                                },
                             });
                             if r.success {
                                 (r.output, true)
                             } else {
-                                (format!("Error: {}", r.error.unwrap_or(r.output)), false)
+                                (output_text, false)
                             }
                         }
                         Err(e) => {
+                            let err_msg = format!("Error executing {}: {e}", tool_name);
                             self.observer.record_event(&ObserverEvent::ToolCall {
                                 tool: tool_name.clone(),
                                 duration: start.elapsed(),
                                 success: false,
+                                output: if trace_content {
+                                    Some(truncate_utf8(&err_msg, 4096))
+                                } else {
+                                    None
+                                },
                             });
-                            (format!("Error executing {}: {e}", tool_name), false)
+                            (err_msg, false)
                         }
                     }
                 } else {
@@ -917,10 +972,16 @@ impl Agent {
                 });
             }
 
+            let trace_content = trace_content_enabled();
             self.observer.record_event(&ObserverEvent::LlmRequest {
                 provider: self.provider_name.clone(),
                 model: effective_model.clone(),
                 messages_count: messages.len(),
+                prompt_content: if trace_content {
+                    serde_json::to_string(&messages).ok()
+                } else {
+                    None
+                },
             });
             let llm_start = Instant::now();
 
@@ -954,6 +1015,11 @@ impl Agent {
                         error_message: None,
                         input_tokens: inp,
                         output_tokens: out,
+                        response_content: if trace_content {
+                            resp.text.clone()
+                        } else {
+                            None
+                        },
                     });
                     resp
                 }
@@ -966,6 +1032,7 @@ impl Agent {
                         error_message: Some(err.to_string()),
                         input_tokens: None,
                         output_tokens: None,
+                        response_content: None,
                     });
                     return Err(err);
                 }
@@ -1146,10 +1213,16 @@ impl Agent {
             // forward deltas.  Otherwise fall back to non-streaming chat.
             use futures_util::StreamExt;
 
+            let trace_content = trace_content_enabled();
             self.observer.record_event(&ObserverEvent::LlmRequest {
                 provider: self.provider_name.clone(),
                 model: effective_model.clone(),
                 messages_count: messages.len(),
+                prompt_content: if trace_content {
+                    serde_json::to_string(&messages).ok()
+                } else {
+                    None
+                },
             });
             let llm_start = Instant::now();
 
@@ -1240,6 +1313,11 @@ impl Agent {
                     error_message: stream_error.clone(),
                     input_tokens: None,
                     output_tokens: None,
+                    response_content: if trace_content && stream_error.is_none() {
+                        Some(streamed_text.clone())
+                    } else {
+                        None
+                    },
                 });
             }
 
@@ -1288,6 +1366,11 @@ impl Agent {
                             error_message: None,
                             input_tokens: inp,
                             output_tokens: out,
+                            response_content: if trace_content {
+                                resp.text.clone()
+                            } else {
+                                None
+                            },
                         });
                         resp
                     }
@@ -1300,6 +1383,7 @@ impl Agent {
                             error_message: Some(err.to_string()),
                             input_tokens: None,
                             output_tokens: None,
+                            response_content: None,
                         });
                         self.observer.record_event(&ObserverEvent::AgentEnd {
                             provider: self.provider_name.clone(),

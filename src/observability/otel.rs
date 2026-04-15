@@ -56,6 +56,9 @@ pub struct OtelObserver {
     /// Tool arguments from the last `ToolCallStart`, pending attachment
     /// to the next `ToolCall` span.
     pending_tool_args: Mutex<Option<String>>,
+    /// Prompt content from the last `LlmRequest`, pending attachment
+    /// to the next `LlmResponse` span as `gen_ai.content.prompt`.
+    pending_prompt_content: Mutex<Option<String>>,
 }
 
 impl OtelObserver {
@@ -231,6 +234,7 @@ impl OtelObserver {
             agent_context: Mutex::new(None),
             pending_messages_count: Mutex::new(None),
             pending_tool_args: Mutex::new(None),
+            pending_prompt_content: Mutex::new(None),
         })
     }
 }
@@ -287,6 +291,7 @@ impl Observer for OtelObserver {
                 // or ToolCallStart events (e.g. timeout before response).
                 self.pending_messages_count.lock().take();
                 self.pending_tool_args.lock().take();
+                self.pending_prompt_content.lock().take();
 
                 // Finalize and end the root span created at AgentStart.
                 let cx = self.agent_context.lock().take();
@@ -322,9 +327,17 @@ impl Observer for OtelObserver {
             }
 
             // ── LLM calls: child spans with token attributes ────
-            ObserverEvent::LlmRequest { messages_count, .. } => {
+            ObserverEvent::LlmRequest {
+                messages_count,
+                prompt_content,
+                ..
+            } => {
                 tracing::info!(messages_count, "[otel-diag] LlmRequest received");
                 *self.pending_messages_count.lock() = Some(*messages_count);
+                // Stash prompt content for the next LlmResponse span.
+                if let Some(content) = prompt_content {
+                    self.pending_prompt_content.lock().replace(content.clone());
+                }
             }
             ObserverEvent::LlmResponse {
                 provider,
@@ -334,6 +347,7 @@ impl Observer for OtelObserver {
                 error_message,
                 input_tokens,
                 output_tokens,
+                response_content,
             } => {
                 let has_parent = self.agent_context.lock().is_some();
                 tracing::info!(
@@ -378,6 +392,17 @@ impl Observer for OtelObserver {
                 if let Some(count) = self.pending_messages_count.lock().take() {
                     attrs.push(KeyValue::new("messages_count", count as i64));
                 }
+                // Attach prompt content from the preceding LlmRequest (opt-in).
+                if let Some(prompt) = self.pending_prompt_content.lock().take() {
+                    attrs.push(KeyValue::new("gen_ai.content.prompt", prompt));
+                }
+                // Attach response content (opt-in via ZEROCLAW_OTEL_TRACE_CONTENT).
+                if let Some(completion) = response_content {
+                    attrs.push(KeyValue::new(
+                        "gen_ai.content.completion",
+                        completion.clone(),
+                    ));
+                }
 
                 let builder = SpanBuilder::from_name("llm.call")
                     .with_kind(SpanKind::Client)
@@ -409,6 +434,7 @@ impl Observer for OtelObserver {
                 tool,
                 duration,
                 success,
+                output,
             } => {
                 let has_parent = self.agent_context.lock().is_some();
                 tracing::info!(
@@ -439,6 +465,11 @@ impl Observer for OtelObserver {
                         args
                     };
                     attrs.push(KeyValue::new("tool.arguments", truncated));
+                }
+                // Attach tool output (opt-in via ZEROCLAW_OTEL_TRACE_CONTENT).
+                // Already truncated to 4 KiB by the caller.
+                if let Some(out) = output {
+                    attrs.push(KeyValue::new("tool.output", out.clone()));
                 }
 
                 let builder = SpanBuilder::from_name("tool.call")
@@ -688,6 +719,7 @@ mod tests {
             provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             messages_count: 2,
+            prompt_content: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             provider: "openrouter".into(),
@@ -697,6 +729,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "openrouter".into(),
@@ -720,11 +753,13 @@ mod tests {
             tool: "shell".into(),
             duration: Duration::from_millis(10),
             success: true,
+            output: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "file_read".into(),
             duration: Duration::from_millis(5),
             success: false,
+            output: None,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
         obs.record_event(&ObserverEvent::ChannelMessage {
@@ -760,6 +795,7 @@ mod tests {
             provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             messages_count: 5,
+            prompt_content: None,
         });
         assert_eq!(*obs.pending_messages_count.lock(), Some(5));
 
@@ -772,6 +808,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(1200),
             output_tokens: Some(350),
+            response_content: None,
         });
         assert!(obs.pending_messages_count.lock().is_none());
 
@@ -787,6 +824,7 @@ mod tests {
             tool: "shell".into(),
             duration: Duration::from_millis(50),
             success: true,
+            output: None,
         });
         assert!(obs.pending_tool_args.lock().is_none());
 
@@ -822,11 +860,13 @@ mod tests {
             error_message: None,
             input_tokens: Some(50),
             output_tokens: Some(20),
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "file_read".into(),
             duration: Duration::from_millis(5),
             success: true,
+            output: None,
         });
         obs.record_event(&ObserverEvent::Error {
             component: "gateway".into(),
@@ -850,6 +890,7 @@ mod tests {
             error_message: Some("429 Too Many Requests".into()),
             input_tokens: None,
             output_tokens: None,
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "anthropic".into(),
@@ -878,6 +919,7 @@ mod tests {
             tool: "shell".into(),
             duration: Duration::from_millis(10),
             success: true,
+            output: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "anthropic".into(),
@@ -928,6 +970,7 @@ mod tests {
             error_message: Some("404 Not Found".into()),
             input_tokens: None,
             output_tokens: None,
+            response_content: None,
         });
     }
 

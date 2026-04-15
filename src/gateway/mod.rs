@@ -1455,6 +1455,7 @@ async fn handle_webhook(
             provider: provider_label.clone(),
             model: model_label.clone(),
             messages_count: 1,
+            prompt_content: None,
         });
 
     match run_gateway_chat_simple(&state, message).await {
@@ -1470,6 +1471,7 @@ async fn handle_webhook(
                     error_message: None,
                     input_tokens: None,
                     output_tokens: None,
+                    response_content: None,
                 });
             state.observer.record_metric(
                 &crate::observability::traits::ObserverMetric::RequestLatency(duration),
@@ -1501,6 +1503,7 @@ async fn handle_webhook(
                     error_message: Some(sanitized.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    response_content: None,
                 });
             state.observer.record_metric(
                 &crate::observability::traits::ObserverMetric::RequestLatency(duration),

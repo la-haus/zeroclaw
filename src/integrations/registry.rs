@@ -297,7 +297,10 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Local model server",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if matches!(c.default_provider.as_deref(), Some("lmstudio" | "lm-studio")) {
+                if matches!(
+                    c.default_provider.as_deref(),
+                    Some("lmstudio" | "lm-studio")
+                ) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
