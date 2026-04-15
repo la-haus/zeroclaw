@@ -242,6 +242,11 @@ impl Observer for OtelObserver {
         match event {
             // ── Agent lifecycle: root span ───────────────────────
             ObserverEvent::AgentStart { provider, model } => {
+                tracing::info!(
+                    provider = %provider,
+                    model = %model,
+                    "[otel-diag] AgentStart received — creating root span"
+                );
                 self.agent_starts.add(
                     1,
                     &[
@@ -261,6 +266,7 @@ impl Observer for OtelObserver {
                 );
                 let cx = Context::current_with_span(span);
                 *self.agent_context.lock() = Some(cx);
+                tracing::info!("[otel-diag] AgentStart — root span stored in agent_context");
             }
             ObserverEvent::AgentEnd {
                 provider,
@@ -270,6 +276,12 @@ impl Observer for OtelObserver {
                 cost_usd,
             } => {
                 let secs = duration.as_secs_f64();
+                tracing::info!(
+                    provider = %provider,
+                    duration_s = secs,
+                    tokens = ?tokens_used,
+                    "[otel-diag] AgentEnd received"
+                );
 
                 // Clear any stale pending state from incomplete LlmRequest
                 // or ToolCallStart events (e.g. timeout before response).
@@ -278,6 +290,7 @@ impl Observer for OtelObserver {
 
                 // Finalize and end the root span created at AgentStart.
                 let cx = self.agent_context.lock().take();
+                let had_context = cx.is_some();
                 if let Some(cx) = cx {
                     let span = cx.span();
                     span.set_attribute(KeyValue::new("duration_s", secs));
@@ -289,6 +302,12 @@ impl Observer for OtelObserver {
                     }
                     span.set_status(Status::Ok);
                     span.end();
+                    tracing::info!("[otel-diag] AgentEnd — root span ended");
+                }
+                if !had_context {
+                    tracing::warn!(
+                        "[otel-diag] AgentEnd — no agent_context found (AgentStart not received?)"
+                    );
                 }
 
                 self.agent_duration.record(
@@ -304,6 +323,7 @@ impl Observer for OtelObserver {
 
             // ── LLM calls: child spans with token attributes ────
             ObserverEvent::LlmRequest { messages_count, .. } => {
+                tracing::info!(messages_count, "[otel-diag] LlmRequest received");
                 *self.pending_messages_count.lock() = Some(*messages_count);
             }
             ObserverEvent::LlmResponse {
@@ -315,6 +335,16 @@ impl Observer for OtelObserver {
                 input_tokens,
                 output_tokens,
             } => {
+                let has_parent = self.agent_context.lock().is_some();
+                tracing::info!(
+                    provider = %provider,
+                    model = %model,
+                    success,
+                    input_tokens = ?input_tokens,
+                    output_tokens = ?output_tokens,
+                    has_parent,
+                    "[otel-diag] LlmResponse received — creating llm.call span"
+                );
                 let secs = duration.as_secs_f64();
                 let metric_attrs = [
                     KeyValue::new("provider", provider.clone()),
@@ -371,7 +401,8 @@ impl Observer for OtelObserver {
             }
 
             // ── Tool calls: child spans with arguments ──────────
-            ObserverEvent::ToolCallStart { arguments, .. } => {
+            ObserverEvent::ToolCallStart { tool, arguments } => {
+                tracing::info!(tool = %tool, has_args = arguments.is_some(), "[otel-diag] ToolCallStart received");
                 *self.pending_tool_args.lock() = arguments.clone();
             }
             ObserverEvent::ToolCall {
@@ -379,6 +410,14 @@ impl Observer for OtelObserver {
                 duration,
                 success,
             } => {
+                let has_parent = self.agent_context.lock().is_some();
+                tracing::info!(
+                    tool = %tool,
+                    success,
+                    has_parent,
+                    duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                    "[otel-diag] ToolCall received — creating tool.call span"
+                );
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
                     .checked_sub(*duration)
@@ -596,8 +635,9 @@ impl Observer for OtelObserver {
     }
 
     fn flush(&self) {
+        tracing::info!("[otel-diag] flush() called — forcing trace and metric export");
         if let Err(e) = self.tracer_provider.force_flush() {
-            tracing::warn!("OTel trace flush failed: {e}");
+            tracing::warn!("[otel-diag] OTel trace flush failed: {e}");
         }
         if let Err(e) = self.meter_provider.force_flush() {
             tracing::warn!("OTel metric flush failed: {e}");
