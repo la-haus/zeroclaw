@@ -74,6 +74,8 @@ pub struct Agent {
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    /// Provider name for observer events (e.g. `"openrouter"`, `"anthropic"`).
+    provider_name: String,
 }
 
 pub struct AgentBuilder {
@@ -103,6 +105,7 @@ pub struct AgentBuilder {
     autonomy_level: Option<crate::security::AutonomyLevel>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    provider_name: Option<String>,
 }
 
 impl AgentBuilder {
@@ -134,6 +137,7 @@ impl AgentBuilder {
             autonomy_level: None,
             activated_tools: None,
             hook_runner: None,
+            provider_name: None,
         }
     }
 
@@ -279,6 +283,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn provider_name(mut self, name: String) -> Self {
+        self.provider_name = Some(name);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -336,6 +345,7 @@ impl AgentBuilder {
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
             hook_runner: self.hook_runner,
+            provider_name: self.provider_name.unwrap_or_else(|| "unknown".into()),
         })
     }
 }
@@ -545,6 +555,7 @@ impl Agent {
             .observer(observer)
             .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
+            .provider_name(provider_name.to_string())
             .memory_loader(Box::new(DefaultMemoryLoader::new(
                 5,
                 config.memory.min_relevance_score,
@@ -906,6 +917,13 @@ impl Agent {
                 });
             }
 
+            self.observer.record_event(&ObserverEvent::LlmRequest {
+                provider: self.provider_name.clone(),
+                model: effective_model.clone(),
+                messages_count: messages.len(),
+            });
+            let llm_start = Instant::now();
+
             let response = match self
                 .provider
                 .chat(
@@ -922,8 +940,35 @@ impl Agent {
                 )
                 .await
             {
-                Ok(resp) => resp,
-                Err(err) => return Err(err),
+                Ok(resp) => {
+                    let (inp, out) = resp
+                        .usage
+                        .as_ref()
+                        .map(|u| (u.input_tokens, u.output_tokens))
+                        .unwrap_or((None, None));
+                    self.observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: self.provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: llm_start.elapsed(),
+                        success: true,
+                        error_message: None,
+                        input_tokens: inp,
+                        output_tokens: out,
+                    });
+                    resp
+                }
+                Err(err) => {
+                    self.observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: self.provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: llm_start.elapsed(),
+                        success: false,
+                        error_message: Some(err.to_string()),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                    return Err(err);
+                }
             };
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
@@ -994,6 +1039,14 @@ impl Agent {
         user_message: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
     ) -> Result<String> {
+        let turn_start = Instant::now();
+        let mut total_tokens_used: u64 = 0;
+
+        self.observer.record_event(&ObserverEvent::AgentStart {
+            provider: self.provider_name.clone(),
+            model: self.model_name.clone(),
+        });
+
         // ── Preamble (identical to turn) ───────────────────────────────
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
@@ -1074,6 +1127,13 @@ impl Agent {
                             cached.clone(),
                         )));
                     self.trim_history();
+                    self.observer.record_event(&ObserverEvent::AgentEnd {
+                        provider: self.provider_name.clone(),
+                        model: self.model_name.clone(),
+                        duration: turn_start.elapsed(),
+                        tokens_used: None,
+                        cost_usd: None,
+                    });
                     return Ok(cached);
                 }
                 self.observer.record_event(&ObserverEvent::CacheMiss {
@@ -1085,6 +1145,13 @@ impl Agent {
             // Try streaming first; if the provider returns content we
             // forward deltas.  Otherwise fall back to non-streaming chat.
             use futures_util::StreamExt;
+
+            self.observer.record_event(&ObserverEvent::LlmRequest {
+                provider: self.provider_name.clone(),
+                model: effective_model.clone(),
+                messages_count: messages.len(),
+            });
+            let llm_start = Instant::now();
 
             let stream_opts = crate::providers::traits::StreamOptions::new(true);
             let mut stream = self.provider.stream_chat(
@@ -1104,6 +1171,7 @@ impl Agent {
             let mut streamed_text = String::new();
             let mut streamed_tool_calls: Vec<crate::providers::traits::ToolCall> = Vec::new();
             let mut got_stream = false;
+            let mut stream_error: Option<String> = None;
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -1153,11 +1221,27 @@ impl Agent {
                         }
                         crate::providers::traits::StreamEvent::Final => break,
                     },
-                    Err(_) => break,
+                    Err(e) => {
+                        stream_error = Some(e.to_string());
+                        break;
+                    }
                 }
             }
             // Drop the stream so we release the borrow on provider.
             drop(stream);
+
+            // Emit LlmResponse for the streaming path (token usage unavailable)
+            if got_stream || stream_error.is_some() {
+                self.observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: self.provider_name.clone(),
+                    model: effective_model.clone(),
+                    duration: llm_start.elapsed(),
+                    success: stream_error.is_none(),
+                    error_message: stream_error.clone(),
+                    input_tokens: None,
+                    output_tokens: None,
+                });
+            }
 
             // If streaming produced text, use it as the response and
             // check for tool calls via the dispatcher.
@@ -1187,8 +1271,45 @@ impl Agent {
                     )
                     .await
                 {
-                    Ok(resp) => resp,
-                    Err(err) => return Err(err),
+                    Ok(resp) => {
+                        let (inp, out) = resp
+                            .usage
+                            .as_ref()
+                            .map(|u| (u.input_tokens, u.output_tokens))
+                            .unwrap_or((None, None));
+                        if let Some(tokens) = inp.or(out) {
+                            total_tokens_used += tokens;
+                        }
+                        self.observer.record_event(&ObserverEvent::LlmResponse {
+                            provider: self.provider_name.clone(),
+                            model: effective_model.clone(),
+                            duration: llm_start.elapsed(),
+                            success: true,
+                            error_message: None,
+                            input_tokens: inp,
+                            output_tokens: out,
+                        });
+                        resp
+                    }
+                    Err(err) => {
+                        self.observer.record_event(&ObserverEvent::LlmResponse {
+                            provider: self.provider_name.clone(),
+                            model: effective_model.clone(),
+                            duration: llm_start.elapsed(),
+                            success: false,
+                            error_message: Some(err.to_string()),
+                            input_tokens: None,
+                            output_tokens: None,
+                        });
+                        self.observer.record_event(&ObserverEvent::AgentEnd {
+                            provider: self.provider_name.clone(),
+                            model: self.model_name.clone(),
+                            duration: turn_start.elapsed(),
+                            tokens_used: None,
+                            cost_usd: None,
+                        });
+                        return Err(err);
+                    }
                 }
             };
 
@@ -1226,6 +1347,17 @@ impl Agent {
                     )));
                 self.trim_history();
 
+                self.observer.record_event(&ObserverEvent::AgentEnd {
+                    provider: self.provider_name.clone(),
+                    model: self.model_name.clone(),
+                    duration: turn_start.elapsed(),
+                    tokens_used: if total_tokens_used > 0 {
+                        Some(total_tokens_used)
+                    } else {
+                        None
+                    },
+                    cost_usd: None,
+                });
                 return Ok(final_text);
             }
 
@@ -1270,6 +1402,17 @@ impl Agent {
             self.trim_history();
         }
 
+        self.observer.record_event(&ObserverEvent::AgentEnd {
+            provider: self.provider_name.clone(),
+            model: self.model_name.clone(),
+            duration: turn_start.elapsed(),
+            tokens_used: if total_tokens_used > 0 {
+                Some(total_tokens_used)
+            } else {
+                None
+            },
+            cost_usd: None,
+        });
         anyhow::bail!(
             "Agent exceeded maximum tool iterations ({})",
             self.config.max_tool_iterations
@@ -2073,5 +2216,196 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl Observer for RecordingObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            let tag = match event {
+                ObserverEvent::AgentStart { .. } => "AgentStart",
+                ObserverEvent::AgentEnd { .. } => "AgentEnd",
+                ObserverEvent::LlmRequest { .. } => "LlmRequest",
+                ObserverEvent::LlmResponse { .. } => "LlmResponse",
+                ObserverEvent::ToolCall { .. } => "ToolCall",
+                ObserverEvent::ToolCallStart { .. } => "ToolCallStart",
+                _ => "Other",
+            };
+            self.events.lock().push(tag.to_string());
+        }
+        fn record_metric(&self, _: &crate::observability::traits::ObserverMetric) {}
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn provider_name_stored_in_agent() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .provider_name("test-provider".to_string())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        assert_eq!(agent.provider_name, "test-provider");
+    }
+
+    #[test]
+    fn provider_name_defaults_to_unknown() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        assert_eq!(agent.provider_name, "unknown");
+    }
+
+    #[tokio::test]
+    async fn turn_emits_llm_request_and_response_events() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![crate::providers::ChatResponse {
+                text: Some("hello".into()),
+                tool_calls: vec![],
+                usage: Some(crate::providers::traits::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let recorder = Arc::new(RecordingObserver::default());
+        let observer: Arc<dyn Observer> = recorder.clone();
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .provider_name("test-provider".to_string())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let _response = agent.turn("hi").await.unwrap();
+
+        let events = recorder.events.lock().clone();
+        assert!(
+            events.contains(&"LlmRequest".to_string()),
+            "Expected LlmRequest event, got: {events:?}"
+        );
+        assert!(
+            events.contains(&"LlmResponse".to_string()),
+            "Expected LlmResponse event, got: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_emits_agent_start_end_and_llm_events() {
+        let tools_received = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(StreamToolCaptureProvider {
+            tools_received: tools_received.clone(),
+            call_count: Arc::new(Mutex::new(0)),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let recorder = Arc::new(RecordingObserver::default());
+        let observer: Arc<dyn Observer> = recorder.clone();
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .provider_name("test-provider".to_string())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let _response = agent
+            .turn_streamed("use the echo tool", event_tx)
+            .await
+            .unwrap();
+
+        let events = recorder.events.lock().clone();
+        assert!(
+            events.first() == Some(&"AgentStart".to_string()),
+            "First event should be AgentStart, got: {events:?}"
+        );
+        assert!(
+            events.last() == Some(&"AgentEnd".to_string()),
+            "Last event should be AgentEnd, got: {events:?}"
+        );
+        assert!(
+            events.contains(&"LlmRequest".to_string()),
+            "Expected LlmRequest event, got: {events:?}"
+        );
+        assert!(
+            events.contains(&"LlmResponse".to_string()),
+            "Expected LlmResponse event, got: {events:?}"
+        );
     }
 }
