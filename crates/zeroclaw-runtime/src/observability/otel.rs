@@ -13,6 +13,14 @@ use std::time::SystemTime;
 static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 static METER_PROVIDER: OnceLock<SdkMeterProvider> = OnceLock::new();
 
+/// When `ZEROCLAW_OTEL_LANGSMITH_COMPAT=true`, emit additional span attributes
+/// that LangSmith expects (gen_ai.usage.prompt_tokens, langsmith.span.kind, etc.).
+fn langsmith_compat_enabled() -> bool {
+    std::env::var("ZEROCLAW_OTEL_LANGSMITH_COMPAT")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
 pub struct OtelObserver {
     // Span parenting state
@@ -236,13 +244,17 @@ impl Observer for OtelObserver {
 
                 tracing::info!(provider = %provider, model = %model, "[otel-diag] AgentStart — creating root span");
                 // Create root span for the agent invocation
+                let mut agent_attrs = vec![
+                    KeyValue::new("provider", provider.clone()),
+                    KeyValue::new("model", model.clone()),
+                ];
+                if langsmith_compat_enabled() {
+                    agent_attrs.push(KeyValue::new("langsmith.span.kind", "chain"));
+                }
                 let span = tracer.build(
                     opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
                         .with_kind(SpanKind::Internal)
-                        .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
-                            KeyValue::new("model", model.clone()),
-                        ]),
+                        .with_attributes(agent_attrs),
                 );
                 let ctx = Context::current_with_span(span);
                 *self.agent_context.lock() = Some(ctx);
@@ -320,6 +332,19 @@ impl Observer for OtelObserver {
                 }
                 if let Some(content) = response_content {
                     span_attrs.push(KeyValue::new("gen_ai.content.completion", content.clone()));
+                }
+
+                // LangSmith compat: duplicate attributes with LangSmith-expected names
+                if langsmith_compat_enabled() {
+                    span_attrs.push(KeyValue::new("gen_ai.system", provider.clone()));
+                    span_attrs.push(KeyValue::new("gen_ai.request.model", model.clone()));
+                    span_attrs.push(KeyValue::new("langsmith.span.kind", "llm"));
+                    if let Some(input) = input_tokens {
+                        span_attrs.push(KeyValue::new("gen_ai.usage.prompt_tokens", *input as i64));
+                    }
+                    if let Some(output) = output_tokens {
+                        span_attrs.push(KeyValue::new("gen_ai.usage.completion_tokens", *output as i64));
+                    }
                 }
 
                 let builder = opentelemetry::trace::SpanBuilder::from_name("llm.call")
@@ -405,8 +430,9 @@ impl Observer for OtelObserver {
                     KeyValue::new("tool.success", *success),
                     KeyValue::new("duration_s", secs),
                 ];
-                if let Some(args) = self.pending_tool_args.lock().take() {
-                    span_attrs.push(KeyValue::new("tool.arguments", args));
+                let tool_args = self.pending_tool_args.lock().take();
+                if let Some(ref args) = tool_args {
+                    span_attrs.push(KeyValue::new("tool.arguments", args.clone()));
                 }
                 if let Some(out) = output {
                     let truncated = if out.len() > 4096 {
@@ -414,7 +440,18 @@ impl Observer for OtelObserver {
                     } else {
                         out.clone()
                     };
-                    span_attrs.push(KeyValue::new("tool.output", truncated));
+                    span_attrs.push(KeyValue::new("tool.output", truncated.clone()));
+
+                    if langsmith_compat_enabled() {
+                        span_attrs.push(KeyValue::new("output.value", truncated));
+                    }
+                }
+
+                if langsmith_compat_enabled() {
+                    span_attrs.push(KeyValue::new("langsmith.span.kind", "tool"));
+                    if let Some(args) = tool_args {
+                        span_attrs.push(KeyValue::new("input.value", args));
+                    }
                 }
 
                 let builder = opentelemetry::trace::SpanBuilder::from_name("tool.call")
