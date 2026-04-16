@@ -352,6 +352,15 @@ impl Observer for OtelObserver {
                     if let Some(content) = response_content {
                         span_attrs.push(KeyValue::new("gen_ai.completion", content.clone()));
                     }
+                    // langsmith.usage_metadata bypasses the nil-Outputs guard in LangSmith's
+                    // collector-proxy, ensuring tokens are always recorded.
+                    let usage_json = format!(
+                        r#"{{"input_tokens":{},"output_tokens":{},"total_tokens":{}}}"#,
+                        input_tokens.unwrap_or_default(),
+                        output_tokens.unwrap_or_default(),
+                        total
+                    );
+                    span_attrs.push(KeyValue::new("langsmith.usage_metadata", usage_json));
                 }
 
                 let builder = opentelemetry::trace::SpanBuilder::from_name("llm.call")
