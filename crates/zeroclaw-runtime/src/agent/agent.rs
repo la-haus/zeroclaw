@@ -711,6 +711,14 @@ impl Agent {
 
         // First try to find tool in static registry, then in activated MCP tools.
         let tc = trace_content_enabled();
+        self.observer.record_event(&ObserverEvent::ToolCallStart {
+            tool: tool_name.clone(),
+            arguments: if tc {
+                Some(truncate_utf8(&tool_args.to_string(), 1024))
+            } else {
+                None
+            },
+        });
         let (result, success) =
             if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
                 match tool.execute(tool_args.clone()).await {
