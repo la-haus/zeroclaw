@@ -327,8 +327,8 @@ impl Observer for OtelObserver {
                 if let Some(err) = error_message {
                     span_attrs.push(KeyValue::new("error.message", err.clone()));
                 }
-                if let Some(content) = prompt_content {
-                    span_attrs.push(KeyValue::new("gen_ai.content.prompt", content));
+                if let Some(ref content) = prompt_content {
+                    span_attrs.push(KeyValue::new("gen_ai.content.prompt", content.clone()));
                 }
                 if let Some(content) = response_content {
                     span_attrs.push(KeyValue::new("gen_ai.content.completion", content.clone()));
@@ -344,6 +344,13 @@ impl Observer for OtelObserver {
                     }
                     if let Some(output) = output_tokens {
                         span_attrs.push(KeyValue::new("gen_ai.usage.completion_tokens", *output as i64));
+                    }
+                    // LangSmith reads gen_ai.prompt / gen_ai.completion for Input/Output tabs
+                    if let Some(content) = prompt_content {
+                        span_attrs.push(KeyValue::new("gen_ai.prompt", content));
+                    }
+                    if let Some(content) = response_content {
+                        span_attrs.push(KeyValue::new("gen_ai.completion", content.clone()));
                     }
                 }
 
