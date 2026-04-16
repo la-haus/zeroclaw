@@ -1095,6 +1095,11 @@ impl Agent {
         user_message: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
     ) -> Result<String> {
+        tracing::info!(
+            provider = %self.provider_name,
+            observer = self.observer.name(),
+            "[otel-diag] turn_streamed ENTERED"
+        );
         let streamed_start = std::time::Instant::now();
         self.observer.record_event(&ObserverEvent::AgentStart {
             provider: self.provider_name.clone(),

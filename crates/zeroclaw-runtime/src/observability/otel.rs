@@ -234,6 +234,7 @@ impl Observer for OtelObserver {
                     ],
                 );
 
+                tracing::info!(provider = %provider, model = %model, "[otel-diag] AgentStart — creating root span");
                 // Create root span for the agent invocation
                 let span = tracer.build(
                     opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
@@ -251,10 +252,12 @@ impl Observer for OtelObserver {
                 prompt_content,
                 ..
             } => {
+                tracing::info!(messages_count, "[otel-diag] LlmRequest received");
                 *self.pending_messages_count.lock() = Some(*messages_count);
                 *self.pending_prompt_content.lock() = prompt_content.clone();
             }
-            ObserverEvent::ToolCallStart { arguments, .. } => {
+            ObserverEvent::ToolCallStart { tool, arguments } => {
+                tracing::info!(tool = %tool, has_args = arguments.is_some(), "[otel-diag] ToolCallStart received");
                 *self.pending_tool_args.lock() = arguments.clone();
             }
             ObserverEvent::TurnComplete
@@ -270,6 +273,12 @@ impl Observer for OtelObserver {
                 output_tokens,
                 response_content,
             } => {
+                let has_parent = self.agent_context.lock().is_some();
+                tracing::info!(
+                    provider = %provider, model = %model, success, has_parent,
+                    input_tokens = ?input_tokens, output_tokens = ?output_tokens,
+                    "[otel-diag] LlmResponse — creating llm.call span"
+                );
                 let secs = duration.as_secs_f64();
                 let attrs = [
                     KeyValue::new("provider", provider.clone()),
@@ -336,6 +345,11 @@ impl Observer for OtelObserver {
             } => {
                 let secs = duration.as_secs_f64();
 
+                let had_ctx = self.agent_context.lock().is_some();
+                tracing::info!(
+                    provider = %provider, duration_s = secs, tokens = ?tokens_used, had_ctx,
+                    "[otel-diag] AgentEnd received"
+                );
                 // End the root agent span that was created in AgentStart
                 if let Some(ctx) = self.agent_context.lock().take() {
                     let span = ctx.span();
@@ -369,6 +383,12 @@ impl Observer for OtelObserver {
                 success,
                 output,
             } => {
+                let has_parent = self.agent_context.lock().is_some();
+                tracing::info!(
+                    tool = %tool, success, has_parent,
+                    duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                    "[otel-diag] ToolCall received"
+                );
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
                     .checked_sub(*duration)
