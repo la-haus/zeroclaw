@@ -44,13 +44,22 @@ pub async fn execute_one_tool(
 ) -> Result<ToolExecutionOutcome> {
     let trace_content = crate::agent::agent::trace_content_enabled();
     let args_summary = truncate_with_ellipsis(&call_arguments.to_string(), 300);
+    let args_for_event = if trace_content {
+        Some(args_summary.clone())
+    } else {
+        None
+    };
+    tracing::info!(
+        tool = %call_name,
+        trace_content,
+        has_args = args_for_event.is_some(),
+        args_len = args_summary.len(),
+        "[otel-diag] ToolCallStart emitting, args_preview={:?}",
+        &args_summary[..args_summary.len().min(100)]
+    );
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
-        arguments: if trace_content {
-            Some(args_summary)
-        } else {
-            None
-        },
+        arguments: args_for_event,
     });
     let start = Instant::now();
 

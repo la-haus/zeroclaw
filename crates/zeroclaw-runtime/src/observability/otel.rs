@@ -254,7 +254,12 @@ impl Observer for OtelObserver {
                 *self.pending_messages_count.lock() = Some(*messages_count);
                 *self.pending_prompt_content.lock() = prompt_content.clone();
             }
-            ObserverEvent::ToolCallStart { arguments, .. } => {
+            ObserverEvent::ToolCallStart { tool, arguments } => {
+                tracing::info!(
+                    tool = %tool,
+                    has_args = arguments.is_some(),
+                    "[otel-diag] ToolCallStart received in OTEL observer"
+                );
                 *self.pending_tool_args.lock() = arguments.clone();
             }
             ObserverEvent::TurnComplete
@@ -385,7 +390,13 @@ impl Observer for OtelObserver {
                     KeyValue::new("tool.success", *success),
                     KeyValue::new("duration_s", secs),
                 ];
-                if let Some(args) = self.pending_tool_args.lock().take() {
+                let pending_args = self.pending_tool_args.lock().take();
+                tracing::info!(
+                    tool = %tool,
+                    has_pending_args = pending_args.is_some(),
+                    "[otel-diag] ToolCall creating span, pending_args available?"
+                );
+                if let Some(args) = pending_args {
                     span_attrs.push(KeyValue::new("tool.arguments", args));
                 }
                 if let Some(out) = output {
