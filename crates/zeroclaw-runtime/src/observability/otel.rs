@@ -486,12 +486,13 @@ impl Observer for OtelObserver {
 
                 if langsmith_compat_enabled() {
                     span_attrs.push(KeyValue::new("langsmith.span.kind", "tool"));
+                    span_attrs.push(KeyValue::new("tool.name", tool.clone()));
                     if let Some(args) = tool_args {
                         span_attrs.push(KeyValue::new("input.value", args));
                     }
                 }
 
-                let builder = opentelemetry::trace::SpanBuilder::from_name("tool.call")
+                let builder = opentelemetry::trace::SpanBuilder::from_name(format!("tool.call:{}", tool))
                     .with_kind(SpanKind::Internal)
                     .with_start_time(start_time)
                     .with_attributes(span_attrs);
