@@ -23,6 +23,9 @@ fn langsmith_compat_enabled() -> bool {
 
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
 pub struct OtelObserver {
+    // Service identity
+    service_name: String,
+
     // Span parenting state
     agent_context: Mutex<Option<Context>>,
     pending_messages_count: Mutex<Option<usize>>,
@@ -193,6 +196,7 @@ impl OtelObserver {
             .build();
 
         Ok(Self {
+            service_name: service_name.to_string(),
             agent_context: Mutex::new(None),
             pending_messages_count: Mutex::new(None),
             pending_tool_args: Mutex::new(None),
@@ -247,6 +251,7 @@ impl Observer for OtelObserver {
                 let mut agent_attrs = vec![
                     KeyValue::new("provider", provider.clone()),
                     KeyValue::new("model", model.clone()),
+                    KeyValue::new("service.name", self.service_name.clone()),
                 ];
                 if langsmith_compat_enabled() {
                     agent_attrs.push(KeyValue::new("langsmith.span.kind", "chain"));
