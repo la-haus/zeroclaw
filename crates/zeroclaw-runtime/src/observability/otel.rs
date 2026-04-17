@@ -2,11 +2,12 @@ use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt, Tracer};
 use opentelemetry::{Context, KeyValue, global};
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use parking_lot::Mutex;
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
@@ -56,7 +57,11 @@ impl OtelObserver {
     ///
     /// Uses HTTP/protobuf transport (port 4318 by default).
     /// Falls back to `http://localhost:4318` if no endpoint is provided.
-    pub fn new(endpoint: Option<&str>, service_name: Option<&str>) -> Result<Self, String> {
+    pub fn new(
+        endpoint: Option<&str>,
+        service_name: Option<&str>,
+        headers: Option<HashMap<String, String>>,
+    ) -> Result<Self, String> {
         let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
         let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
         let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
@@ -64,9 +69,13 @@ impl OtelObserver {
 
         // ── Singleton tracer provider (OnceLock) ────────────────
         let _tp = TRACER_PROVIDER.get_or_init(|| {
-            let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+            let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
                 .with_http()
-                .with_endpoint(&traces_endpoint)
+                .with_endpoint(&traces_endpoint);
+            if let Some(ref h) = headers {
+                span_builder = span_builder.with_headers(h.clone());
+            }
+            let span_exporter = span_builder
                 .build()
                 .expect("Failed to create OTLP span exporter");
 
@@ -85,9 +94,13 @@ impl OtelObserver {
 
         // ── Singleton meter provider (OnceLock) ─────────────────
         let _mp = METER_PROVIDER.get_or_init(|| {
-            let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+            let mut metric_builder = opentelemetry_otlp::MetricExporter::builder()
                 .with_http()
-                .with_endpoint(&metrics_endpoint)
+                .with_endpoint(&metrics_endpoint);
+            if let Some(ref h) = headers {
+                metric_builder = metric_builder.with_headers(h.clone());
+            }
+            let metric_exporter = metric_builder
                 .build()
                 .expect("Failed to create OTLP metric exporter");
 
@@ -344,6 +357,9 @@ impl Observer for OtelObserver {
                     span_attrs.push(KeyValue::new("gen_ai.system", provider.clone()));
                     span_attrs.push(KeyValue::new("gen_ai.request.model", model.clone()));
                     span_attrs.push(KeyValue::new("langsmith.span.kind", "llm"));
+                    // ls_model_name + ls_provider: required for LangSmith pricing lookup
+                    span_attrs.push(KeyValue::new("ls_model_name", model.clone()));
+                    span_attrs.push(KeyValue::new("ls_provider", provider.clone()));
                     if let Some(input) = input_tokens {
                         span_attrs.push(KeyValue::new("gen_ai.usage.prompt_tokens", *input as i64));
                     }
@@ -682,7 +698,7 @@ mod tests {
     fn test_observer() -> OtelObserver {
         // Create with a dummy endpoint — exports will silently fail
         // but the observer itself works fine for recording
-        OtelObserver::new(Some("http://127.0.0.1:19999"), Some("zeroclaw-test"))
+        OtelObserver::new(Some("http://127.0.0.1:19999"), Some("zeroclaw-test"), None)
             .expect("observer creation should not fail with valid endpoint format")
     }
 
@@ -857,10 +873,59 @@ mod tests {
     #[test]
     fn otel_observer_creation_with_valid_endpoint_succeeds() {
         // Even though endpoint is unreachable, creation should succeed
-        let result = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("zeroclaw-test"));
+        let result = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("zeroclaw-test"), None);
         assert!(
             result.is_ok(),
             "observer creation must succeed even with unreachable endpoint"
+        );
+    }
+
+    #[test]
+    fn otel_observer_creation_with_headers_succeeds() {
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer sk-test".to_string());
+        headers.insert("X-Custom".to_string(), "value".to_string());
+        let result = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("test"), Some(headers));
+        assert!(
+            result.is_ok(),
+            "observer creation with headers must succeed"
+        );
+    }
+
+    #[test]
+    fn otel_observer_with_headers_records_events() {
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer sk-test".to_string());
+        let obs = OtelObserver::new(Some("http://127.0.0.1:19999"), Some("test"), Some(headers))
+            .expect("creation should succeed");
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "anthropic".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(100),
+            success: true,
+            error_message: None,
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            response_content: None,
+        });
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "shell".into(),
+            duration: Duration::from_millis(50),
+            success: true,
+            output: None,
+        });
+    }
+
+    #[test]
+    fn otel_observer_with_empty_headers_succeeds() {
+        let result = OtelObserver::new(
+            Some("http://127.0.0.1:12345"),
+            Some("test"),
+            Some(HashMap::new()),
+        );
+        assert!(
+            result.is_ok(),
+            "observer creation with empty headers must succeed"
         );
     }
 }
