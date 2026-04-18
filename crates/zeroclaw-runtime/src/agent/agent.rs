@@ -1311,6 +1311,23 @@ impl Agent {
                     .as_ref()
                     .map(|u| (u.input_tokens, u.output_tokens))
                     .unwrap_or((None, None));
+                // Build response content: prefer streamed text, fall back to
+                // tool call summary so LangSmith always has an Output value.
+                let response_content = if tc {
+                    if !streamed_text.is_empty() {
+                        Some(truncate_utf8(&streamed_text, 32_768))
+                    } else if !streamed_tool_calls.is_empty() {
+                        let tool_summary: Vec<String> = streamed_tool_calls
+                            .iter()
+                            .map(|tc| format!("{}({})", tc.name, truncate_utf8(&tc.arguments, 512)))
+                            .collect();
+                        Some(format!("[tool_use] {}", tool_summary.join(", ")))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 self.observer.record_event(&ObserverEvent::LlmResponse {
                     provider: self.provider_name.clone(),
                     model: effective_model.clone(),
@@ -1319,11 +1336,7 @@ impl Agent {
                     error_message: None,
                     input_tokens: s_input,
                     output_tokens: s_output,
-                    response_content: if tc {
-                        Some(truncate_utf8(&streamed_text, 32_768))
-                    } else {
-                        None
-                    },
+                    response_content,
                 });
                 // Build a synthetic ChatResponse from streamed text
                 zeroclaw_providers::ChatResponse {
