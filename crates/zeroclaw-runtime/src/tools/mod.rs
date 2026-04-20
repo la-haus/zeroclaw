@@ -346,36 +346,36 @@ pub fn all_tools_with_runtime(
         Arc::new(FileEditTool::new(security.clone())),
         Arc::new(GlobSearchTool::new(security.clone())),
         Arc::new(ContentSearchTool::new(security.clone())),
-        Arc::new(CronAddTool::new(config.clone(), security.clone())),
-        Arc::new(CronListTool::new(config.clone())),
-        Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
-        Arc::new(CronUpdateTool::new(config.clone(), security.clone())),
-        Arc::new(CronRunTool::new(config.clone(), security.clone())),
-        Arc::new(CronRunsTool::new(config.clone())),
-        Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
-        Arc::new(MemoryRecallTool::new(memory.clone())),
-        Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
-        Arc::new(MemoryExportTool::new(memory.clone())),
-        Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
-        Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
-        Arc::new(ModelRoutingConfigTool::new(
-            config.clone(),
-            security.clone(),
-        )),
-        Arc::new(ModelSwitchTool::new(security.clone())),
-        Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
-        Arc::new(GitOperationsTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-        )),
-        Arc::new(PushoverTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-        )),
-        Arc::new(CalculatorTool::new()),
-        Arc::new(WeatherTool::new()),
-        Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
     ];
+
+    // Cron tools: only register when cron subsystem is enabled.
+    if root_config.cron.enabled {
+        tool_arcs.extend([
+            Arc::new(CronAddTool::new(config.clone(), security.clone())) as Arc<dyn Tool>,
+            Arc::new(CronListTool::new(config.clone())),
+            Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
+            Arc::new(CronUpdateTool::new(config.clone(), security.clone())),
+            Arc::new(CronRunTool::new(config.clone(), security.clone())),
+            Arc::new(CronRunsTool::new(config.clone())),
+        ]);
+    }
+
+    tool_arcs.push(Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())));
+    tool_arcs.push(Arc::new(MemoryRecallTool::new(memory.clone())));
+    tool_arcs.push(Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())));
+    tool_arcs.push(Arc::new(MemoryExportTool::new(memory.clone())));
+    tool_arcs.push(Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())));
+    if root_config.scheduler.enabled {
+        tool_arcs.push(Arc::new(ScheduleTool::new(security.clone(), root_config.clone())));
+    }
+    tool_arcs.push(Arc::new(ModelRoutingConfigTool::new(config.clone(), security.clone())));
+    tool_arcs.push(Arc::new(ModelSwitchTool::new(security.clone())));
+    tool_arcs.push(Arc::new(ProxyConfigTool::new(config.clone(), security.clone())));
+    tool_arcs.push(Arc::new(GitOperationsTool::new(security.clone(), workspace_dir.to_path_buf())));
+    tool_arcs.push(Arc::new(PushoverTool::new(security.clone(), workspace_dir.to_path_buf())));
+    tool_arcs.push(Arc::new(CalculatorTool::new()));
+    tool_arcs.push(Arc::new(WeatherTool::new()));
+    tool_arcs.push(Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())));
 
     // Register discord_search if discord_history channel is configured
     if root_config.channels.discord_history.is_some() {
@@ -960,6 +960,17 @@ pub fn all_tools_with_runtime(
             root_config.pipeline.clone(),
             pipeline_tools,
         )));
+    }
+
+    // Remove built-in tools listed in excluded_builtin_tools config.
+    let excluded = &root_config.agent.excluded_builtin_tools;
+    if !excluded.is_empty() {
+        let before = tool_arcs.len();
+        tool_arcs.retain(|t| !excluded.iter().any(|e| e == t.name()));
+        let removed = before - tool_arcs.len();
+        if removed > 0 {
+            tracing::info!("excluded_builtin_tools: removed {removed} tools from registry");
+        }
     }
 
     (
