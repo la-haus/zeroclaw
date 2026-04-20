@@ -360,19 +360,43 @@ pub fn all_tools_with_runtime(
         ]);
     }
 
-    tool_arcs.push(Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())));
+    tool_arcs.push(Arc::new(MemoryStoreTool::new(
+        memory.clone(),
+        security.clone(),
+    )));
     tool_arcs.push(Arc::new(MemoryRecallTool::new(memory.clone())));
-    tool_arcs.push(Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())));
+    tool_arcs.push(Arc::new(MemoryForgetTool::new(
+        memory.clone(),
+        security.clone(),
+    )));
     tool_arcs.push(Arc::new(MemoryExportTool::new(memory.clone())));
-    tool_arcs.push(Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())));
+    tool_arcs.push(Arc::new(MemoryPurgeTool::new(
+        memory.clone(),
+        security.clone(),
+    )));
     if root_config.scheduler.enabled {
-        tool_arcs.push(Arc::new(ScheduleTool::new(security.clone(), root_config.clone())));
+        tool_arcs.push(Arc::new(ScheduleTool::new(
+            security.clone(),
+            root_config.clone(),
+        )));
     }
-    tool_arcs.push(Arc::new(ModelRoutingConfigTool::new(config.clone(), security.clone())));
+    tool_arcs.push(Arc::new(ModelRoutingConfigTool::new(
+        config.clone(),
+        security.clone(),
+    )));
     tool_arcs.push(Arc::new(ModelSwitchTool::new(security.clone())));
-    tool_arcs.push(Arc::new(ProxyConfigTool::new(config.clone(), security.clone())));
-    tool_arcs.push(Arc::new(GitOperationsTool::new(security.clone(), workspace_dir.to_path_buf())));
-    tool_arcs.push(Arc::new(PushoverTool::new(security.clone(), workspace_dir.to_path_buf())));
+    tool_arcs.push(Arc::new(ProxyConfigTool::new(
+        config.clone(),
+        security.clone(),
+    )));
+    tool_arcs.push(Arc::new(GitOperationsTool::new(
+        security.clone(),
+        workspace_dir.to_path_buf(),
+    )));
+    tool_arcs.push(Arc::new(PushoverTool::new(
+        security.clone(),
+        workspace_dir.to_path_buf(),
+    )));
     tool_arcs.push(Arc::new(CalculatorTool::new()));
     tool_arcs.push(Arc::new(WeatherTool::new()));
     tool_arcs.push(Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())));
