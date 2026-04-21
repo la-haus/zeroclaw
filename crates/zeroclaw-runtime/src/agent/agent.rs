@@ -711,15 +711,14 @@ impl Agent {
 
         // Emit ToolCallStart so OTEL observer captures tool arguments
         let tc = trace_content_enabled();
-        self.observer
-            .record_event(&ObserverEvent::ToolCallStart {
-                tool: tool_name.clone(),
-                arguments: if tc {
-                    Some(truncate_utf8(&tool_args.to_string(), 1024))
-                } else {
-                    None
-                },
-            });
+        self.observer.record_event(&ObserverEvent::ToolCallStart {
+            tool: tool_name.clone(),
+            arguments: if tc {
+                Some(truncate_utf8(&tool_args.to_string(), 1024))
+            } else {
+                None
+            },
+        });
 
         // First try to find tool in static registry, then in activated MCP tools.
         let (result, success) =

@@ -5263,10 +5263,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover actions, 'list_accounts' to retrieve connected account IDs, 'execute' to run (optionally with connected_account_id), and 'connect' for OAuth.",
         ));
     }
-    tool_descs.push((
-        "schedule",
-        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
-    ));
+    if config.scheduler.enabled {
+        tool_descs.push((
+            "schedule",
+            "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
+        ));
+    }
     tool_descs.push((
         "pushover",
         "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
@@ -5285,6 +5287,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let excluded = &config.autonomy.non_cli_excluded_tools;
     if !excluded.is_empty() && config.autonomy.level != AutonomyLevel::Full {
         tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+    }
+    // Remove tool descriptions for excluded built-in tools.
+    {
+        let excluded_builtins = &config.agent.excluded_builtin_tools;
+        if !excluded_builtins.is_empty() {
+            tool_descs.retain(|(name, _)| !excluded_builtins.iter().any(|e| e == name));
+        }
     }
 
     let bootstrap_max_chars = if config.agent.compact_context {

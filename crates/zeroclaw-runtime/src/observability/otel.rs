@@ -364,7 +364,10 @@ impl Observer for OtelObserver {
                         span_attrs.push(KeyValue::new("gen_ai.usage.prompt_tokens", *input as i64));
                     }
                     if let Some(output) = output_tokens {
-                        span_attrs.push(KeyValue::new("gen_ai.usage.completion_tokens", *output as i64));
+                        span_attrs.push(KeyValue::new(
+                            "gen_ai.usage.completion_tokens",
+                            *output as i64,
+                        ));
                     }
                     // LangSmith reads gen_ai.prompt / gen_ai.completion for Input/Output tabs
                     if let Some(content) = prompt_content {
@@ -492,10 +495,11 @@ impl Observer for OtelObserver {
                     }
                 }
 
-                let builder = opentelemetry::trace::SpanBuilder::from_name(format!("tool.call:{}", tool))
-                    .with_kind(SpanKind::Internal)
-                    .with_start_time(start_time)
-                    .with_attributes(span_attrs);
+                let builder =
+                    opentelemetry::trace::SpanBuilder::from_name(format!("tool.call:{}", tool))
+                        .with_kind(SpanKind::Internal)
+                        .with_start_time(start_time)
+                        .with_attributes(span_attrs);
 
                 let parent_ctx = self.agent_context.lock().clone();
                 let mut span = child_span!(builder, parent_ctx);

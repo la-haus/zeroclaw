@@ -1441,6 +1441,14 @@ pub struct AgentConfig {
     /// Default: `[]` (no filtering — all tools included).
     #[serde(default)]
     pub tool_filter_groups: Vec<ToolFilterGroup>,
+    /// Built-in tool names to exclude from the tool registry and system prompt.
+    ///
+    /// Unlike `tool_filter_groups` (which only filters MCP tools), this blocklist
+    /// removes built-in tools entirely — they won't be registered, won't appear
+    /// in the system prompt, and won't consume tokens.
+    /// Default: `[]` (all built-in tools available).
+    #[serde(default)]
+    pub excluded_builtin_tools: Vec<String>,
     /// Maximum characters for the assembled system prompt. When `> 0`, the prompt
     /// is truncated to this limit after assembly (keeping the top portion which
     /// contains identity and safety instructions). `0` means unlimited.
@@ -1530,6 +1538,7 @@ impl Default for AgentConfig {
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
             tool_filter_groups: Vec::new(),
+            excluded_builtin_tools: Vec::new(),
             max_system_prompt_chars: default_max_system_prompt_chars(),
             thinking: crate::scattered_types::ThinkingConfig::default(),
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),

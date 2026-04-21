@@ -2286,24 +2286,26 @@ pub async fn run(
             "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
         ));
     }
-    tool_descs.push((
-        "cron_add",
-        "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
-    ));
-    tool_descs.push((
-        "cron_list",
-        "List all cron jobs with schedule, status, and metadata.",
-    ));
-    tool_descs.push(("cron_remove", "Remove a cron job by job_id."));
-    tool_descs.push((
-        "cron_update",
-        "Patch a cron job (schedule, enabled, command/prompt, model, delivery, session_target).",
-    ));
-    tool_descs.push((
-        "cron_run",
-        "Force-run a cron job immediately and record a run history entry.",
-    ));
-    tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
+    if config.cron.enabled {
+        tool_descs.push((
+            "cron_add",
+            "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
+        ));
+        tool_descs.push((
+            "cron_list",
+            "List all cron jobs with schedule, status, and metadata.",
+        ));
+        tool_descs.push(("cron_remove", "Remove a cron job by job_id."));
+        tool_descs.push((
+            "cron_update",
+            "Patch a cron job (schedule, enabled, command/prompt, model, delivery, session_target).",
+        ));
+        tool_descs.push((
+            "cron_run",
+            "Force-run a cron job immediately and record a run history entry.",
+        ));
+        tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
+    }
     tool_descs.push((
         "screenshot",
         "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
@@ -2324,10 +2326,12 @@ pub async fn run(
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
         ));
     }
-    tool_descs.push((
-        "schedule",
-        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
-    ));
+    if config.scheduler.enabled {
+        tool_descs.push((
+            "schedule",
+            "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
+        ));
+    }
     tool_descs.push((
         "model_routing_config",
         "Configure default model, scenario routing, and delegate agents. Use for natural-language requests like: 'set conversation to kimi and coding to gpt-5.3-codex'.",
@@ -2367,6 +2371,11 @@ pub async fn run(
             "hardware_capabilities",
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
+    }
+    // Remove tool descriptions for excluded built-in tools.
+    let excluded = &config.agent.excluded_builtin_tools;
+    if !excluded.is_empty() {
+        tool_descs.retain(|(name, _)| !excluded.iter().any(|e| e == name));
     }
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -3256,6 +3265,13 @@ pub async fn process_message(
         let excluded = &config.autonomy.non_cli_excluded_tools;
         if !excluded.is_empty() {
             tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+        }
+    }
+    // Remove tool descriptions for excluded built-in tools.
+    {
+        let excluded = &config.agent.excluded_builtin_tools;
+        if !excluded.is_empty() {
+            tool_descs.retain(|(name, _)| !excluded.iter().any(|e| e == name));
         }
     }
 
