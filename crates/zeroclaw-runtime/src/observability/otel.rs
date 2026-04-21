@@ -268,6 +268,22 @@ impl Observer for OtelObserver {
                 ];
                 if langsmith_compat_enabled() {
                     agent_attrs.push(KeyValue::new("langsmith.span.kind", "chain"));
+                    agent_attrs.push(KeyValue::new(
+                        "langsmith.metadata.service_name",
+                        self.service_name.clone(),
+                    ));
+                    // Add custom metadata from ZEROCLAW_OTEL_METADATA env var
+                    // Format: key=value,key=value (e.g. enterprise_code=af9b1dd5,agent_type=cx)
+                    if let Ok(metadata) = std::env::var("ZEROCLAW_OTEL_METADATA") {
+                        for pair in metadata.split(',') {
+                            if let Some((k, v)) = pair.split_once('=') {
+                                agent_attrs.push(KeyValue::new(
+                                    format!("langsmith.metadata.{}", k.trim()),
+                                    v.trim().to_string(),
+                                ));
+                            }
+                        }
+                    }
                 }
                 let span = tracer.build(
                     opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
