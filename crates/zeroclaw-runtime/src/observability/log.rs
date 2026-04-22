@@ -20,7 +20,9 @@ impl LogObserver {
 impl Observer for LogObserver {
     fn record_event(&self, event: &ObserverEvent) {
         match event {
-            ObserverEvent::AgentStart { provider, model } => {
+            ObserverEvent::AgentStart {
+                provider, model, ..
+            } => {
                 info!(provider = %provider, model = %model, "agent.start");
             }
             ObserverEvent::AgentEnd {
@@ -200,6 +202,7 @@ mod tests {
         obs.record_event(&ObserverEvent::AgentStart {
             provider: "openrouter".into(),
             model: "claude-sonnet".into(),
+            user_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "openrouter".into(),

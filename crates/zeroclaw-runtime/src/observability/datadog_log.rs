@@ -78,15 +78,19 @@ impl DatadogLogObserver {
 impl Observer for DatadogLogObserver {
     fn record_event(&self, event: &ObserverEvent) {
         match event {
-            ObserverEvent::AgentStart { provider, model } => {
-                self.emit(
-                    "info",
-                    "agent.start",
-                    json!({
-                        "provider": provider,
-                        "model": model,
-                    }),
-                );
+            ObserverEvent::AgentStart {
+                provider,
+                model,
+                user_id,
+            } => {
+                let mut attrs = json!({
+                    "provider": provider,
+                    "model": model,
+                });
+                if let Some(uid) = user_id {
+                    attrs["user_id"] = json!(uid);
+                }
+                self.emit("info", "agent.start", attrs);
             }
 
             ObserverEvent::LlmRequest {
@@ -293,6 +297,7 @@ mod tests {
         obs.record_event(&ObserverEvent::AgentStart {
             provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
+            user_id: None,
         });
         obs.record_event(&ObserverEvent::LlmRequest {
             provider: "anthropic".into(),

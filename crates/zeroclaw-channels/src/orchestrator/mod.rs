@@ -3092,6 +3092,7 @@ async fn process_channel_message(
                         ctx.observer.record_event(&ObserverEvent::AgentStart {
                             provider: route.provider.clone(),
                             model: route.model.clone(),
+                            user_id: None,
                         });
 
                         continue;

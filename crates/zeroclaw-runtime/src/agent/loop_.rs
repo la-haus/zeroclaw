@@ -2212,6 +2212,7 @@ pub async fn run(
     observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.to_string(),
         model: model_name.to_string(),
+        user_id: None,
     });
 
     // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
@@ -2590,6 +2591,7 @@ pub async fn run(
                         observer.record_event(&ObserverEvent::AgentStart {
                             provider: provider_name.to_string(),
                             model: model_name.to_string(),
+                            user_id: None,
                         });
 
                         continue;
@@ -2901,6 +2903,7 @@ pub async fn run(
                             observer.record_event(&ObserverEvent::AgentStart {
                                 provider: provider_name.to_string(),
                                 model: model_name.to_string(),
+                                user_id: None,
                             });
 
                             continue;

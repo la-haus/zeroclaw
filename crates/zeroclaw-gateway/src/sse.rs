@@ -164,7 +164,9 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 })
             }
-            zeroclaw_runtime::observability::ObserverEvent::AgentStart { provider, model } => {
+            zeroclaw_runtime::observability::ObserverEvent::AgentStart {
+                provider, model, ..
+            } => {
                 serde_json::json!({
                     "type": "agent_start",
                     "provider": provider,

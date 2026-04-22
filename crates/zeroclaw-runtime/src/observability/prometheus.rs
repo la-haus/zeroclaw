@@ -313,7 +313,7 @@ impl PrometheusObserver {
 impl Observer for PrometheusObserver {
     fn record_event(&self, event: &ObserverEvent) {
         match event {
-            ObserverEvent::AgentStart { provider, model } => {
+            ObserverEvent::AgentStart { provider, model, .. } => {
                 self.agent_starts
                     .with_label_values(&[provider, model])
                     .inc();
@@ -536,6 +536,7 @@ mod tests {
         obs.record_event(&ObserverEvent::AgentStart {
             provider: "openrouter".into(),
             model: "claude-sonnet".into(),
+            user_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "openrouter".into(),
@@ -590,6 +591,7 @@ mod tests {
         obs.record_event(&ObserverEvent::AgentStart {
             provider: "openrouter".into(),
             model: "claude-sonnet".into(),
+            user_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),

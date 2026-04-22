@@ -249,7 +249,11 @@ impl Observer for OtelObserver {
         }
 
         match event {
-            ObserverEvent::AgentStart { provider, model } => {
+            ObserverEvent::AgentStart {
+                provider,
+                model,
+                user_id,
+            } => {
                 self.agent_starts.add(
                     1,
                     &[
@@ -265,12 +269,18 @@ impl Observer for OtelObserver {
                     KeyValue::new("model", model.clone()),
                     KeyValue::new("service.name", self.service_name.clone()),
                 ];
+                if let Some(uid) = user_id {
+                    agent_attrs.push(KeyValue::new("user_id", uid.clone()));
+                }
                 if langsmith_compat_enabled() {
                     agent_attrs.push(KeyValue::new("langsmith.span.kind", "chain"));
                     agent_attrs.push(KeyValue::new(
                         "langsmith.metadata.service_name",
                         self.service_name.clone(),
                     ));
+                    if let Some(uid) = user_id {
+                        agent_attrs.push(KeyValue::new("langsmith.metadata.user_id", uid.clone()));
+                    }
                     // Add custom metadata from ZEROCLAW_OTEL_METADATA env var
                     // Format: key=value,key=value (e.g. enterprise_code=af9b1dd5,agent_type=cx)
                     if let Ok(metadata) = std::env::var("ZEROCLAW_OTEL_METADATA") {
@@ -735,6 +745,7 @@ mod tests {
         obs.record_event(&ObserverEvent::AgentStart {
             provider: "openrouter".into(),
             model: "claude-sonnet".into(),
+            user_id: None,
         });
         obs.record_event(&ObserverEvent::LlmRequest {
             provider: "openrouter".into(),

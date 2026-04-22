@@ -1502,6 +1502,7 @@ async fn handle_webhook(
         &zeroclaw_runtime::observability::ObserverEvent::AgentStart {
             provider: provider_label.clone(),
             model: model_label.clone(),
+            user_id: None,
         },
     );
     state.observer.record_event(
