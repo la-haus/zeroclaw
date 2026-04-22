@@ -37,73 +37,73 @@
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub mod agent;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod approval;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod auth;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub mod channels;
 pub mod commands;
 pub mod config;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod cost;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub mod cron;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod daemon;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod doctor;
 #[cfg(feature = "gateway")]
 pub mod gateway;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub mod hands;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod hardware;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod health;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod heartbeat;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub mod hooks;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod integrations;
 pub mod memory;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod multimodal;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub mod nodes;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub mod observability;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod onboard;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub mod peripherals;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub mod platform;
 pub mod providers;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub mod rag;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub mod routines;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod security;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod service;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod skills;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub mod sop;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub mod tools;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod trust;
 #[cfg(feature = "tui-onboarding")]
 pub mod tui;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub(crate) mod tunnel;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 pub mod verifiable_intent;
 
 #[cfg(feature = "plugins-wasm")]
