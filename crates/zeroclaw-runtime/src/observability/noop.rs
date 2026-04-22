@@ -38,6 +38,9 @@ mod tests {
             provider: "test".into(),
             model: "test".into(),
             user_id: None,
+            session_id: None,
+            message_id: None,
+            input: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "test".into(),
@@ -45,6 +48,7 @@ mod tests {
             duration: Duration::from_millis(100),
             tokens_used: Some(42),
             cost_usd: Some(0.001),
+            output: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "test".into(),
@@ -52,6 +56,7 @@ mod tests {
             duration: Duration::ZERO,
             tokens_used: None,
             cost_usd: None,
+            output: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),

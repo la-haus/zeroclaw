@@ -324,6 +324,7 @@ impl Observer for PrometheusObserver {
                 duration,
                 tokens_used,
                 cost_usd: _,
+                ..
             } => {
                 // Agent duration is recorded via the histogram with provider/model labels
                 self.agent_duration
@@ -537,6 +538,9 @@ mod tests {
             provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             user_id: None,
+            session_id: None,
+            message_id: None,
+            input: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "openrouter".into(),
@@ -544,6 +548,7 @@ mod tests {
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
             cost_usd: None,
+            output: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "openrouter".into(),
@@ -551,6 +556,7 @@ mod tests {
             duration: Duration::ZERO,
             tokens_used: None,
             cost_usd: None,
+            output: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
@@ -592,6 +598,9 @@ mod tests {
             provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             user_id: None,
+            session_id: None,
+            message_id: None,
+            input: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),

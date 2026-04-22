@@ -1503,6 +1503,9 @@ async fn handle_webhook(
             provider: provider_label.clone(),
             model: model_label.clone(),
             user_id: None,
+            session_id: None,
+            message_id: None,
+            input: None,
         },
     );
     state.observer.record_event(
@@ -1539,6 +1542,7 @@ async fn handle_webhook(
                     duration,
                     tokens_used: None,
                     cost_usd: None,
+                    output: Some(response.clone()),
                 },
             );
 
@@ -1577,6 +1581,7 @@ async fn handle_webhook(
                     duration,
                     tokens_used: None,
                     cost_usd: None,
+                    output: None,
                 },
             );
 

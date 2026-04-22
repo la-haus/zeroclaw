@@ -259,6 +259,9 @@ impl Observer for OtelObserver {
                 provider,
                 model,
                 user_id,
+                session_id,
+                message_id,
+                input,
             } => {
                 self.agent_starts.add(
                     1,
@@ -278,6 +281,15 @@ impl Observer for OtelObserver {
                 if let Some(uid) = user_id {
                     agent_attrs.push(KeyValue::new("user_id", uid.clone()));
                 }
+                if let Some(sid) = session_id {
+                    agent_attrs.push(KeyValue::new("session.id", sid.clone()));
+                }
+                if let Some(mid) = message_id {
+                    agent_attrs.push(KeyValue::new("message.id", mid.clone()));
+                }
+                if let Some(inp) = input {
+                    agent_attrs.push(KeyValue::new("gen_ai.content.prompt", inp.clone()));
+                }
                 if langsmith_compat_enabled() {
                     agent_attrs.push(KeyValue::new("langsmith.span.kind", "chain"));
                     agent_attrs.push(KeyValue::new(
@@ -286,6 +298,17 @@ impl Observer for OtelObserver {
                     ));
                     if let Some(uid) = user_id {
                         agent_attrs.push(KeyValue::new("langsmith.metadata.user_id", uid.clone()));
+                    }
+                    if let Some(sid) = session_id {
+                        agent_attrs
+                            .push(KeyValue::new("langsmith.metadata.session_id", sid.clone()));
+                    }
+                    if let Some(mid) = message_id {
+                        agent_attrs
+                            .push(KeyValue::new("langsmith.metadata.message_id", mid.clone()));
+                    }
+                    if let Some(inp) = input {
+                        agent_attrs.push(KeyValue::new("input.value", inp.clone()));
                     }
                     // Add custom metadata from ZEROCLAW_OTEL_METADATA env var
                     // Format: key=value,key=value (e.g. enterprise_code=af9b1dd5,agent_type=cx)
@@ -450,6 +473,7 @@ impl Observer for OtelObserver {
                 duration,
                 tokens_used,
                 cost_usd,
+                output,
             } => {
                 let secs = duration.as_secs_f64();
 
@@ -467,6 +491,12 @@ impl Observer for OtelObserver {
                     }
                     if let Some(c) = cost_usd {
                         span.set_attribute(KeyValue::new("cost_usd", *c));
+                    }
+                    if let Some(out) = output {
+                        span.set_attribute(KeyValue::new("gen_ai.content.completion", out.clone()));
+                        if langsmith_compat_enabled() {
+                            span.set_attribute(KeyValue::new("output.value", out.clone()));
+                        }
                     }
                     span.set_status(Status::Ok);
                     span.end();
@@ -770,6 +800,9 @@ mod tests {
             provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             user_id: None,
+            session_id: None,
+            message_id: None,
+            input: None,
         });
         obs.record_event(&ObserverEvent::LlmRequest {
             provider: "openrouter".into(),
@@ -793,6 +826,7 @@ mod tests {
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
             cost_usd: Some(0.0015),
+            output: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "openrouter".into(),
@@ -800,6 +834,7 @@ mod tests {
             duration: Duration::ZERO,
             tokens_used: None,
             cost_usd: None,
+            output: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),

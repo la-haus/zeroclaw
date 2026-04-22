@@ -2213,6 +2213,9 @@ pub async fn run(
         provider: provider_name.to_string(),
         model: model_name.to_string(),
         user_id: None,
+        session_id: None,
+        message_id: None,
+        input: None,
     });
 
     // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
@@ -2592,6 +2595,9 @@ pub async fn run(
                             provider: provider_name.to_string(),
                             model: model_name.to_string(),
                             user_id: None,
+                            session_id: None,
+                            message_id: None,
+                            input: None,
                         });
 
                         continue;
@@ -2904,6 +2910,9 @@ pub async fn run(
                                 provider: provider_name.to_string(),
                                 model: model_name.to_string(),
                                 user_id: None,
+                                session_id: None,
+                                message_id: None,
+                                input: None,
                             });
 
                             continue;
@@ -3025,6 +3034,7 @@ pub async fn run(
         duration,
         tokens_used: None,
         cost_usd: None,
+        output: Some(final_output.clone()),
     });
 
     Ok(final_output)

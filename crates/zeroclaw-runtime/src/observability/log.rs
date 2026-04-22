@@ -31,6 +31,7 @@ impl Observer for LogObserver {
                 duration,
                 tokens_used,
                 cost_usd,
+                ..
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 info!(provider = %provider, model = %model, duration_ms = ms, tokens = ?tokens_used, cost_usd = ?cost_usd, "agent.end");
@@ -203,6 +204,9 @@ mod tests {
             provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             user_id: None,
+            session_id: None,
+            message_id: None,
+            input: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "openrouter".into(),
@@ -210,6 +214,7 @@ mod tests {
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
             cost_usd: Some(0.0015),
+            output: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "openrouter".into(),
@@ -217,6 +222,7 @@ mod tests {
             duration: Duration::ZERO,
             tokens_used: None,
             cost_usd: None,
+            output: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             provider: "openrouter".into(),

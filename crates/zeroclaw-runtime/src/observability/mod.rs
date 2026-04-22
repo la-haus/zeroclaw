@@ -91,12 +91,16 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
 
                 for (i, (endpoint, headers)) in endpoints.iter().enumerate() {
                     let instance_name = format!("otel-{}", i);
+                    // Only the first observer (Datadog) writes to shared trace context.
+                    // Others (LangSmith/Langfuse) generate different trace IDs that would
+                    // overwrite Datadog's, breaking log↔trace correlation.
+                    let ctx_for_observer = if i == 0 { Some(shared_ctx.clone()) } else { None };
                     match OtelObserver::new(
                         Some(endpoint.as_str()),
                         config.otel_service_name.as_deref(),
                         headers.clone(),
                         Some(&instance_name),
-                        Some(shared_ctx.clone()),
+                        ctx_for_observer,
                     ) {
                         Ok(obs) => {
                             tracing::info!(

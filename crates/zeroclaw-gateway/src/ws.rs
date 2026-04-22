@@ -65,6 +65,8 @@ pub struct WsQuery {
     pub name: Option<String>,
     /// Optional user identifier (phone, user ID, job name, etc.) for tracing/logging.
     pub user_id: Option<String>,
+    /// Optional message identifier for trace correlation.
+    pub message_id: Option<String>,
 }
 
 /// Extract a bearer token from WebSocket-compatible sources.
@@ -145,8 +147,11 @@ pub async fn handle_ws_chat(
     let session_id = params.session_id;
     let session_name = params.name;
     let user_id = params.user_id;
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, session_name, user_id))
-        .into_response()
+    let message_id = params.message_id;
+    ws.on_upgrade(move |socket| {
+        handle_socket(socket, state, session_id, session_name, user_id, message_id)
+    })
+    .into_response()
 }
 
 /// Gateway session key prefix to avoid collisions with channel sessions.
@@ -158,6 +163,7 @@ async fn handle_socket(
     session_id: Option<String>,
     session_name: Option<String>,
     user_id: Option<String>,
+    message_id: Option<String>,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -196,9 +202,14 @@ async fn handle_socket(
     };
     agent.set_memory_session_id(Some(session_id.clone()));
     agent.user_id = user_id.clone();
+    agent.session_id = Some(session_id.clone());
+    agent.message_id = message_id.clone();
 
     if let Some(ref uid) = user_id {
         tracing::info!(user_id = %uid, session_id = %session_id, "User ID attached to session");
+    }
+    if let Some(ref mid) = message_id {
+        tracing::info!(message_id = %mid, session_id = %session_id, "Message ID attached to session");
     }
 
     // Hydrate agent from persisted session (if available)
