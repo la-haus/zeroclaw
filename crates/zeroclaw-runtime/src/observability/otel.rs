@@ -1,3 +1,4 @@
+use super::SharedTraceContext;
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider};
 use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt, Tracer, TracerProvider};
@@ -27,6 +28,9 @@ pub struct OtelObserver {
     // Instance-owned providers (not global singletons)
     tracer_provider: SdkTracerProvider,
     _meter_provider: SdkMeterProvider,
+
+    // Shared trace context for log↔trace correlation (written here, read by DatadogLogObserver)
+    trace_context: Option<SharedTraceContext>,
 
     // Span parenting state
     agent_context: Mutex<Option<Context>>,
@@ -63,6 +67,7 @@ impl OtelObserver {
         service_name: Option<&str>,
         headers: Option<HashMap<String, String>>,
         instance_name: Option<&str>,
+        trace_context: Option<SharedTraceContext>,
     ) -> Result<Self, String> {
         let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
         let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
@@ -209,6 +214,7 @@ impl OtelObserver {
             service_name: service_name.to_string(),
             tracer_provider: tp,
             _meter_provider: mp,
+            trace_context,
             agent_context: Mutex::new(None),
             pending_messages_count: Mutex::new(None),
             pending_tool_args: Mutex::new(None),
@@ -300,6 +306,18 @@ impl Observer for OtelObserver {
                         .with_attributes(agent_attrs),
                 );
                 let ctx = Context::current_with_span(span);
+
+                // Write trace_id/span_id to shared context for log↔trace correlation
+                if let Some(ref tc) = self.trace_context {
+                    let sc = ctx.span().span_context().clone();
+                    if sc.is_valid() {
+                        let trace_id_128 = u128::from_be_bytes(sc.trace_id().to_bytes());
+                        let trace_id_64 = (trace_id_128 & ((1u128 << 64) - 1)) as u64;
+                        let span_id = u64::from_be_bytes(sc.span_id().to_bytes());
+                        *tc.lock() = (trace_id_64.to_string(), span_id.to_string());
+                    }
+                }
+
                 *self.agent_context.lock() = Some(ctx);
             }
             ObserverEvent::LlmRequest {
@@ -452,6 +470,11 @@ impl Observer for OtelObserver {
                     }
                     span.set_status(Status::Ok);
                     span.end();
+                }
+
+                // Reset shared trace context so logs after AgentEnd show "0"
+                if let Some(ref tc) = self.trace_context {
+                    *tc.lock() = ("0".into(), "0".into());
                 }
 
                 // Clear pending state
@@ -729,6 +752,7 @@ mod tests {
             Some("zeroclaw-test"),
             None,
             None,
+            None,
         )
         .expect("observer creation should not fail with valid endpoint format")
     }
@@ -910,6 +934,7 @@ mod tests {
             Some("zeroclaw-test"),
             None,
             None,
+            None,
         );
         assert!(
             result.is_ok(),
@@ -927,6 +952,7 @@ mod tests {
             Some("test"),
             Some(headers),
             None,
+            None,
         );
         assert!(
             result.is_ok(),
@@ -942,6 +968,7 @@ mod tests {
             Some("http://127.0.0.1:19999"),
             Some("test"),
             Some(headers),
+            None,
             None,
         )
         .expect("creation should succeed");
@@ -969,6 +996,7 @@ mod tests {
             Some("http://127.0.0.1:12345"),
             Some("test"),
             Some(HashMap::new()),
+            None,
             None,
         );
         assert!(
