@@ -4,6 +4,10 @@
 //! `lahaus-logger` Python schema so Datadog Log Management can parse, index,
 //! and correlate logs with APM traces without extra pipelines.
 //!
+//! When compiled with `observability-otel`, logs include `dd.trace_id` and
+//! `dd.span_id` extracted from the active OTEL span context — enabling
+//! automatic log↔trace correlation in Datadog.
+//!
 //! Metrics are a no-op — they go through the OTEL pipeline instead.
 
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
@@ -33,7 +37,28 @@ impl DatadogLogObserver {
         }
     }
 
+    /// Get current OTEL trace_id and span_id for Datadog correlation.
+    /// Returns (trace_id_64bit, span_id) as strings, or ("0", "0") if unavailable.
+    fn current_trace_context(&self) -> (String, String) {
+        #[cfg(feature = "observability-otel")]
+        {
+            use opentelemetry::trace::TraceContextExt;
+            let ctx = opentelemetry::Context::current();
+            let span = ctx.span();
+            let sc = span.span_context();
+            if sc.is_valid() {
+                // Datadog uses 64-bit trace IDs: take lower 64 bits of 128-bit OTEL trace ID
+                let trace_id_128 = u128::from_be_bytes(sc.trace_id().to_bytes());
+                let trace_id_64 = (trace_id_128 & ((1u128 << 64) - 1)) as u64;
+                let span_id = u64::from_be_bytes(sc.span_id().to_bytes());
+                return (trace_id_64.to_string(), span_id.to_string());
+            }
+        }
+        ("0".to_string(), "0".to_string())
+    }
+
     fn emit(&self, level: &str, msg: &str, attributes: serde_json::Value) {
+        let (trace_id, span_id) = self.current_trace_context();
         let line = json!({
             "time": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             "level": level,
@@ -42,6 +67,8 @@ impl DatadogLogObserver {
             "dd.service": &self.service,
             "dd.version": &self.version,
             "dd.env": &self.env,
+            "dd.trace_id": trace_id,
+            "dd.span_id": span_id,
             "attributes": attributes,
         });
         println!("{}", line);
