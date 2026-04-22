@@ -406,6 +406,16 @@ impl Agent {
     pub async fn from_config(config: &Config) -> Result<Self> {
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
+        Self::from_config_with_observer(config, observer).await
+    }
+
+    /// Like [`from_config`] but accepts a pre-built observer, allowing
+    /// multiple agents (e.g. per-WebSocket-connection) to share the same
+    /// observer/TracerProvider instead of re-creating one each time.
+    pub async fn from_config_with_observer(
+        config: &Config,
+        observer: Arc<dyn Observer>,
+    ) -> Result<Self> {
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::from_config(

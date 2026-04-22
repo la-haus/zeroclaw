@@ -27,6 +27,15 @@ pub use verbose::VerboseObserver;
 
 use zeroclaw_config::schema::ObservabilityConfig;
 
+/// Shared trace context for log↔trace correlation.
+///
+/// Holds `(trace_id_64bit, span_id)` as decimal strings.
+/// Updated by `OtelObserver` on `AgentStart`/`AgentEnd` and read by
+/// `DatadogLogObserver` so structured logs carry the correct `dd.trace_id`
+/// and `dd.span_id` without relying on the global OpenTelemetry context
+/// (which OtelObserver never registers spans into).
+pub type SharedTraceContext = std::sync::Arc<parking_lot::Mutex<(String, String)>>;
+
 /// Factory: create the right observer from config
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     match config.backend.as_str() {
@@ -50,6 +59,11 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
             #[cfg(feature = "observability-otel")]
             {
                 let mut observers: Vec<Box<dyn Observer>> = Vec::new();
+
+                // Shared trace context so DatadogLogObserver can read the
+                // active trace_id/span_id written by OtelObserver.
+                let shared_ctx: SharedTraceContext =
+                    std::sync::Arc::new(parking_lot::Mutex::new(("0".into(), "0".into())));
 
                 // Build consolidated endpoint list
                 let mut endpoints: Vec<(
@@ -82,6 +96,7 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
                         config.otel_service_name.as_deref(),
                         headers.clone(),
                         Some(&instance_name),
+                        Some(shared_ctx.clone()),
                     ) {
                         Ok(obs) => {
                             tracing::info!(
@@ -98,7 +113,10 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
                 }
 
                 // Always include DatadogLogObserver for structured stdout logging
-                observers.push(Box::new(DatadogLogObserver::new()));
+                // with shared trace context for log↔trace correlation.
+                observers.push(Box::new(
+                    DatadogLogObserver::new().with_trace_context(shared_ctx.clone()),
+                ));
 
                 if observers.is_empty() {
                     Box::new(NoopObserver)

@@ -165,9 +165,15 @@ async fn handle_socket(
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
 
-    // Build a persistent Agent for this connection so history is maintained across turns.
+    // Build a persistent Agent for this connection, reusing the shared observer
+    // from AppState to avoid re-creating OtelObserver + TracerProvider per connection.
     let config = state.config.lock().clone();
-    let mut agent = match zeroclaw_runtime::agent::Agent::from_config(&config).await {
+    let mut agent = match zeroclaw_runtime::agent::Agent::from_config_with_observer(
+        &config,
+        state.observer.clone(),
+    )
+    .await
+    {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(error = %e, "Agent initialization failed");

@@ -10,6 +10,7 @@
 //!
 //! Metrics are a no-op — they go through the OTEL pipeline instead.
 
+use super::SharedTraceContext;
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use serde_json::json;
 use std::any::Any;
@@ -19,6 +20,9 @@ pub struct DatadogLogObserver {
     service: String,
     version: String,
     env: String,
+    /// Shared trace context written by OtelObserver, giving us the active
+    /// trace_id/span_id without relying on the global OpenTelemetry context.
+    trace_context: Option<SharedTraceContext>,
 }
 
 impl Default for DatadogLogObserver {
@@ -34,12 +38,34 @@ impl DatadogLogObserver {
             service: std::env::var("DD_SERVICE").unwrap_or_else(|_| "zeroclaw".into()),
             version: std::env::var("DD_VERSION").unwrap_or_else(|_| "unknown".into()),
             env: std::env::var("DD_ENV").unwrap_or_else(|_| "development".into()),
+            trace_context: None,
         }
+    }
+
+    /// Attach a shared trace context for log↔trace correlation.
+    ///
+    /// When set, `current_trace_context()` reads trace_id/span_id from this
+    /// shared state (written by OtelObserver) instead of the global OTEL
+    /// context, which OtelObserver never registers spans into.
+    pub fn with_trace_context(mut self, ctx: SharedTraceContext) -> Self {
+        self.trace_context = Some(ctx);
+        self
     }
 
     /// Get current OTEL trace_id and span_id for Datadog correlation.
     /// Returns (trace_id_64bit, span_id) as strings, or ("0", "0") if unavailable.
     fn current_trace_context(&self) -> (String, String) {
+        // Prefer shared trace context (written by OtelObserver) over global context
+        if let Some(ref tc) = self.trace_context {
+            let pair = tc.lock();
+            if pair.0 != "0" {
+                return pair.clone();
+            }
+        }
+
+        // Fallback: read from global OpenTelemetry context (may still be "0"
+        // if no spans are registered globally, but kept for standalone usage
+        // without OtelObserver).
         #[cfg(feature = "observability-otel")]
         {
             use opentelemetry::trace::TraceContextExt;
