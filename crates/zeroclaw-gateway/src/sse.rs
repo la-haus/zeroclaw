@@ -180,6 +180,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 duration,
                 tokens_used,
                 cost_usd,
+                ..
             } => serde_json::json!({
                 "type": "agent_end",
                 "provider": provider,

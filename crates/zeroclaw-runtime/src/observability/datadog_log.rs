@@ -108,6 +108,9 @@ impl Observer for DatadogLogObserver {
                 provider,
                 model,
                 user_id,
+                session_id,
+                message_id,
+                input,
             } => {
                 let mut attrs = json!({
                     "provider": provider,
@@ -115,6 +118,15 @@ impl Observer for DatadogLogObserver {
                 });
                 if let Some(uid) = user_id {
                     attrs["user_id"] = json!(uid);
+                }
+                if let Some(sid) = session_id {
+                    attrs["session_id"] = json!(sid);
+                }
+                if let Some(mid) = message_id {
+                    attrs["message_id"] = json!(mid);
+                }
+                if let Some(inp) = input {
+                    attrs["input"] = json!(inp);
                 }
                 self.emit("info", "agent.start", attrs);
             }
@@ -174,6 +186,7 @@ impl Observer for DatadogLogObserver {
                 duration,
                 tokens_used,
                 cost_usd,
+                output,
             } => {
                 let mut attrs = json!({
                     "provider": provider,
@@ -185,6 +198,9 @@ impl Observer for DatadogLogObserver {
                 }
                 if let Some(cost) = cost_usd {
                     attrs["cost_usd"] = json!(cost);
+                }
+                if let Some(out) = output {
+                    attrs["output"] = json!(out);
                 }
                 self.emit("info", "agent.end", attrs);
             }
@@ -324,6 +340,9 @@ mod tests {
             provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             user_id: None,
+            session_id: None,
+            message_id: None,
+            input: None,
         });
         obs.record_event(&ObserverEvent::LlmRequest {
             provider: "anthropic".into(),
@@ -361,6 +380,7 @@ mod tests {
             duration: Duration::from_secs(30),
             tokens_used: Some(5000),
             cost_usd: Some(0.015),
+            output: None,
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
     }

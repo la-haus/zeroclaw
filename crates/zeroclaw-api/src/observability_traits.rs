@@ -14,6 +14,12 @@ pub enum ObserverEvent {
         model: String,
         /// Optional user identifier (phone, user ID, job name) for tracing/logging.
         user_id: Option<String>,
+        /// Optional session identifier for trace correlation.
+        session_id: Option<String>,
+        /// Optional message identifier for trace correlation.
+        message_id: Option<String>,
+        /// The user's raw input message that triggered this agent invocation.
+        input: Option<String>,
     },
     /// A request is about to be sent to an LLM provider.
     ///
@@ -47,6 +53,8 @@ pub enum ObserverEvent {
         duration: Duration,
         tokens_used: Option<u64>,
         cost_usd: Option<f64>,
+        /// The agent's final response text for this invocation.
+        output: Option<String>,
     },
     /// A tool call is about to be executed.
     ToolCallStart {

@@ -63,6 +63,10 @@ pub struct Agent {
     memory_session_id: Option<String>,
     /// Optional user identifier for tracing/logging (phone, user ID, job name).
     pub user_id: Option<String>,
+    /// Optional session identifier for trace correlation.
+    pub session_id: Option<String>,
+    /// Optional message identifier for trace correlation.
+    pub message_id: Option<String>,
     history: Vec<ConversationMessage>,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
     available_hints: Vec<String>,
@@ -350,6 +354,8 @@ impl AgentBuilder {
             auto_save: self.auto_save.unwrap_or(false),
             memory_session_id: self.memory_session_id,
             user_id: None,
+            session_id: None,
+            message_id: None,
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
@@ -1128,6 +1134,9 @@ impl Agent {
             provider: self.provider_name.clone(),
             model: self.model_name.clone(),
             user_id: self.user_id.clone(),
+            session_id: self.session_id.clone(),
+            message_id: self.message_id.clone(),
+            input: Some(user_message.to_string()),
         });
 
         // ── Preamble (identical to turn) ───────────────────────────────
@@ -1216,6 +1225,7 @@ impl Agent {
                         duration: streamed_start.elapsed(),
                         tokens_used: None,
                         cost_usd: None,
+                        output: Some(cached.clone()),
                     });
                     return Ok(cached);
                 }
@@ -1415,6 +1425,7 @@ impl Agent {
                             duration: streamed_start.elapsed(),
                             tokens_used: None,
                             cost_usd: None,
+                            output: None,
                         });
                         return Err(err);
                     }
@@ -1461,6 +1472,7 @@ impl Agent {
                     duration: streamed_start.elapsed(),
                     tokens_used: None,
                     cost_usd: None,
+                    output: Some(final_text.clone()),
                 });
                 return Ok(final_text);
             }
@@ -1512,6 +1524,7 @@ impl Agent {
             duration: streamed_start.elapsed(),
             tokens_used: None,
             cost_usd: None,
+            output: None,
         });
         anyhow::bail!(
             "Agent exceeded maximum tool iterations ({})",
@@ -1590,6 +1603,9 @@ pub async fn run(
         provider: provider_name.clone(),
         model: model_name.clone(),
         user_id: agent.user_id.clone(),
+        session_id: agent.session_id.clone(),
+        message_id: agent.message_id.clone(),
+        input: message.clone(),
     });
 
     if let Some(msg) = message {
@@ -1605,6 +1621,7 @@ pub async fn run(
         duration: start.elapsed(),
         tokens_used: None,
         cost_usd: None,
+        output: None,
     });
 
     Ok(())

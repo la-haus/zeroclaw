@@ -3093,6 +3093,9 @@ async fn process_channel_message(
                             provider: route.provider.clone(),
                             model: route.model.clone(),
                             user_id: None,
+                            session_id: None,
+                            message_id: None,
+                            input: None,
                         });
 
                         continue;
