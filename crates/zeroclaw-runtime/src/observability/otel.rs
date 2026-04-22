@@ -1,6 +1,6 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
-use opentelemetry::metrics::{Counter, Gauge, Histogram};
-use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt, Tracer};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider};
+use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt, Tracer, TracerProvider};
 use opentelemetry::{Context, KeyValue, global};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -8,11 +8,7 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use parking_lot::Mutex;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::time::SystemTime;
-
-static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
-static METER_PROVIDER: OnceLock<SdkMeterProvider> = OnceLock::new();
 
 /// When `ZEROCLAW_OTEL_LANGSMITH_COMPAT=true`, emit additional span attributes
 /// that LangSmith expects (gen_ai.usage.prompt_tokens, langsmith.span.kind, etc.).
@@ -24,8 +20,13 @@ fn langsmith_compat_enabled() -> bool {
 
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
 pub struct OtelObserver {
-    // Service identity
+    // Instance identity
+    instance_name: String,
     service_name: String,
+
+    // Instance-owned providers (not global singletons)
+    tracer_provider: SdkTracerProvider,
+    _meter_provider: SdkMeterProvider,
 
     // Span parenting state
     agent_context: Mutex<Option<Context>>,
@@ -61,67 +62,62 @@ impl OtelObserver {
         endpoint: Option<&str>,
         service_name: Option<&str>,
         headers: Option<HashMap<String, String>>,
+        instance_name: Option<&str>,
     ) -> Result<Self, String> {
         let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
         let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
         let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
         let service_name = service_name.unwrap_or("zeroclaw");
+        let instance_name = instance_name.unwrap_or("otel-0").to_string();
 
-        // ── Singleton tracer provider (OnceLock) ────────────────
-        let _tp = TRACER_PROVIDER.get_or_init(|| {
-            let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
-                .with_http()
-                .with_endpoint(&traces_endpoint);
-            if let Some(ref h) = headers {
-                span_builder = span_builder.with_headers(h.clone());
-            }
-            let span_exporter = span_builder
-                .build()
-                .expect("Failed to create OTLP span exporter");
+        // ── Instance-scoped tracer provider ─────────────────────
+        let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_endpoint(&traces_endpoint);
+        if let Some(ref h) = headers {
+            span_builder = span_builder.with_headers(h.clone());
+        }
+        let span_exporter = span_builder
+            .build()
+            .expect("Failed to create OTLP span exporter");
 
-            let tp = SdkTracerProvider::builder()
-                .with_batch_exporter(span_exporter)
-                .with_resource(
-                    opentelemetry_sdk::Resource::builder()
-                        .with_service_name(service_name.to_string())
-                        .build(),
-                )
-                .build();
+        let tp = SdkTracerProvider::builder()
+            .with_batch_exporter(span_exporter)
+            .with_resource(
+                opentelemetry_sdk::Resource::builder()
+                    .with_service_name(service_name.to_string())
+                    .build(),
+            )
+            .build();
 
-            global::set_tracer_provider(tp.clone());
-            tp
-        });
+        // Set the first instance as the global provider (needed for tracer("zeroclaw"))
+        global::set_tracer_provider(tp.clone());
 
-        // ── Singleton meter provider (OnceLock) ─────────────────
-        let _mp = METER_PROVIDER.get_or_init(|| {
-            let mut metric_builder = opentelemetry_otlp::MetricExporter::builder()
-                .with_http()
-                .with_endpoint(&metrics_endpoint);
-            if let Some(ref h) = headers {
-                metric_builder = metric_builder.with_headers(h.clone());
-            }
-            let metric_exporter = metric_builder
-                .build()
-                .expect("Failed to create OTLP metric exporter");
+        // ── Instance-scoped meter provider ──────────────────────
+        let mut metric_builder = opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .with_endpoint(&metrics_endpoint);
+        if let Some(ref h) = headers {
+            metric_builder = metric_builder.with_headers(h.clone());
+        }
+        let metric_exporter = metric_builder
+            .build()
+            .expect("Failed to create OTLP metric exporter");
 
-            let metric_reader =
-                opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
+        let metric_reader =
+            opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
 
-            let mp = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-                .with_reader(metric_reader)
-                .with_resource(
-                    opentelemetry_sdk::Resource::builder()
-                        .with_service_name(service_name.to_string())
-                        .build(),
-                )
-                .build();
-
-            global::set_meter_provider(mp.clone());
-            mp
-        });
+        let mp = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_reader(metric_reader)
+            .with_resource(
+                opentelemetry_sdk::Resource::builder()
+                    .with_service_name(service_name.to_string())
+                    .build(),
+            )
+            .build();
 
         // ── Create metric instruments ────────────────────────────
-        let meter = global::meter("zeroclaw");
+        let meter = mp.meter("zeroclaw");
 
         let agent_starts = meter
             .u64_counter("zeroclaw.agent.starts")
@@ -209,7 +205,10 @@ impl OtelObserver {
             .build();
 
         Ok(Self {
+            instance_name,
             service_name: service_name.to_string(),
+            tracer_provider: tp,
+            _meter_provider: mp,
             agent_context: Mutex::new(None),
             pending_messages_count: Mutex::new(None),
             pending_tool_args: Mutex::new(None),
@@ -236,7 +235,7 @@ impl OtelObserver {
 
 impl Observer for OtelObserver {
     fn record_event(&self, event: &ObserverEvent) {
-        let tracer = global::tracer("zeroclaw");
+        let tracer = self.tracer_provider.tracer("zeroclaw");
 
         // Macro: build a span as child of the agent root context, or standalone.
         macro_rules! child_span {
@@ -684,15 +683,11 @@ impl Observer for OtelObserver {
     }
 
     fn flush(&self) {
-        if let Some(tp) = TRACER_PROVIDER.get()
-            && let Err(e) = tp.force_flush()
-        {
-            tracing::warn!("OTel trace flush failed: {e}");
+        if let Err(e) = self.tracer_provider.force_flush() {
+            tracing::warn!(instance = %self.instance_name, "OTel trace flush failed: {e}");
         }
-        if let Some(mp) = METER_PROVIDER.get()
-            && let Err(e) = mp.force_flush()
-        {
-            tracing::warn!("OTel metric flush failed: {e}");
+        if let Err(e) = self._meter_provider.force_flush() {
+            tracing::warn!(instance = %self.instance_name, "OTel metric flush failed: {e}");
         }
     }
 
@@ -719,8 +714,13 @@ mod tests {
     fn test_observer() -> OtelObserver {
         // Create with a dummy endpoint — exports will silently fail
         // but the observer itself works fine for recording
-        OtelObserver::new(Some("http://127.0.0.1:19999"), Some("zeroclaw-test"), None)
-            .expect("observer creation should not fail with valid endpoint format")
+        OtelObserver::new(
+            Some("http://127.0.0.1:19999"),
+            Some("zeroclaw-test"),
+            None,
+            None,
+        )
+        .expect("observer creation should not fail with valid endpoint format")
     }
 
     #[test]
@@ -894,7 +894,12 @@ mod tests {
     #[test]
     fn otel_observer_creation_with_valid_endpoint_succeeds() {
         // Even though endpoint is unreachable, creation should succeed
-        let result = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("zeroclaw-test"), None);
+        let result = OtelObserver::new(
+            Some("http://127.0.0.1:12345"),
+            Some("zeroclaw-test"),
+            None,
+            None,
+        );
         assert!(
             result.is_ok(),
             "observer creation must succeed even with unreachable endpoint"
@@ -906,7 +911,12 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("Authorization".to_string(), "Bearer sk-test".to_string());
         headers.insert("X-Custom".to_string(), "value".to_string());
-        let result = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("test"), Some(headers));
+        let result = OtelObserver::new(
+            Some("http://127.0.0.1:12345"),
+            Some("test"),
+            Some(headers),
+            None,
+        );
         assert!(
             result.is_ok(),
             "observer creation with headers must succeed"
@@ -917,8 +927,13 @@ mod tests {
     fn otel_observer_with_headers_records_events() {
         let mut headers = HashMap::new();
         headers.insert("Authorization".to_string(), "Bearer sk-test".to_string());
-        let obs = OtelObserver::new(Some("http://127.0.0.1:19999"), Some("test"), Some(headers))
-            .expect("creation should succeed");
+        let obs = OtelObserver::new(
+            Some("http://127.0.0.1:19999"),
+            Some("test"),
+            Some(headers),
+            None,
+        )
+        .expect("creation should succeed");
         obs.record_event(&ObserverEvent::LlmResponse {
             provider: "anthropic".into(),
             model: "claude-sonnet".into(),
@@ -943,6 +958,7 @@ mod tests {
             Some("http://127.0.0.1:12345"),
             Some("test"),
             Some(HashMap::new()),
+            None,
         );
         assert!(
             result.is_ok(),
