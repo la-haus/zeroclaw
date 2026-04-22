@@ -73,83 +73,83 @@ fn pause_after_no_command_help() {
     let _ = std::io::stdin().read_line(&mut line);
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod agent;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod approval;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod auth;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod channels;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod cli_input;
 mod commands;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod rag {
     pub use zeroclaw::rag::*;
 }
 mod config;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod cost;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod cron;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod daemon;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod doctor;
 #[cfg(feature = "gateway")]
 mod gateway;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod hardware;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod health;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod heartbeat;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod hooks;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod i18n;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod identity;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod integrations;
 mod memory;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod migration;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod multimodal;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod observability;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod onboard;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod peripherals;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod platform;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod security;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod service;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod skillforge;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod skills;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod sop;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod tools;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod trust;
 #[cfg(feature = "tui-onboarding")]
 mod tui;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod tunnel;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod util;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod verifiable_intent;
 
 use config::Config;
@@ -935,7 +935,7 @@ async fn main() -> Result<()> {
     // Install default crypto provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
         eprintln!("Warning: Failed to install default crypto provider: {e:?}");
     }
@@ -981,7 +981,7 @@ async fn main() -> Result<()> {
     // detection fails.  This means `curl … | bash` and
     // `zeroclaw onboard --api-key …` both take the fast path, while a bare
     // `zeroclaw onboard` in a terminal launches the wizard.
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     if let Commands::Onboard {
         force,
         reinit,
@@ -1117,9 +1117,9 @@ async fn main() -> Result<()> {
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
     config.apply_env_overrides();
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     if config.security.otp.enabled {
         let config_dir = config
             .config_path
@@ -1134,7 +1134,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    #[cfg(not(feature = "agent-runtime"))]
+    #[cfg(not(any(feature = "agent-runtime", feature = "agent-core")))]
     {
         // Kernel-only mode: minimal CLI agent without channels/tools/gateway
         match cli.command {
@@ -1204,7 +1204,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     match cli.command {
         Commands::Onboard { .. } | Commands::Completions { .. } => unreachable!(),
 
@@ -1378,7 +1378,7 @@ async fn main() -> Result<()> {
                 info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
             }
             // Wire CLI channel for interactive mode
-            #[cfg(feature = "agent-runtime")]
+            #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
             zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
                 Box::new(zeroclaw_channels::cli::CliChannel::new())
             }));
@@ -1392,7 +1392,7 @@ async fn main() -> Result<()> {
             }));
 
             // Wire cron delivery to the channels orchestrator
-            #[cfg(feature = "agent-runtime")]
+            #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
             zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
                 |config, channel, target, output| {
                     Box::pin(async move {
@@ -2101,7 +2101,7 @@ async fn main() -> Result<()> {
 }
 
 /// Build wizard callbacks that wire downstream crate functionality into the onboarding wizard.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn build_wizard_callbacks() -> onboard::WizardCallbacks {
     onboard::WizardCallbacks {
         #[cfg(feature = "hardware")]
@@ -2317,7 +2317,7 @@ fn build_wizard_callbacks() -> onboard::WizardCallbacks {
     }
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn handle_estop_command(
     config: &Config,
     estop_command: Option<EstopSubcommands>,
@@ -2389,7 +2389,7 @@ fn handle_estop_command(
     }
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn build_engage_level(
     level: Option<EstopLevelArg>,
     domains: Vec<String>,
@@ -2430,7 +2430,7 @@ fn build_engage_level(
     }
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn build_resume_selector(
     network: bool,
     domains: Vec<String>,
@@ -2453,7 +2453,7 @@ fn build_resume_selector(
     Ok(security::ResumeSelector::KillAll)
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn print_estop_status(state: &security::EstopState) {
     println!("Estop status:");
     println!(
@@ -2575,7 +2575,7 @@ fn log_gateway_start(host: &str, port: u16) {
 }
 
 /// Gracefully shutdown a running gateway via the admin endpoint.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
     let url = format!("http://{host}:{port}/admin/shutdown");
     let client = reqwest::Client::new();
@@ -2597,7 +2597,7 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
 
 /// Fetch the current pairing code from a running gateway.
 /// If `new` is true, generates a fresh pairing code via POST request.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<String>> {
     let client = reqwest::Client::new();
 
@@ -2668,13 +2668,13 @@ struct PendingOAuthLoginFile {
     created_at: String,
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn pending_oauth_login_path(config: &Config, provider: &str) -> std::path::PathBuf {
     let filename = format!("auth-{}-pending.json", provider);
     auth::state_dir_from_config(config).join(filename)
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn pending_oauth_secret_store(config: &Config) -> security::secrets::SecretStore {
     security::secrets::SecretStore::new(
         &auth::state_dir_from_config(config),
@@ -2694,7 +2694,7 @@ fn set_owner_only_permissions(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn save_pending_oauth_login(config: &Config, pending: &PendingOAuthLogin) -> Result<()> {
     let path = pending_oauth_login_path(config, &pending.provider);
     if let Some(parent) = path.parent() {
@@ -2723,7 +2723,7 @@ fn save_pending_oauth_login(config: &Config, pending: &PendingOAuthLogin) -> Res
     Ok(())
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn load_pending_oauth_login(config: &Config, provider: &str) -> Result<Option<PendingOAuthLogin>> {
     let path = pending_oauth_login_path(config, provider);
     if !path.exists() {
@@ -2751,7 +2751,7 @@ fn load_pending_oauth_login(config: &Config, provider: &str) -> Result<Option<Pe
     }))
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn clear_pending_oauth_login(config: &Config, provider: &str) {
     let path = pending_oauth_login_path(config, provider);
     if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
@@ -2761,7 +2761,7 @@ fn clear_pending_oauth_login(config: &Config, provider: &str) {
     let _ = std::fs::remove_file(path);
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn read_auth_input(prompt: &str) -> Result<String> {
     let input = Password::new()
         .with_prompt(prompt)
@@ -2770,7 +2770,7 @@ fn read_auth_input(prompt: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn read_plain_input(prompt: &str) -> Result<String> {
     let input: String = cli_input::Input::new()
         .with_prompt(prompt)
@@ -2778,7 +2778,7 @@ fn read_plain_input(prompt: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn extract_openai_account_id_for_profile(access_token: &str) -> Option<String> {
     let account_id = auth::openai_oauth::extract_account_id_from_jwt(access_token);
     if account_id.is_none() {
@@ -2790,7 +2790,7 @@ fn extract_openai_account_id_for_profile(access_token: &str) -> Option<String> {
     account_id
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 async fn import_openai_codex_auth_profile(
     auth_service: &auth::AuthService,
     profile: &str,
@@ -2839,7 +2839,7 @@ async fn import_openai_codex_auth_profile(
     Ok(())
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
     match profile
         .token_set
@@ -2860,7 +2860,7 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
     let auth_service = auth::AuthService::from_config(config);
 
@@ -3366,13 +3366,13 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn onboard_help_includes_model_flag() {
         let cmd = Cli::command();
         let onboard = cmd
@@ -3391,7 +3391,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn onboard_cli_accepts_model_provider_and_api_key_in_quick_mode() {
         let cli = Cli::try_parse_from([
             "zeroclaw",
@@ -3425,7 +3425,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn completions_cli_parses_supported_shells() {
         for shell in ["bash", "fish", "zsh", "powershell", "elvish"] {
             let cli = Cli::try_parse_from(["zeroclaw", "completions", shell])
@@ -3438,7 +3438,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn completion_generation_mentions_binary_name() {
         let mut output = Vec::new();
         write_shell_completion(CompletionShell::Bash, &mut output)
@@ -3451,7 +3451,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn onboard_cli_accepts_force_flag() {
         let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--force"])
             .expect("onboard --force should parse");
@@ -3463,14 +3463,14 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn onboard_cli_rejects_removed_interactive_flag() {
         // --interactive was removed; onboard auto-detects TTY instead.
         assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn onboard_cli_parses_quick_flag() {
         let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--quick"])
             .expect("onboard --quick should parse");
@@ -3482,7 +3482,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn onboard_cli_quick_and_channels_only_conflict() {
         // --quick and --channels-only should both parse at the CLI level
         // (the conflict is checked at runtime), but we verify both flags parse.
@@ -3494,7 +3494,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn onboard_cli_bare_parses() {
         let cli = Cli::try_parse_from(["zeroclaw", "onboard"]).expect("bare onboard should parse");
 
@@ -3505,7 +3505,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn cli_parses_estop_default_engage() {
         let cli = Cli::try_parse_from(["zeroclaw", "estop"]).expect("estop command should parse");
 
@@ -3526,7 +3526,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn cli_parses_estop_resume_domain() {
         let cli = Cli::try_parse_from(["zeroclaw", "estop", "resume", "--domain", "*.chase.com"])
             .expect("estop resume command should parse");
@@ -3541,7 +3541,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn agent_command_parses_with_temperature() {
         let cli = Cli::try_parse_from(["zeroclaw", "agent", "--temperature", "0.5"])
             .expect("agent command with temperature should parse");
@@ -3555,7 +3555,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn agent_command_parses_without_temperature() {
         let cli = Cli::try_parse_from(["zeroclaw", "agent", "--message", "hello"])
             .expect("agent command without temperature should parse");
@@ -3569,7 +3569,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn agent_command_parses_session_state_file() {
         let cli =
             Cli::try_parse_from(["zeroclaw", "agent", "--session-state-file", "session.json"])
@@ -3586,7 +3586,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn agent_fallback_uses_config_default_temperature() {
         // Test that when user doesn't provide --temperature,
         // the fallback logic works correctly
@@ -3607,7 +3607,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn agent_fallback_uses_hardcoded_when_config_uses_default() {
         // Test that when config uses default value (0.7), fallback still works
         let config = Config::default();
