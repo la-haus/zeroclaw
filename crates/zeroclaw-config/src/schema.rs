@@ -5376,15 +5376,27 @@ impl Default for MemoryConfig {
 
 // ── Observability ─────────────────────────────────────────────────
 
+/// Configuration for a single OTLP export endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct OtelEndpointConfig {
+    /// OTLP endpoint URL (e.g. "https://api.smith.langchain.com/otel").
+    pub endpoint: String,
+    /// Optional HTTP headers (e.g. authorization tokens).
+    #[serde(default)]
+    pub headers: Option<std::collections::HashMap<String, String>>,
+}
+
 /// Observability backend configuration (`[observability]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "observability"]
 pub struct ObservabilityConfig {
-    /// "none" | "log" | "verbose" | "prometheus" | "otel"
+    /// "none" | "log" | "verbose" | "prometheus" | "otel" | "datadog-log"
     pub backend: String,
 
     /// OTLP endpoint (e.g. "http://localhost:4318"). Only used when backend = "otel".
+    /// Backwards-compatible single-endpoint config. Prefer otel_endpoints for multi-target.
     #[serde(default)]
     pub otel_endpoint: Option<String>,
 
@@ -5393,13 +5405,24 @@ pub struct ObservabilityConfig {
     pub otel_service_name: Option<String>,
 
     /// Optional HTTP headers sent with every OTLP export request (e.g. authorization).
-    /// Specified as key-value pairs in TOML:
-    /// ```toml
-    /// [observability.otel_headers]
-    /// Authorization = "Bearer sk-..."
-    /// ```
+    /// Backwards-compatible single-endpoint headers. Prefer otel_endpoints for multi-target.
     #[serde(default)]
     pub otel_headers: Option<std::collections::HashMap<String, String>>,
+
+    /// Multiple OTLP endpoints for fan-out export (e.g. Datadog + LangSmith).
+    /// Each entry creates a separate OtelObserver instance wrapped in MultiObserver.
+    /// When non-empty, otel_endpoint/otel_headers are also included as the first endpoint.
+    /// ```toml
+    /// [[observability.otel_endpoints]]
+    /// endpoint = "http://datadog-agent:4318"
+    ///
+    /// [[observability.otel_endpoints]]
+    /// endpoint = "https://api.smith.langchain.com/otel"
+    /// [observability.otel_endpoints.headers]
+    /// x-api-key = "lsv2_..."
+    /// ```
+    #[serde(default)]
+    pub otel_endpoints: Vec<OtelEndpointConfig>,
 
     /// Runtime trace storage mode: "none" | "rolling" | "full".
     /// Controls whether model replies and tool-call diagnostics are persisted.
@@ -5422,6 +5445,7 @@ impl Default for ObservabilityConfig {
             otel_endpoint: None,
             otel_service_name: None,
             otel_headers: None,
+            otel_endpoints: Vec::new(),
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),

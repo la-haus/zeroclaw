@@ -57,7 +57,7 @@ mod tests {
     }
 
     #[test]
-    fn factory_otel_returns_otel() {
+    fn factory_otel_returns_multi() {
         let cfg = ObservabilityConfig {
             backend: "otel".into(),
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
@@ -65,7 +65,7 @@ mod tests {
             ..ObservabilityConfig::default()
         };
         let expected = if cfg!(feature = "observability-otel") {
-            "otel"
+            "multi"
         } else {
             "noop"
         };
@@ -81,7 +81,7 @@ mod tests {
             ..ObservabilityConfig::default()
         };
         let expected = if cfg!(feature = "observability-otel") {
-            "otel"
+            "multi"
         } else {
             "noop"
         };
@@ -97,7 +97,7 @@ mod tests {
             ..ObservabilityConfig::default()
         };
         let expected = if cfg!(feature = "observability-otel") {
-            "otel"
+            "multi"
         } else {
             "noop"
         };

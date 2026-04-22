@@ -1,3 +1,4 @@
+pub mod datadog_log;
 pub mod dora;
 pub mod log;
 pub mod multi;
@@ -14,6 +15,7 @@ pub mod verbose;
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;
+pub use datadog_log::DatadogLogObserver;
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
@@ -30,6 +32,7 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     match config.backend.as_str() {
         "log" => Box::new(LogObserver::new()),
         "verbose" => Box::new(VerboseObserver::new()),
+        "datadog-log" => Box::new(DatadogLogObserver::new()),
         "prometheus" => {
             #[cfg(feature = "observability-prometheus")]
             {
@@ -45,24 +48,64 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
         }
         "otel" | "opentelemetry" | "otlp" => {
             #[cfg(feature = "observability-otel")]
-            match OtelObserver::new(
-                config.otel_endpoint.as_deref(),
-                config.otel_service_name.as_deref(),
-                config.otel_headers.clone(),
-            ) {
-                Ok(obs) => {
-                    tracing::info!(
-                        endpoint = config
-                            .otel_endpoint
-                            .as_deref()
-                            .unwrap_or("http://localhost:4318"),
-                        "OpenTelemetry observer initialized"
-                    );
-                    Box::new(obs)
+            {
+                let mut observers: Vec<Box<dyn Observer>> = Vec::new();
+
+                // Build consolidated endpoint list
+                let mut endpoints: Vec<(
+                    String,
+                    Option<std::collections::HashMap<String, String>>,
+                )> = Vec::new();
+
+                // Legacy single-endpoint config (backwards compat)
+                if let Some(ref ep) = config.otel_endpoint {
+                    endpoints.push((ep.clone(), config.otel_headers.clone()));
                 }
-                Err(e) => {
-                    tracing::error!("Failed to create OTel observer: {e}. Falling back to noop.");
+
+                // New multi-endpoint config
+                for ep_cfg in &config.otel_endpoints {
+                    // Deduplicate: skip if same endpoint already added from legacy config
+                    if !endpoints.iter().any(|(e, _)| e == &ep_cfg.endpoint) {
+                        endpoints.push((ep_cfg.endpoint.clone(), ep_cfg.headers.clone()));
+                    }
+                }
+
+                // If no endpoints configured at all, use default
+                if endpoints.is_empty() {
+                    endpoints.push(("http://localhost:4318".into(), None));
+                }
+
+                for (i, (endpoint, headers)) in endpoints.iter().enumerate() {
+                    let instance_name = format!("otel-{}", i);
+                    match OtelObserver::new(
+                        Some(endpoint.as_str()),
+                        config.otel_service_name.as_deref(),
+                        headers.clone(),
+                        Some(&instance_name),
+                    ) {
+                        Ok(obs) => {
+                            tracing::info!(
+                                endpoint = %endpoint,
+                                instance = %instance_name,
+                                "OpenTelemetry observer initialized"
+                            );
+                            observers.push(Box::new(obs));
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to create OTel observer for {}: {e}", endpoint);
+                        }
+                    }
+                }
+
+                // Always include DatadogLogObserver for structured stdout logging
+                observers.push(Box::new(DatadogLogObserver::new()));
+
+                if observers.is_empty() {
                     Box::new(NoopObserver)
+                } else if observers.len() == 1 {
+                    observers.pop().unwrap()
+                } else {
+                    Box::new(MultiObserver::new(observers))
                 }
             }
             #[cfg(not(feature = "observability-otel"))]
@@ -125,6 +168,15 @@ mod tests {
     }
 
     #[test]
+    fn factory_datadog_log_returns_datadog_log() {
+        let cfg = ObservabilityConfig {
+            backend: "datadog-log".into(),
+            ..ObservabilityConfig::default()
+        };
+        assert_eq!(create_observer(&cfg).name(), "datadog-log");
+    }
+
+    #[test]
     fn factory_prometheus_returns_prometheus() {
         let cfg = ObservabilityConfig {
             backend: "prometheus".into(),
@@ -139,19 +191,22 @@ mod tests {
     }
 
     #[test]
-    fn factory_otel_returns_otel() {
+    fn factory_otel_returns_multi_with_datadog_log() {
         let cfg = ObservabilityConfig {
             backend: "otel".into(),
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
             ..ObservabilityConfig::default()
         };
+        let obs = create_observer(&cfg);
+        // With otel feature: returns "multi" (OtelObserver + DatadogLogObserver)
+        // Without: returns "noop"
         let expected = if cfg!(feature = "observability-otel") {
-            "otel"
+            "multi"
         } else {
             "noop"
         };
-        assert_eq!(create_observer(&cfg).name(), expected);
+        assert_eq!(obs.name(), expected);
     }
 
     #[test]
@@ -162,12 +217,13 @@ mod tests {
             otel_service_name: Some("test".into()),
             ..ObservabilityConfig::default()
         };
+        let obs = create_observer(&cfg);
         let expected = if cfg!(feature = "observability-otel") {
-            "otel"
+            "multi"
         } else {
             "noop"
         };
-        assert_eq!(create_observer(&cfg).name(), expected);
+        assert_eq!(obs.name(), expected);
     }
 
     #[test]
@@ -178,12 +234,13 @@ mod tests {
             otel_service_name: Some("test".into()),
             ..ObservabilityConfig::default()
         };
+        let obs = create_observer(&cfg);
         let expected = if cfg!(feature = "observability-otel") {
-            "otel"
+            "multi"
         } else {
             "noop"
         };
-        assert_eq!(create_observer(&cfg).name(), expected);
+        assert_eq!(obs.name(), expected);
     }
 
     #[test]
