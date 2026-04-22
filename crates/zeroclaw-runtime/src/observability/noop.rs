@@ -37,6 +37,7 @@ mod tests {
         obs.record_event(&ObserverEvent::AgentStart {
             provider: "test".into(),
             model: "test".into(),
+            user_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "test".into(),

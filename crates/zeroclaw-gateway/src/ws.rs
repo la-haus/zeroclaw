@@ -63,6 +63,8 @@ pub struct WsQuery {
     pub session_id: Option<String>,
     /// Optional human-readable name for the session.
     pub name: Option<String>,
+    /// Optional user identifier (phone, user ID, job name, etc.) for tracing/logging.
+    pub user_id: Option<String>,
 }
 
 /// Extract a bearer token from WebSocket-compatible sources.
@@ -142,7 +144,8 @@ pub async fn handle_ws_chat(
 
     let session_id = params.session_id;
     let session_name = params.name;
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, session_name))
+    let user_id = params.user_id;
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, session_name, user_id))
         .into_response()
 }
 
@@ -154,6 +157,7 @@ async fn handle_socket(
     state: AppState,
     session_id: Option<String>,
     session_name: Option<String>,
+    user_id: Option<String>,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -185,6 +189,11 @@ async fn handle_socket(
         }
     };
     agent.set_memory_session_id(Some(session_id.clone()));
+    agent.user_id = user_id.clone();
+
+    if let Some(ref uid) = user_id {
+        tracing::info!(user_id = %uid, session_id = %session_id, "User ID attached to session");
+    }
 
     // Hydrate agent from persisted session (if available)
     let mut resumed = false;
@@ -219,6 +228,9 @@ async fn handle_socket(
     });
     if let Some(ref name) = effective_name {
         session_start["name"] = serde_json::Value::String(name.clone());
+    }
+    if let Some(ref uid) = user_id {
+        session_start["user_id"] = serde_json::Value::String(uid.clone());
     }
     let _ = sender
         .send(Message::Text(session_start.to_string().into()))

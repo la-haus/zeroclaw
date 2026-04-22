@@ -61,6 +61,8 @@ pub struct Agent {
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     auto_save: bool,
     memory_session_id: Option<String>,
+    /// Optional user identifier for tracing/logging (phone, user ID, job name).
+    pub user_id: Option<String>,
     history: Vec<ConversationMessage>,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
     available_hints: Vec<String>,
@@ -347,6 +349,7 @@ impl AgentBuilder {
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
             memory_session_id: self.memory_session_id,
+            user_id: None,
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
@@ -1114,6 +1117,7 @@ impl Agent {
         self.observer.record_event(&ObserverEvent::AgentStart {
             provider: self.provider_name.clone(),
             model: self.model_name.clone(),
+            user_id: self.user_id.clone(),
         });
 
         // ── Preamble (identical to turn) ───────────────────────────────
@@ -1575,6 +1579,7 @@ pub async fn run(
     agent.observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.clone(),
         model: model_name.clone(),
+        user_id: agent.user_id.clone(),
     });
 
     if let Some(msg) = message {

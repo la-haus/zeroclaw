@@ -9,7 +9,12 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub enum ObserverEvent {
     /// The agent orchestration loop has started a new session.
-    AgentStart { provider: String, model: String },
+    AgentStart {
+        provider: String,
+        model: String,
+        /// Optional user identifier (phone, user ID, job name) for tracing/logging.
+        user_id: Option<String>,
+    },
     /// A request is about to be sent to an LLM provider.
     ///
     /// This is emitted immediately before a provider call so observers can print
