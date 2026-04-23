@@ -73,6 +73,10 @@ pub async fn execute_one_tool(
                 None
             },
         });
+        observer.record_event(&ObserverEvent::Error {
+            component: format!("tool.{call_name}"),
+            message: reason.clone(),
+        });
         return Ok(ToolExecutionOutcome {
             output: reason.clone(),
             success: false,
@@ -139,6 +143,10 @@ pub async fn execute_one_tool(
                 } else {
                     None
                 },
+            });
+            observer.record_event(&ObserverEvent::Error {
+                component: format!("tool.{call_name}"),
+                message: scrub_credentials(&reason),
             });
             Ok(ToolExecutionOutcome {
                 output: reason.clone(),
