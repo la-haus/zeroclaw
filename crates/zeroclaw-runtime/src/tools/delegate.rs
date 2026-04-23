@@ -69,6 +69,8 @@ pub struct DelegateTool {
     delegate_config: DelegateToolConfig,
     /// Workspace directory inherited from the root agent context.
     workspace_dir: PathBuf,
+    /// Whether skills containing script files (.sh, etc.) are allowed.
+    allow_scripts: bool,
     /// Cancellation token for cascade control of background tasks.
     cancellation_token: CancellationToken,
     /// Optional memory instance for namespace isolation on delegate agents.
@@ -105,6 +107,7 @@ impl DelegateTool {
             multimodal_config: zeroclaw_config::schema::MultimodalConfig::default(),
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: PathBuf::new(),
+            allow_scripts: false,
             cancellation_token: CancellationToken::new(),
             memory: None,
         }
@@ -145,9 +148,16 @@ impl DelegateTool {
             multimodal_config: zeroclaw_config::schema::MultimodalConfig::default(),
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: PathBuf::new(),
+            allow_scripts: false,
             cancellation_token: CancellationToken::new(),
             memory: None,
         }
+    }
+
+    /// Set whether skills containing script files are allowed.
+    pub fn with_allow_scripts(mut self, allow_scripts: bool) -> Self {
+        self.allow_scripts = allow_scripts;
+        self
     }
 
     /// Attach parent tools used to build sub-agent allowlist registries.
@@ -638,6 +648,7 @@ impl DelegateTool {
         let multimodal_config = self.multimodal_config.clone();
         let delegate_config = self.delegate_config.clone();
         let workspace_dir = self.workspace_dir.clone();
+        let allow_scripts = self.allow_scripts;
         let child_token = self.cancellation_token.child_token();
         let task_id_clone = task_id.clone();
 
@@ -653,6 +664,7 @@ impl DelegateTool {
                 multimodal_config,
                 delegate_config,
                 workspace_dir: workspace_dir.clone(),
+                allow_scripts,
                 cancellation_token: child_token.clone(),
                 memory: None,
             };
@@ -795,6 +807,7 @@ impl DelegateTool {
             let multimodal_config = self.multimodal_config.clone();
             let delegate_config = self.delegate_config.clone();
             let workspace_dir = self.workspace_dir.clone();
+            let allow_scripts = self.allow_scripts;
             let cancellation_token = self.cancellation_token.child_token();
             let agent_name = agent_name.clone();
             let prompt = prompt.to_string();
@@ -811,6 +824,7 @@ impl DelegateTool {
                     multimodal_config,
                     delegate_config,
                     workspace_dir,
+                    allow_scripts,
                     cancellation_token,
                     memory: None,
                 };
@@ -1029,7 +1043,7 @@ impl DelegateTool {
             .filter(|s| !s.trim().is_empty())
             .map(|dir| workspace_dir.join(dir))
             .unwrap_or_else(|| crate::skills::skills_dir(workspace_dir));
-        let skills = crate::skills::load_skills_from_directory(&skills_dir, false);
+        let skills = crate::skills::load_skills_from_directory(&skills_dir, self.allow_scripts);
 
         // Determine shell policy instructions when the `shell` tool is in the
         // effective tool list.
