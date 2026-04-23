@@ -1,6 +1,6 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use std::any::Any;
-use tracing::info;
+use tracing::{error, info, warn};
 
 /// Log-based observer — uses tracing, zero external deps
 pub struct LogObserver;
@@ -46,7 +46,11 @@ impl Observer for LogObserver {
                 ..
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-                info!(tool = %tool, duration_ms = ms, success = success, "tool.call");
+                if *success {
+                    info!(tool = %tool, duration_ms = ms, success = success, "tool.call");
+                } else {
+                    warn!(tool = %tool, duration_ms = ms, success = success, "tool.call");
+                }
             }
             ObserverEvent::TurnComplete => {
                 info!("turn.complete");
@@ -67,7 +71,7 @@ impl Observer for LogObserver {
                 info!(cache_type = %cache_type, "cache.miss");
             }
             ObserverEvent::Error { component, message } => {
-                info!(component = %component, error = %message, "error");
+                error!(component = %component, error = %message, "error");
             }
             ObserverEvent::LlmRequest {
                 provider,
@@ -93,16 +97,28 @@ impl Observer for LogObserver {
                 ..
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-                info!(
-                    provider = %provider,
-                    model = %model,
-                    duration_ms = ms,
-                    success = success,
-                    error = ?error_message,
-                    input_tokens = ?input_tokens,
-                    output_tokens = ?output_tokens,
-                    "llm.response"
-                );
+                if *success {
+                    info!(
+                        provider = %provider,
+                        model = %model,
+                        duration_ms = ms,
+                        success = success,
+                        input_tokens = ?input_tokens,
+                        output_tokens = ?output_tokens,
+                        "llm.response"
+                    );
+                } else {
+                    error!(
+                        provider = %provider,
+                        model = %model,
+                        duration_ms = ms,
+                        success = success,
+                        error = ?error_message,
+                        input_tokens = ?input_tokens,
+                        output_tokens = ?output_tokens,
+                        "llm.response"
+                    );
+                }
             }
             ObserverEvent::HandStarted { hand_name } => {
                 info!(hand = %hand_name, "hand.started");
@@ -119,7 +135,7 @@ impl Observer for LogObserver {
                 error,
                 duration_ms,
             } => {
-                info!(hand = %hand_name, error = %error, duration_ms = duration_ms, "hand.failed");
+                error!(hand = %hand_name, error = %error, duration_ms = duration_ms, "hand.failed");
             }
             ObserverEvent::DeploymentStarted { deploy_id } => {
                 info!(deploy_id = %deploy_id, "deployment.started");
@@ -131,7 +147,7 @@ impl Observer for LogObserver {
                 info!(deploy_id = %deploy_id, commit_sha = %commit_sha, "deployment.completed");
             }
             ObserverEvent::DeploymentFailed { deploy_id, reason } => {
-                info!(deploy_id = %deploy_id, reason = %reason, "deployment.failed");
+                error!(deploy_id = %deploy_id, reason = %reason, "deployment.failed");
             }
             ObserverEvent::RecoveryCompleted { deploy_id } => {
                 info!(deploy_id = %deploy_id, "recovery.completed");

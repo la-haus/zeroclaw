@@ -1312,6 +1312,10 @@ pub async fn run_tool_call_loop(
                     output_tokens: None,
                     response_content: None,
                 });
+                observer.record_event(&ObserverEvent::Error {
+                    component: "llm".to_string(),
+                    message: safe_error.clone(),
+                });
                 runtime_trace::record_event(
                     "llm_response",
                     Some(channel_name),
