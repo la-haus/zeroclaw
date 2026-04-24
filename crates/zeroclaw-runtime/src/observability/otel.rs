@@ -537,12 +537,6 @@ impl Observer for OtelObserver {
                     .checked_sub(*duration)
                     .unwrap_or(SystemTime::now());
 
-                let status = if *success {
-                    Status::Ok
-                } else {
-                    Status::error("")
-                };
-
                 let mut span_attrs = vec![
                     KeyValue::new("tool.name", tool.clone()),
                     KeyValue::new("tool.success", *success),
@@ -552,12 +546,17 @@ impl Observer for OtelObserver {
                 if let Some(ref args) = tool_args {
                     span_attrs.push(KeyValue::new("tool.arguments", args.clone()));
                 }
+                let mut error_msg = String::new();
                 if let Some(out) = output {
                     let truncated = if out.len() > 4096 {
                         format!("{}...", &out[..out.floor_char_boundary(4096)])
                     } else {
                         out.clone()
                     };
+                    if !*success {
+                        error_msg = truncated.clone();
+                        span_attrs.push(KeyValue::new("error.message", truncated.clone()));
+                    }
                     span_attrs.push(KeyValue::new("tool.output", truncated.clone()));
 
                     if langsmith_compat_enabled() {
@@ -581,7 +580,11 @@ impl Observer for OtelObserver {
 
                 let parent_ctx = self.agent_context.lock().clone();
                 let mut span = child_span!(builder, parent_ctx);
-                span.set_status(status);
+                if *success {
+                    span.set_status(Status::Ok);
+                } else {
+                    span.set_status(Status::error(error_msg));
+                }
                 span.end();
 
                 let attrs = [
