@@ -555,6 +555,12 @@ pub struct ModelProviderConfig {
     /// Merge system messages into first user message.
     #[serde(default)]
     pub merge_system_into_user: bool,
+    /// Extended thinking budget tokens for Anthropic models.
+    /// When set, enables native extended thinking with the specified token budget.
+    /// The model's reasoning goes into separate `thinking` blocks.
+    /// Can also be set via `ZEROCLAW_EXTENDED_THINKING_BUDGET` env var.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extended_thinking_budget: Option<u32>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -1497,6 +1503,14 @@ pub struct AgentConfig {
     /// behavior). Default: `2`.
     #[serde(default = "default_keep_tool_context_turns")]
     pub keep_tool_context_turns: usize,
+
+    /// Friendly fallback message sent to the user when the agent fails
+    /// (provider error, timeout, max iterations). When set, this message
+    /// replaces the raw error in user-facing channels. The actual error is
+    /// still logged for observability.
+    /// Can also be set via `ZEROCLAW_ERROR_FALLBACK_MESSAGE` env var.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_fallback_message: Option<String>,
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -1548,6 +1562,7 @@ impl Default for AgentConfig {
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
+            error_fallback_message: None,
         }
     }
 }

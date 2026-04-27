@@ -39,6 +39,19 @@ impl ThinkingLevel {
             _ => None,
         }
     }
+
+    /// Returns a suggested `budget_tokens` value for Anthropic extended thinking.
+    /// `Off` and `Minimal` return `None` (no extended thinking), while higher
+    /// levels map to progressively larger token budgets.
+    pub fn suggested_budget_tokens(&self) -> Option<u32> {
+        match self {
+            Self::Off | Self::Minimal => None,
+            Self::Low => Some(4_000),
+            Self::Medium => Some(8_000),
+            Self::High => Some(16_000),
+            Self::Max => Some(32_000),
+        }
+    }
 }
 
 /// Configuration for thinking/reasoning level control.

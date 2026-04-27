@@ -14,6 +14,8 @@ pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
     max_tokens: u32,
+    /// When set, enables Anthropic extended thinking with the given budget.
+    extended_thinking_budget: Option<u32>,
 }
 
 const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 4096;
@@ -51,6 +53,14 @@ struct ContentBlock {
     text: Option<String>,
 }
 
+/// Extended thinking configuration for native Anthropic API requests.
+#[derive(Debug, Serialize)]
+struct NativeThinkingConfig {
+    #[serde(rename = "type")]
+    kind: String,
+    budget_tokens: u32,
+}
+
 #[derive(Debug, Serialize)]
 struct NativeChatRequest<'a> {
     model: String,
@@ -65,6 +75,8 @@ struct NativeChatRequest<'a> {
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<NativeThinkingConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -200,6 +212,7 @@ impl AnthropicProvider {
                 .map(ToString::to_string),
             base_url,
             max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
+            extended_thinking_budget: None,
         }
     }
 
@@ -207,6 +220,34 @@ impl AnthropicProvider {
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
         self
+    }
+
+    /// Enable extended thinking with the given budget token count.
+    /// When enabled, the model's reasoning goes into separate `thinking` blocks
+    /// and `max_tokens` is automatically adjusted to be at least `budget + 1024`.
+    /// Enable extended thinking with the given budget token count.
+    /// When enabled, the model's reasoning goes into separate `thinking` blocks
+    /// and `max_tokens` is automatically adjusted to be at least `budget + 1024`.
+    pub fn with_extended_thinking_budget(mut self, budget: Option<u32>) -> Self {
+        self.extended_thinking_budget = budget;
+        self
+    }
+
+    /// Returns `(effective_max_tokens, Option<NativeThinkingConfig>)` based on
+    /// whether extended thinking is enabled.
+    fn thinking_params(&self) -> (u32, Option<NativeThinkingConfig>) {
+        match self.extended_thinking_budget {
+            Some(budget) if budget > 0 => {
+                // Anthropic requires max_tokens > budget_tokens
+                let effective_max = self.max_tokens.max(budget + 1024);
+                let config = NativeThinkingConfig {
+                    kind: "enabled".to_string(),
+                    budget_tokens: budget,
+                };
+                (effective_max, Some(config))
+            }
+            _ => (self.max_tokens, None),
+        }
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -227,7 +268,14 @@ impl AnthropicProvider {
                 )
                 .header("anthropic-dangerous-direct-browser-access", "true")
         } else {
-            request.header("x-api-key", credential)
+            let req = request.header("x-api-key", credential);
+            // Add the interleaved-thinking beta header for API-key auth when
+            // extended thinking is enabled.
+            if self.extended_thinking_budget.is_some() {
+                req.header("anthropic-beta", "interleaved-thinking-2025-05-14")
+            } else {
+                req
+            }
         }
     }
 
@@ -513,6 +561,7 @@ impl AnthropicProvider {
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
+        let mut thinking_parts = Vec::new();
 
         let usage = response.usage.map(|u| TokenUsage {
             input_tokens: u.input_tokens,
@@ -522,6 +571,13 @@ impl AnthropicProvider {
 
         for block in response.content {
             match block.kind.as_str() {
+                "thinking" => {
+                    if let Some(text) = block.text.map(|t| t.trim().to_string())
+                        && !text.is_empty()
+                    {
+                        thinking_parts.push(text);
+                    }
+                }
                 "text" => {
                     if let Some(text) = block.text.map(|t| t.trim().to_string())
                         && !text.is_empty()
@@ -555,7 +611,11 @@ impl AnthropicProvider {
             },
             tool_calls,
             usage,
-            reasoning_content: None,
+            reasoning_content: if thinking_parts.is_empty() {
+                None
+            } else {
+                Some(thinking_parts.join("\n"))
+            },
         }
     }
 
@@ -595,6 +655,7 @@ impl AnthropicProvider {
         let mut stream_input_tokens: u64 = 0;
         let mut stream_output_tokens: u64 = 0;
         let mut stream_cached_tokens: u64 = 0;
+        let mut in_thinking_block = false;
 
         while let Ok(Some(line)) = lines.next_line().await {
             let line = line.trim().to_string();
@@ -648,27 +709,39 @@ impl AnthropicProvider {
                             .get("type")
                             .and_then(|t| t.as_str())
                             .unwrap_or_default();
-                        if block_type == "tool_use" {
-                            if let Some(id) = tool_id.take() {
-                                let name = tool_name.take().unwrap_or_default();
-                                let input = std::mem::take(&mut tool_input_json);
-                                let _ = tx
-                                    .send(Ok(StreamEvent::ToolCall(ProviderToolCall {
-                                        id,
-                                        name,
-                                        arguments: input,
-                                    })))
-                                    .await;
+                        match block_type {
+                            "thinking" => {
+                                in_thinking_block = true;
                             }
-                            tool_id = block
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .map(ToString::to_string);
-                            tool_name = block
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .map(ToString::to_string);
-                            tool_input_json.clear();
+                            "text" => {
+                                in_thinking_block = false;
+                            }
+                            "tool_use" => {
+                                in_thinking_block = false;
+                                if let Some(id) = tool_id.take() {
+                                    let name = tool_name.take().unwrap_or_default();
+                                    let input = std::mem::take(&mut tool_input_json);
+                                    let _ = tx
+                                        .send(Ok(StreamEvent::ToolCall(ProviderToolCall {
+                                            id,
+                                            name,
+                                            arguments: input,
+                                        })))
+                                        .await;
+                                }
+                                tool_id = block
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .map(ToString::to_string);
+                                tool_name = block
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .map(ToString::to_string);
+                                tool_input_json.clear();
+                            }
+                            _ => {
+                                in_thinking_block = false;
+                            }
                         }
                     }
                 }
@@ -679,17 +752,33 @@ impl AnthropicProvider {
                             .and_then(|t| t.as_str())
                             .unwrap_or_default();
                         match delta_type {
-                            "text_delta" => {
-                                if let Some(text) = delta.get("text").and_then(|t| t.as_str())
+                            "thinking_delta" => {
+                                if let Some(text) = delta.get("thinking").and_then(|t| t.as_str())
                                     && !text.is_empty()
                                     && tx
-                                        .send(Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                                        .send(Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
                                             text.to_string(),
                                         ))))
                                         .await
                                         .is_err()
                                 {
                                     return;
+                                }
+                            }
+                            "text_delta" => {
+                                if let Some(text) = delta.get("text").and_then(|t| t.as_str())
+                                    && !text.is_empty()
+                                {
+                                    // When inside a thinking block (interleaved thinking),
+                                    // text deltas are actually thinking content.
+                                    let chunk = if in_thinking_block {
+                                        StreamChunk::reasoning(text.to_string())
+                                    } else {
+                                        StreamChunk::delta(text.to_string())
+                                    };
+                                    if tx.send(Ok(StreamEvent::TextDelta(chunk))).await.is_err() {
+                                        return;
+                                    }
                                 }
                             }
                             "input_json_delta" => {
@@ -798,10 +887,11 @@ impl Provider for AnthropicProvider {
             system
         };
 
-        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic API request");
+        let (effective_max_tokens, thinking_config) = self.thinking_params();
+        tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic API request");
         let request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: self.max_tokens,
+            max_tokens: effective_max_tokens,
             system,
             messages: vec![NativeMessage {
                 role: "user".to_string(),
@@ -814,6 +904,7 @@ impl Provider for AnthropicProvider {
             tools: None,
             tool_choice: None,
             stream: None,
+            thinking: thinking_config,
         };
 
         let mut request = self
@@ -876,16 +967,18 @@ impl Provider for AnthropicProvider {
         } else {
             system_prompt
         };
-        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic streaming API request");
+        let (effective_max_tokens, thinking_config) = self.thinking_params();
+        tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic streaming API request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: self.max_tokens,
+            max_tokens: effective_max_tokens,
             system: system_prompt,
             messages,
             temperature,
             tools: native_tools,
             tool_choice,
             stream: None,
+            thinking: thinking_config,
         };
 
         let req = self
@@ -1030,16 +1123,18 @@ impl Provider for AnthropicProvider {
             system_prompt
         };
 
-        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic stream_chat request");
+        let (effective_max_tokens, thinking_config) = self.thinking_params();
+        tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic stream_chat request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: self.max_tokens,
+            max_tokens: effective_max_tokens,
             system: system_prompt,
             messages,
             temperature,
             tools: native_tools,
             tool_choice,
             stream: Some(true),
+            thinking: thinking_config,
         };
 
         let body = Self::build_streaming_request(&native_request);
@@ -1697,6 +1792,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: None,
+            thinking: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -1790,6 +1886,7 @@ mod tests {
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
             max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
+            extended_thinking_budget: None,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
