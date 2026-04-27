@@ -545,26 +545,40 @@ async fn process_chat_message(
 
             tracing::error!(error = %e, "Agent turn failed");
             let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
-            let error_code = if sanitized.to_lowercase().contains("api key")
-                || sanitized.to_lowercase().contains("authentication")
-                || sanitized.to_lowercase().contains("unauthorized")
-            {
-                "AUTH_ERROR"
-            } else if sanitized.to_lowercase().contains("provider")
-                || sanitized.to_lowercase().contains("model")
-            {
-                "PROVIDER_ERROR"
-            } else {
-                "AGENT_ERROR"
-            };
-            let err = serde_json::json!({
-                "type": "error",
-                "message": sanitized,
-                "code": error_code,
-            });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
 
-            // Broadcast error event
+            // When a fallback message is configured, send it as a friendly
+            // response instead of the raw error JSON.
+            if let Some(ref fallback) = state.error_fallback_message {
+                let reset = serde_json::json!({ "type": "chunk_reset" });
+                let _ = sender.send(Message::Text(reset.to_string().into())).await;
+
+                let done = serde_json::json!({
+                    "type": "done",
+                    "full_response": fallback,
+                });
+                let _ = sender.send(Message::Text(done.to_string().into())).await;
+            } else {
+                let error_code = if sanitized.to_lowercase().contains("api key")
+                    || sanitized.to_lowercase().contains("authentication")
+                    || sanitized.to_lowercase().contains("unauthorized")
+                {
+                    "AUTH_ERROR"
+                } else if sanitized.to_lowercase().contains("provider")
+                    || sanitized.to_lowercase().contains("model")
+                {
+                    "PROVIDER_ERROR"
+                } else {
+                    "AGENT_ERROR"
+                };
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": sanitized,
+                    "code": error_code,
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+            }
+
+            // Broadcast error event (always, for observability)
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "error",
                 "component": "ws_chat",

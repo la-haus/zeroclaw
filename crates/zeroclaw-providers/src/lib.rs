@@ -713,6 +713,9 @@ pub struct ProviderRuntimeOptions {
     /// When true, system messages are merged into the first user message before
     /// sending. Propagated from `ModelProviderConfig::merge_system_into_user`.
     pub merge_system_into_user: bool,
+    /// Extended thinking budget tokens for Anthropic models.
+    /// When set, enables native extended thinking with the specified budget.
+    pub extended_thinking_budget: Option<u32>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -729,6 +732,7 @@ impl Default for ProviderRuntimeOptions {
             api_path: None,
             provider_max_tokens: None,
             merge_system_into_user: false,
+            extended_thinking_budget: None,
         }
     }
 }
@@ -771,6 +775,20 @@ pub fn provider_runtime_options_from_config(
         api_path: fallback.and_then(|e| e.api_path.clone()),
         provider_max_tokens: fallback.and_then(|e| e.max_tokens),
         merge_system_into_user,
+        extended_thinking_budget: fallback
+            .and_then(|e| e.extended_thinking_budget)
+            .or_else(|| {
+                std::env::var("ZEROCLAW_EXTENDED_THINKING_BUDGET")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
+            .or_else(|| {
+                config
+                    .agent
+                    .thinking
+                    .default_level
+                    .suggested_budget_tokens()
+            }),
     }
 }
 
@@ -1192,6 +1210,7 @@ fn create_provider_with_url_and_options(
             if let Some(mt) = options.provider_max_tokens {
                 p = p.with_max_tokens(mt);
             }
+            p = p.with_extended_thinking_budget(options.extended_thinking_budget);
             Ok(Box::new(p))
         }
         "openai" => {
