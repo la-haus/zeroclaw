@@ -235,7 +235,9 @@ impl AnthropicProvider {
 
     /// Returns `(effective_max_tokens, Option<NativeThinkingConfig>)` based on
     /// whether extended thinking is enabled.
-    fn thinking_params(&self) -> (u32, Option<NativeThinkingConfig>) {
+    /// Returns (effective_max_tokens, thinking_config, effective_temperature).
+    /// Anthropic requires `temperature = 1` when extended thinking is enabled.
+    fn thinking_params(&self, temperature: f64) -> (u32, Option<NativeThinkingConfig>, f64) {
         match self.extended_thinking_budget {
             Some(budget) if budget > 0 => {
                 // Anthropic requires max_tokens > budget_tokens
@@ -244,9 +246,10 @@ impl AnthropicProvider {
                     kind: "enabled".to_string(),
                     budget_tokens: budget,
                 };
-                (effective_max, Some(config))
+                // Anthropic requires temperature = 1 when thinking is enabled
+                (effective_max, Some(config), 1.0)
             }
-            _ => (self.max_tokens, None),
+            _ => (self.max_tokens, None, temperature),
         }
     }
 
@@ -887,7 +890,8 @@ impl Provider for AnthropicProvider {
             system
         };
 
-        let (effective_max_tokens, thinking_config) = self.thinking_params();
+        let (effective_max_tokens, thinking_config, temperature) =
+            self.thinking_params(temperature);
         tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic API request");
         let request = NativeChatRequest {
             model: model.to_string(),
@@ -967,7 +971,8 @@ impl Provider for AnthropicProvider {
         } else {
             system_prompt
         };
-        let (effective_max_tokens, thinking_config) = self.thinking_params();
+        let (effective_max_tokens, thinking_config, temperature) =
+            self.thinking_params(temperature);
         tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic streaming API request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
@@ -1123,7 +1128,8 @@ impl Provider for AnthropicProvider {
             system_prompt
         };
 
-        let (effective_max_tokens, thinking_config) = self.thinking_params();
+        let (effective_max_tokens, thinking_config, temperature) =
+            self.thinking_params(temperature);
         tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic stream_chat request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
