@@ -312,6 +312,11 @@ async fn run_agent_job(
     let mut cron_config = config.clone();
     cron_config.memory.auto_save = false;
 
+    // Assign a unique session ID so memories written during this run can be
+    // purged atomically if the run fails (prevents snowball accumulation).
+    let run_session_id = uuid::Uuid::new_v4().to_string();
+    let session_path = std::path::PathBuf::from(format!("cron-{run_session_id}"));
+
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
             Box::pin(crate::agent::run(
@@ -326,7 +331,7 @@ async fn run_agent_job(
                     .unwrap_or(0.7),
                 vec![],
                 false,
-                None,
+                Some(session_path.clone()),
                 job.allowed_tools.clone(),
             ))
             .await
@@ -342,7 +347,22 @@ async fn run_agent_job(
                 response
             },
         ),
-        Err(e) => (false, format!("agent job failed: {e}")),
+        Err(e) => {
+            // Purge memories written during this failed run so they don't
+            // pollute future recall and cause context snowball.
+            let mem_session_key = format!("cli:{}", session_path.display());
+            if let Ok(mem) = zeroclaw_memory::create_memory(
+                &config.memory,
+                &config.workspace_dir,
+                config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.api_key.as_deref()),
+            ) {
+                let _ = mem.purge_session(&mem_session_key).await;
+            }
+            (false, format!("agent job failed: {e}"))
+        }
     }
 }
 
