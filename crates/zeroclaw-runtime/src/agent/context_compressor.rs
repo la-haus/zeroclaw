@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use zeroclaw_api::provider::{ChatMessage, Provider};
 use zeroclaw_memory::traits::Memory;
+use zeroclaw_providers::multimodal;
 
 pub use zeroclaw_config::scattered_types::ContextCompressionConfig;
 
@@ -301,7 +302,11 @@ impl ContextCompressor {
 
         // Build transcript from the middle section
         let middle = &history[start..end];
-        let transcript = build_transcript(middle, self.config.source_max_chars);
+        let transcript = build_summarizer_transcript(
+            middle,
+            self.config.source_max_chars,
+            provider.supports_vision(),
+        );
 
         if transcript.is_empty() {
             return Ok(false);
@@ -460,6 +465,20 @@ fn build_transcript(messages: &[ChatMessage], max_chars: usize) -> String {
     } else {
         transcript
     }
+}
+
+fn build_summarizer_transcript(
+    messages: &[ChatMessage],
+    max_chars: usize,
+    supports_vision: bool,
+) -> String {
+    let transcript = build_transcript(messages, max_chars);
+    if supports_vision {
+        return transcript;
+    }
+
+    let (cleaned, refs) = multimodal::parse_image_markers(&transcript);
+    if refs.is_empty() { transcript } else { cleaned }
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {

@@ -526,6 +526,15 @@ pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)
 #[derive(Debug, Default)]
 struct StreamedChatOutcome {
     response_text: String,
+    /// Accumulated reasoning/thinking content from streaming deltas.
+    ///
+    /// Captured separately from `response_text` so it can be threaded into
+    /// `ChatResponse.reasoning_content` and ultimately persisted on the
+    /// `AssistantToolCalls` history entry. Required for providers like
+    /// DeepSeek V4 that reject follow-up requests when the assistant's
+    /// prior `reasoning_content` is missing from replayed tool-call turns
+    /// (see upstream issue #6059).
+    reasoning_content: String,
     tool_calls: Vec<ToolCall>,
     forwarded_live_deltas: bool,
 }
@@ -580,6 +589,21 @@ async fn consume_provider_streaming_response(
                 // do not affect the agent's tool dispatch loop.
             }
             StreamEvent::TextDelta(chunk) => {
+                // Reasoning/thinking deltas arrive on the same `TextDelta`
+                // event as plain text but populate `chunk.reasoning` instead
+                // of `chunk.delta`. They must be captured into the outcome
+                // even when `chunk.delta` is empty — otherwise providers
+                // that require reasoning to round-trip on subsequent turns
+                // (DeepSeek V4 thinking mode) reject the next request with
+                // a 400. Reasoning is never forwarded as a visible response
+                // delta — it is the model's internal monologue, kept for
+                // replay only.
+                if let Some(reasoning) = chunk.reasoning.as_deref()
+                    && !reasoning.is_empty()
+                {
+                    outcome.reasoning_content.push_str(reasoning);
+                }
+
                 if chunk.delta.is_empty() {
                     continue;
                 }
@@ -1074,11 +1098,16 @@ pub async fn run_tool_call_loop(
             {
                 Ok(streamed) => {
                     streamed_live_deltas = streamed.forwarded_live_deltas;
+                    let reasoning_content = if streamed.reasoning_content.is_empty() {
+                        None
+                    } else {
+                        Some(streamed.reasoning_content)
+                    };
                     Ok(zeroclaw_providers::ChatResponse {
                         text: Some(streamed.response_text),
                         tool_calls: streamed.tool_calls,
                         usage: None,
-                        reasoning_content: None,
+                        reasoning_content,
                     })
                 }
                 Err(stream_err) => {
