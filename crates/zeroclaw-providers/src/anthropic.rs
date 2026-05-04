@@ -977,9 +977,24 @@ impl Provider for AnthropicProvider {
         } else {
             system_prompt
         };
-        let (effective_max_tokens, thinking_config, temperature) =
-            self.thinking_params(temperature);
-        tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic streaming API request");
+        // Anthropic rejects thinking + forced tool_choice. Disable thinking
+        // when tool_choice forces a specific tool (structured output forcing).
+        let is_forced_tool = tool_choice
+            .as_ref()
+            .and_then(|tc| tc.get("type"))
+            .and_then(|t| t.as_str())
+            == Some("tool");
+        let (effective_max_tokens, thinking_config, temperature) = if is_forced_tool {
+            tracing::debug!(
+                model = %model,
+                max_tokens = self.max_tokens,
+                "Thinking disabled for forced tool_choice"
+            );
+            (self.max_tokens, None, temperature)
+        } else {
+            self.thinking_params(temperature)
+        };
+        tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic chat request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: effective_max_tokens,
@@ -1140,8 +1155,22 @@ impl Provider for AnthropicProvider {
             system_prompt
         };
 
-        let (effective_max_tokens, thinking_config, temperature) =
-            self.thinking_params(temperature);
+        // Anthropic rejects thinking + forced tool_choice — see chat() for details.
+        let is_forced_tool = tool_choice
+            .as_ref()
+            .and_then(|tc| tc.get("type"))
+            .and_then(|t| t.as_str())
+            == Some("tool");
+        let (effective_max_tokens, thinking_config, temperature) = if is_forced_tool {
+            tracing::debug!(
+                model = %model,
+                max_tokens = self.max_tokens,
+                "Thinking disabled for forced tool_choice"
+            );
+            (self.max_tokens, None, temperature)
+        } else {
+            self.thinking_params(temperature)
+        };
         tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic stream_chat request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
