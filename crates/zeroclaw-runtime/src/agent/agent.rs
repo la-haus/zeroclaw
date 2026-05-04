@@ -90,7 +90,9 @@ pub struct Agent {
     /// Optional JSON schema for structured output forcing.
     /// When set, the agent makes one extra LLM call with a forced tool to
     /// format the final response according to this schema.
-    pub output_schema: Option<serde_json::Value>,
+    /// Consumed (taken) after use — single-message sessions only.
+    /// Use `set_output_schema()` to configure.
+    output_schema: Option<serde_json::Value>,
 }
 
 pub struct AgentBuilder {

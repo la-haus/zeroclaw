@@ -67,8 +67,6 @@ pub struct WsQuery {
     pub user_id: Option<String>,
     /// Optional message identifier for trace correlation.
     pub message_id: Option<String>,
-    /// Optional JSON-encoded schema string for structured output forcing.
-    pub output_schema: Option<String>,
 }
 
 /// Extract a bearer token from WebSocket-compatible sources.
@@ -150,17 +148,8 @@ pub async fn handle_ws_chat(
     let session_name = params.name;
     let user_id = params.user_id;
     let message_id = params.message_id;
-    let output_schema = params.output_schema;
     ws.on_upgrade(move |socket| {
-        handle_socket(
-            socket,
-            state,
-            session_id,
-            session_name,
-            user_id,
-            message_id,
-            output_schema,
-        )
+        handle_socket(socket, state, session_id, session_name, user_id, message_id)
     })
     .into_response()
 }
@@ -175,7 +164,6 @@ async fn handle_socket(
     session_name: Option<String>,
     user_id: Option<String>,
     message_id: Option<String>,
-    output_schema: Option<String>,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -216,14 +204,6 @@ async fn handle_socket(
     agent.user_id = user_id.clone();
     agent.session_id = Some(session_id.clone());
     agent.message_id = message_id.clone();
-
-    // Set connection-level output_schema from query param (if valid JSON)
-    let connection_output_schema: Option<serde_json::Value> = output_schema
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok());
-    if let Some(ref schema) = connection_output_schema {
-        agent.set_output_schema(Some(schema.clone()));
-    }
 
     if let Some(ref uid) = user_id {
         tracing::info!(user_id = %uid, session_id = %session_id, "User ID attached to session");
