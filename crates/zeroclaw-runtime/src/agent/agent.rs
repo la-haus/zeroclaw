@@ -1196,7 +1196,7 @@ impl Agent {
         let effective_model = self.classify_model(user_message);
 
         // ── Turn loop ──────────────────────────────────────────────────
-        for _ in 0..self.config.max_tool_iterations {
+        for iteration in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
 
             // Response cache check (same as turn)
@@ -1472,11 +1472,66 @@ impl Agent {
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {
-                let final_text = if text.is_empty() {
+                let mut final_text = if text.is_empty() {
                     response.text.unwrap_or_default()
                 } else {
                     text
                 };
+
+                // === AUTO OUTPUT CLEANUP ===
+                // When output_schema_auto is enabled and the turn used many tool calls,
+                // make one extra LLM call to strip reasoning from the response.
+                // Returns a plain string (not JSON) — transparent to consumers.
+                if self.config.output_schema_auto
+                    && iteration >= self.config.keep_tool_context_turns
+                    && self.output_schema.is_none()
+                {
+                    let cleanup_messages = vec![
+                        ChatMessage::system(
+                            "The user asked a question and an AI assistant produced a response after \
+                             executing multiple tools. Extract ONLY the final user-facing message from \
+                             the response. Remove all reasoning, planning, data analysis, counting, \
+                             and internal commentary. Return ONLY the clean message as plain text."
+                                .to_string(),
+                        ),
+                        ChatMessage::user(format!(
+                            "User question: {}\n\nAssistant response:\n{}",
+                            user_message, final_text
+                        )),
+                    ];
+
+                    match self
+                        .provider
+                        .chat(
+                            ChatRequest {
+                                messages: &cleanup_messages,
+                                tools: None,
+                            },
+                            &effective_model,
+                            self.temperature,
+                        )
+                        .await
+                    {
+                        Ok(resp) => {
+                            let clean = resp.text.unwrap_or_default().trim().to_string();
+                            if !clean.is_empty() {
+                                tracing::info!(
+                                    original_len = final_text.len(),
+                                    clean_len = clean.len(),
+                                    iterations = iteration,
+                                    "Auto output cleanup applied"
+                                );
+                                final_text = clean;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Auto output cleanup failed: {e}, using original response"
+                            );
+                        }
+                    }
+                }
+                // === END AUTO OUTPUT CLEANUP ===
 
                 // === STRUCTURED OUTPUT FORCING ===
                 // When output_schema is set, make one more LLM call forcing the
