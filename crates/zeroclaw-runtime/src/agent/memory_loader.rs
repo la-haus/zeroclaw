@@ -58,6 +58,9 @@ impl MemoryLoader for DefaultMemoryLoader {
             if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
                 continue;
             }
+            if zeroclaw_memory::is_user_autosave_key(&entry.key) {
+                continue;
+            }
             if zeroclaw_memory::should_skip_autosave_content(&entry.content) {
                 continue;
             }

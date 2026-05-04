@@ -988,7 +988,7 @@ impl Provider for AnthropicProvider {
             tracing::debug!(
                 model = %model,
                 max_tokens = self.max_tokens,
-                "Thinking disabled for forced tool_choice"
+                "Thinking disabled for forced tool_choice — Anthropic rejects thinking + tool forcing"
             );
             (self.max_tokens, None, temperature)
         } else {
@@ -1165,7 +1165,7 @@ impl Provider for AnthropicProvider {
             tracing::debug!(
                 model = %model,
                 max_tokens = self.max_tokens,
-                "Thinking disabled for forced tool_choice"
+                "Thinking disabled for forced tool_choice — Anthropic rejects thinking + tool forcing"
             );
             (self.max_tokens, None, temperature)
         } else {

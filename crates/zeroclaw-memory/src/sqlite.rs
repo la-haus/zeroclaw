@@ -348,7 +348,7 @@ impl SqliteMemory {
         // Escape FTS5 special chars and build query
         let fts_query: String = query
             .split_whitespace()
-            .map(|w| format!("\"{w}\""))
+            .map(Self::fts5_term_query)
             .collect::<Vec<_>>()
             .join(" OR ");
 
@@ -380,6 +380,55 @@ impl SqliteMemory {
             results.push(row?);
         }
         Ok(results)
+    }
+
+    fn fts5_term_query(term: &str) -> String {
+        if let Some(prefix) = term.strip_suffix('*')
+            && !prefix.is_empty()
+        {
+            let escaped = prefix.replace('"', "\"\"");
+            format!("\"{escaped}\"*")
+        } else {
+            let escaped = term.replace('"', "\"\"");
+            format!("\"{escaped}\"")
+        }
+    }
+
+    fn like_search_pattern(term: &str) -> String {
+        if let Some(prefix) = term.strip_suffix('*')
+            && !prefix.is_empty()
+        {
+            return format!("%{}%", Self::escape_like_pattern(prefix));
+        }
+        format!("%{}%", Self::escape_like_pattern(term))
+    }
+
+    fn is_prefix_wildcard_term(term: &str) -> bool {
+        matches!(term.strip_suffix('*'), Some(prefix) if !prefix.is_empty())
+    }
+
+    fn escape_like_pattern(term: &str) -> String {
+        let mut escaped = String::with_capacity(term.len());
+        for ch in term.chars() {
+            if matches!(ch, '%' | '_' | '\\') {
+                escaped.push('\\');
+            }
+            escaped.push(ch);
+        }
+        escaped
+    }
+
+    fn like_fallback_matches(text: &str, term: &str) -> bool {
+        let text = text.to_lowercase();
+        if let Some(prefix) = term.strip_suffix('*')
+            && !prefix.is_empty()
+        {
+            let prefix = prefix.to_lowercase();
+            return text
+                .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                .any(|token| token.starts_with(&prefix));
+        }
+        text.contains(&term.to_lowercase())
     }
 
     /// Vector similarity search: scan embeddings and compute cosine similarity.
@@ -759,21 +808,37 @@ impl Memory for SqliteMemory {
             // If hybrid returned nothing, fall back to LIKE search.
             if results.is_empty() {
                 const MAX_LIKE_KEYWORDS: usize = 8;
-                let keywords: Vec<String> = query
+                let raw_keywords: Vec<String> = query
                     .split_whitespace()
                     .take(MAX_LIKE_KEYWORDS)
-                    .map(|w| format!("%{w}%"))
+                    .map(str::to_string)
                     .collect();
-                if !keywords.is_empty() {
-                    let conditions: Vec<String> = keywords
+                if !raw_keywords.is_empty() {
+                    let needs_prefix_filter = raw_keywords
+                        .iter()
+                        .any(|keyword| Self::is_prefix_wildcard_term(keyword));
+                    let sql_limit = if needs_prefix_filter {
+                        limit.saturating_mul(8).min(limit.saturating_add(512))
+                    } else {
+                        limit
+                    };
+                    let patterns: Vec<String> = raw_keywords
+                        .iter()
+                        .map(|keyword| Self::like_search_pattern(keyword))
+                        .collect();
+                    let conditions: Vec<String> = patterns
                         .iter()
                         .enumerate()
                         .map(|(i, _)| {
-                            format!("(content LIKE ?{} OR key LIKE ?{})", i * 2 + 1, i * 2 + 2)
+                            format!(
+                                "(content LIKE ?{} ESCAPE '\\' OR key LIKE ?{} ESCAPE '\\')",
+                                i * 2 + 1,
+                                i * 2 + 2
+                            )
                         })
                         .collect();
                     let where_clause = conditions.join(" OR ");
-                    let mut param_idx = keywords.len() * 2 + 1;
+                    let mut param_idx = patterns.len() * 2 + 1;
                     let mut time_conditions = String::new();
                     if since_ref.is_some() {
                         let _ = write!(time_conditions, " AND created_at >= ?{param_idx}");
@@ -791,7 +856,7 @@ impl Memory for SqliteMemory {
                     );
                     let mut stmt = conn.prepare(&sql)?;
                     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    for kw in &keywords {
+                    for kw in &patterns {
                         param_values.push(Box::new(kw.clone()));
                         param_values.push(Box::new(kw.clone()));
                     }
@@ -802,7 +867,7 @@ impl Memory for SqliteMemory {
                         param_values.push(Box::new(u.to_string()));
                     }
                     #[allow(clippy::cast_possible_wrap)]
-                    param_values.push(Box::new(limit as i64));
+                    param_values.push(Box::new(sql_limit as i64));
                     let params_ref: Vec<&dyn rusqlite::types::ToSql> =
                         param_values.iter().map(AsRef::as_ref).collect();
                     let rows = stmt.query_map(params_ref.as_slice(), |row| {
@@ -825,7 +890,18 @@ impl Memory for SqliteMemory {
                             && entry.session_id.as_deref() != Some(sid) {
                                 continue;
                             }
+                        if needs_prefix_filter
+                            && !raw_keywords.iter().any(|keyword| {
+                                Self::like_fallback_matches(&entry.key, keyword)
+                                    || Self::like_fallback_matches(&entry.content, keyword)
+                            })
+                        {
+                            continue;
+                        }
                         results.push(entry);
+                        if results.len() >= limit {
+                            break;
+                        }
                     }
                 }
             }
