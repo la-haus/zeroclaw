@@ -300,6 +300,10 @@ async fn handle_socket(
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
                 let content = parsed["content"].as_str().unwrap_or("").to_string();
+                // Per-message output_schema overrides connection-level schema
+                if let Some(schema) = parsed.get("output_schema") {
+                    agent.set_output_schema(Some(schema.clone()));
+                }
                 if !content.is_empty() {
                     // Persist user message
                     if let Some(ref backend) = state.session_backend {
@@ -371,6 +375,10 @@ async fn handle_socket(
                 }
 
                 let content = parsed["content"].as_str().unwrap_or("").to_string();
+                // Per-message output_schema overrides connection-level schema
+                if let Some(schema) = parsed.get("output_schema") {
+                    agent.set_output_schema(Some(schema.clone()));
+                }
                 if content.is_empty() {
                     let err = serde_json::json!({
                         "type": "error",

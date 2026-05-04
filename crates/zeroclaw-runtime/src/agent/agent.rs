@@ -87,6 +87,12 @@ pub struct Agent {
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    /// Optional JSON schema for structured output forcing.
+    /// When set, the agent makes one extra LLM call with a forced tool to
+    /// format the final response according to this schema.
+    /// Consumed (taken) after use — single-message sessions only.
+    /// Use `set_output_schema()` to configure.
+    output_schema: Option<serde_json::Value>,
 }
 
 pub struct AgentBuilder {
@@ -369,6 +375,7 @@ impl AgentBuilder {
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
             hook_runner: self.hook_runner,
+            output_schema: None,
         })
     }
 }
@@ -388,6 +395,12 @@ impl Agent {
 
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
         self.memory_session_id = session_id;
+    }
+
+    /// Set the output schema for structured output forcing.
+    /// When set, the final response will be formatted as JSON matching this schema.
+    pub fn set_output_schema(&mut self, schema: Option<serde_json::Value>) {
+        self.output_schema = schema;
     }
 
     /// Hydrate the agent with prior chat messages (e.g. from a session backend).
@@ -1440,6 +1453,89 @@ impl Agent {
                     text
                 };
 
+                // === STRUCTURED OUTPUT FORCING ===
+                // When output_schema is set, make one more LLM call forcing the
+                // model to use a synthetic `structured_output` tool whose parameters
+                // match the requested schema.  The tool-call arguments become the
+                // final JSON response.
+                //
+                // Uses a minimal context (system + user message with the response
+                // text) to avoid issues with compacted history or large contexts.
+                if self.output_schema.is_some() {
+                    let schema = self.output_schema.take().unwrap();
+
+                    let tool_spec = ToolSpec {
+                        name: "structured_output".to_string(),
+                        description: "Format the final response according to the required schema."
+                            .to_string(),
+                        parameters: schema,
+                    };
+
+                    // Minimal context: just system instruction + the text to format.
+                    // This avoids dependence on history compaction settings.
+                    let messages = vec![
+                        ChatMessage::system(
+                            "You are a formatting assistant. Use the structured_output tool \
+                             to extract the requested fields from the provided text. \
+                             Do not add commentary."
+                                .to_string(),
+                        ),
+                        ChatMessage::user(final_text.clone()),
+                    ];
+                    let tool_specs_for_forcing = [tool_spec];
+
+                    let structured_response = zeroclaw_api::TOOL_CHOICE_OVERRIDE
+                        .scope(Some("tool:structured_output".to_string()), async {
+                            self.provider
+                                .chat(
+                                    ChatRequest {
+                                        messages: &messages,
+                                        tools: Some(&tool_specs_for_forcing),
+                                    },
+                                    &effective_model,
+                                    self.temperature,
+                                )
+                                .await
+                        })
+                        .await;
+
+                    match structured_response {
+                        Ok(resp) => {
+                            if let Some(first_call) = resp.tool_calls.first() {
+                                let json_str = first_call.arguments.clone();
+
+                                self.history.push(ConversationMessage::Chat(
+                                    ChatMessage::assistant(json_str.clone()),
+                                ));
+                                self.trim_history();
+
+                                let forcing_tokens = resp.usage.as_ref().and_then(|u| {
+                                    u.input_tokens.zip(u.output_tokens).map(|(i, o)| i + o)
+                                });
+                                self.observer.record_event(&ObserverEvent::AgentEnd {
+                                    provider: self.provider_name.clone(),
+                                    model: self.model_name.clone(),
+                                    duration: streamed_start.elapsed(),
+                                    tokens_used: forcing_tokens,
+                                    cost_usd: None,
+                                    output: Some(json_str.clone()),
+                                });
+                                return Ok(json_str);
+                            }
+                            tracing::warn!(
+                                "Structured output forcing failed: no tool calls in response, \
+                                 falling back to raw text"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Structured output forcing failed: {e}, falling back to raw text"
+                            );
+                        }
+                    }
+                }
+                // === END STRUCTURED OUTPUT ===
+
                 // Store in response cache
                 if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                     let token_count = response
@@ -2347,5 +2443,122 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn set_output_schema_stores_and_clears() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "message": {"type": "string"},
+                "action": {"type": "string", "enum": ["SEND", "NO_REPLY"]}
+            },
+            "required": ["message", "action"]
+        });
+
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent build");
+
+        assert!(agent.output_schema.is_none());
+
+        agent.set_output_schema(Some(schema.clone()));
+        assert!(agent.output_schema.is_some());
+        assert_eq!(agent.output_schema.as_ref().unwrap(), &schema);
+
+        agent.set_output_schema(None);
+        assert!(agent.output_schema.is_none());
+    }
+
+    #[tokio::test]
+    async fn turn_with_output_schema_makes_forced_call() {
+        // First response: final text (no tool calls) → triggers structured output
+        // Second response: forced tool call with structured JSON
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![
+                // Response 1: agent's normal final response
+                zeroclaw_providers::ChatResponse {
+                    text: Some("☕ ¡Buen día! Hoy tienes 3 citas.".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                // Response 2: forced structured_output tool call
+                zeroclaw_providers::ChatResponse {
+                    text: None,
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "tc_1".into(),
+                        name: "structured_output".into(),
+                        arguments:
+                            r#"{"message":"☕ ¡Buen día! Hoy tienes 3 citas.","action":"SEND"}"#
+                                .into(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+        });
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "message": {"type": "string"},
+                "action": {"type": "string", "enum": ["SEND", "NO_REPLY"]}
+            },
+            "required": ["message", "action"]
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent build");
+        agent.set_output_schema(Some(schema));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let result = agent.turn_streamed("Generate daily briefing", tx).await;
+
+        assert!(result.is_ok(), "turn_streamed failed: {:?}", result.err());
+        let response = result.unwrap();
+
+        // Should return the structured JSON, not the raw text
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response).expect("Response should be valid JSON");
+        assert_eq!(parsed["action"], "SEND");
+        assert!(parsed["message"].as_str().unwrap().contains("3 citas"));
+
+        // output_schema should be consumed (taken)
+        assert!(agent.output_schema.is_none());
     }
 }
