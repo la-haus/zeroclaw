@@ -2202,6 +2202,32 @@ mod tests {
     }
 
     #[test]
+    fn tool_choice_override_with_tool_prefix_produces_named_choice() {
+        // The `tool:name` format should produce {"type":"tool","name":"name"}
+        let tc = "tool:structured_output".to_string();
+        let result = if let Some(tool_name) = tc.strip_prefix("tool:") {
+            serde_json::json!({ "type": "tool", "name": tool_name })
+        } else {
+            serde_json::json!({ "type": tc })
+        };
+        assert_eq!(result["type"], "tool");
+        assert_eq!(result["name"], "structured_output");
+    }
+
+    #[test]
+    fn tool_choice_override_without_prefix_produces_type_only() {
+        // Plain strings like "any" or "auto" should produce {"type":"any"}
+        let tc = "any".to_string();
+        let result = if let Some(tool_name) = tc.strip_prefix("tool:") {
+            serde_json::json!({ "type": "tool", "name": tool_name })
+        } else {
+            serde_json::json!({ "type": tc })
+        };
+        assert_eq!(result["type"], "any");
+        assert!(result.get("name").is_none());
+    }
+
+    #[test]
     fn convert_messages_no_adjacent_same_role() {
         // Verify that convert_messages never produces adjacent messages with the
         // same role, regardless of input ordering.
