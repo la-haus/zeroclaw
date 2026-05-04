@@ -1509,11 +1509,14 @@ impl Agent {
                                 ));
                                 self.trim_history();
 
+                                let forcing_tokens = resp.usage.as_ref().and_then(|u| {
+                                    u.input_tokens.zip(u.output_tokens).map(|(i, o)| i + o)
+                                });
                                 self.observer.record_event(&ObserverEvent::AgentEnd {
                                     provider: self.provider_name.clone(),
                                     model: self.model_name.clone(),
                                     duration: streamed_start.elapsed(),
-                                    tokens_used: None,
+                                    tokens_used: forcing_tokens,
                                     cost_usd: None,
                                     output: Some(json_str.clone()),
                                 });
