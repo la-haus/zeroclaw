@@ -87,6 +87,10 @@ pub struct Agent {
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    /// Optional JSON schema for structured output forcing.
+    /// When set, the agent makes one extra LLM call with a forced tool to
+    /// format the final response according to this schema.
+    pub output_schema: Option<serde_json::Value>,
 }
 
 pub struct AgentBuilder {
@@ -369,6 +373,7 @@ impl AgentBuilder {
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
             hook_runner: self.hook_runner,
+            output_schema: None,
         })
     }
 }
@@ -388,6 +393,12 @@ impl Agent {
 
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
         self.memory_session_id = session_id;
+    }
+
+    /// Set the output schema for structured output forcing.
+    /// When set, the final response will be formatted as JSON matching this schema.
+    pub fn set_output_schema(&mut self, schema: Option<serde_json::Value>) {
+        self.output_schema = schema;
     }
 
     /// Hydrate the agent with prior chat messages (e.g. from a session backend).
@@ -1439,6 +1450,88 @@ impl Agent {
                 } else {
                     text
                 };
+
+                // === STRUCTURED OUTPUT FORCING ===
+                // When output_schema is set, make one more LLM call forcing the
+                // model to use a synthetic `structured_output` tool whose parameters
+                // match the requested schema.  The tool-call arguments become the
+                // final JSON response.
+                if self.output_schema.is_some() {
+                    // Take the schema so we don't loop on the next iteration.
+                    let schema = self.output_schema.take().unwrap();
+
+                    let tool_spec = ToolSpec {
+                        name: "structured_output".to_string(),
+                        description: "Format the final response according to the required schema."
+                            .to_string(),
+                        parameters: schema,
+                    };
+
+                    let format_msg = format!(
+                        "Format the following response into the structured_output tool. \
+                         Extract the relevant fields from this text:\n\n{}",
+                        final_text
+                    );
+
+                    // Push assistant response + formatting instruction
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::assistant(
+                            final_text.clone(),
+                        )));
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::user(format_msg)));
+
+                    let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+                    let tool_specs_for_forcing = [tool_spec];
+
+                    let structured_response = zeroclaw_api::TOOL_CHOICE_OVERRIDE
+                        .scope(Some("tool:structured_output".to_string()), async {
+                            self.provider
+                                .chat(
+                                    ChatRequest {
+                                        messages: &messages,
+                                        tools: Some(&tool_specs_for_forcing),
+                                    },
+                                    &effective_model,
+                                    self.temperature,
+                                )
+                                .await
+                        })
+                        .await;
+
+                    match structured_response {
+                        Ok(resp) => {
+                            if let Some(first_call) = resp.tool_calls.first() {
+                                let json_str = first_call.arguments.clone();
+
+                                self.history.push(ConversationMessage::Chat(
+                                    ChatMessage::assistant(json_str.clone()),
+                                ));
+                                self.trim_history();
+
+                                self.observer.record_event(&ObserverEvent::AgentEnd {
+                                    provider: self.provider_name.clone(),
+                                    model: self.model_name.clone(),
+                                    duration: streamed_start.elapsed(),
+                                    tokens_used: None,
+                                    cost_usd: None,
+                                    output: Some(json_str.clone()),
+                                });
+                                return Ok(json_str);
+                            }
+                            tracing::warn!(
+                                "Structured output forcing failed: no tool calls in response, \
+                                 falling back to raw text"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Structured output forcing failed: {e}, falling back to raw text"
+                            );
+                        }
+                    }
+                }
+                // === END STRUCTURED OUTPUT ===
 
                 // Store in response cache
                 if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {

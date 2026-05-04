@@ -960,7 +960,13 @@ impl Provider for AnthropicProvider {
             .flatten();
         let native_tools = Self::convert_tools(request.tools);
         let tool_choice = if native_tools.is_some() {
-            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
+            tool_choice_override.map(|tc| {
+                if let Some(tool_name) = tc.strip_prefix("tool:") {
+                    serde_json::json!({ "type": "tool", "name": tool_name })
+                } else {
+                    serde_json::json!({ "type": tc })
+                }
+            })
         } else {
             None
         };
@@ -1117,7 +1123,13 @@ impl Provider for AnthropicProvider {
             .flatten();
         let native_tools = Self::convert_tools(request.tools);
         let tool_choice = if native_tools.is_some() {
-            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
+            tool_choice_override.map(|tc| {
+                if let Some(tool_name) = tc.strip_prefix("tool:") {
+                    serde_json::json!({ "type": "tool", "name": tool_name })
+                } else {
+                    serde_json::json!({ "type": tc })
+                }
+            })
         } else {
             None
         };
