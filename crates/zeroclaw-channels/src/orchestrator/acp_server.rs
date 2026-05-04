@@ -381,6 +381,27 @@ impl AcpServer {
                         "content": delta,
                     }),
                 },
+                TurnEvent::LlmCall {
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    duration_ms,
+                    input_preview,
+                    output_preview,
+                } => JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/event",
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "type": "llm_call",
+                        "model": model,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "duration_ms": duration_ms,
+                        "input_preview": input_preview,
+                        "output_preview": output_preview,
+                    }),
+                },
             };
             self.write_notification(&notification).await;
         }
