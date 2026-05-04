@@ -9,6 +9,7 @@
 //! Server -> Client: {"type":"chunk","content":"Hi! "}
 //! Server -> Client: {"type":"tool_call","name":"shell","args":{...}}
 //! Server -> Client: {"type":"tool_result","name":"shell","output":"..."}
+//! Server -> Client: {"type":"llm_call","model":"...","input_tokens":N,"output_tokens":N,"duration_ms":N,"input_preview":"...","output_preview":"..."}
 //! Server -> Client: {"type":"done","full_response":"..."}
 //! ```
 //!
@@ -484,6 +485,22 @@ async fn process_chat_message(
                 TurnEvent::ToolResult { name, output } => {
                     serde_json::json!({ "type": "tool_result", "name": name, "output": output })
                 }
+                TurnEvent::LlmCall {
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    duration_ms,
+                    input_preview,
+                    output_preview,
+                } => serde_json::json!({
+                    "type": "llm_call",
+                    "model": model,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "duration_ms": duration_ms,
+                    "input_preview": input_preview,
+                    "output_preview": output_preview,
+                }),
             };
             let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
         }

@@ -1374,6 +1374,17 @@ impl Agent {
                     output_tokens: s_output,
                     response_content,
                 });
+                // Emit LlmCall event to WebSocket clients
+                let _ = event_tx
+                    .send(TurnEvent::LlmCall {
+                        model: effective_model.clone(),
+                        input_tokens: s_input,
+                        output_tokens: s_output,
+                        duration_ms: llm_start.elapsed().as_millis() as u64,
+                        input_preview: truncate_utf8(user_message, 500),
+                        output_preview: truncate_utf8(&streamed_text, 500),
+                    })
+                    .await;
                 // Build a synthetic ChatResponse from streamed text
                 zeroclaw_providers::ChatResponse {
                     text: Some(streamed_text),
@@ -1419,6 +1430,20 @@ impl Agent {
                                 None
                             },
                         });
+                        // Emit LlmCall event to WebSocket clients (non-streaming path)
+                        let _ = event_tx
+                            .send(TurnEvent::LlmCall {
+                                model: effective_model.clone(),
+                                input_tokens,
+                                output_tokens,
+                                duration_ms: llm_start.elapsed().as_millis() as u64,
+                                input_preview: truncate_utf8(user_message, 500),
+                                output_preview: truncate_utf8(
+                                    resp.text.as_deref().unwrap_or(""),
+                                    500,
+                                ),
+                            })
+                            .await;
                         resp
                     }
                     Err(err) => {

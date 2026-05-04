@@ -14,4 +14,13 @@ pub enum TurnEvent {
     },
     /// A tool has returned a result.
     ToolResult { name: String, output: String },
+    /// Summary of a completed LLM call (input/output tokens, model, duration).
+    LlmCall {
+        model: String,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        duration_ms: u64,
+        input_preview: String,
+        output_preview: String,
+    },
 }
