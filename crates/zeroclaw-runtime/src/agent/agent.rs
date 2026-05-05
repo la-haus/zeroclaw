@@ -1486,34 +1486,66 @@ impl Agent {
                     && iteration >= self.config.keep_tool_context_turns
                     && self.output_schema.is_none()
                 {
+                    // Use tool forcing (same as structured output) to guarantee
+                    // clean extraction. Plain text completion fails because the
+                    // LLM returns the response unchanged.
+                    let auto_schema = serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "response": {
+                                "type": "string",
+                                "description": "The final user-facing message. No reasoning, planning, or internal commentary."
+                            }
+                        },
+                        "required": ["response"]
+                    });
+                    let tool_spec = ToolSpec {
+                        name: "structured_output".to_string(),
+                        description: "Extract the final user-facing message.".to_string(),
+                        parameters: auto_schema,
+                    };
                     let cleanup_messages = vec![
                         ChatMessage::system(
-                            "Given the user's question and an assistant's response, return \
-                             ONLY the final message intended for the user. No reasoning, \
-                             no preambles, no commentary."
+                            "Extract the final user-facing message from this response. \
+                             Remove any reasoning, planning, or internal commentary. \
+                             Keep all formatting, emojis, and data intact."
                                 .to_string(),
                         ),
-                        ChatMessage::user(format!(
-                            "User question: {}\n\nAssistant response:\n{}",
-                            user_message, final_text
-                        )),
+                        ChatMessage::user(final_text.clone()),
                     ];
+                    let tool_specs_for_cleanup = [tool_spec];
 
-                    match self
-                        .provider
-                        .chat(
-                            ChatRequest {
-                                messages: &cleanup_messages,
-                                tools: None,
-                            },
-                            &effective_model,
-                            self.temperature,
-                        )
-                        .await
-                    {
+                    let cleanup_result = zeroclaw_api::TOOL_CHOICE_OVERRIDE
+                        .scope(Some("tool:structured_output".to_string()), async {
+                            self.provider
+                                .chat(
+                                    ChatRequest {
+                                        messages: &cleanup_messages,
+                                        tools: Some(&tool_specs_for_cleanup),
+                                    },
+                                    &effective_model,
+                                    self.temperature,
+                                )
+                                .await
+                        })
+                        .await;
+
+                    match cleanup_result {
                         Ok(resp) => {
-                            let clean = resp.text.unwrap_or_default().trim().to_string();
-                            if !clean.is_empty() {
+                            let clean = resp
+                                .tool_calls
+                                .first()
+                                .and_then(|tc| {
+                                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                                })
+                                .and_then(|v| {
+                                    v.get("response")
+                                        .and_then(|r| r.as_str())
+                                        .map(|s| s.trim().to_string())
+                                })
+                                .filter(|s| !s.is_empty());
+
+                            if let Some(clean) = clean {
                                 let cleanup_tokens = resp.usage.as_ref().and_then(|u| {
                                     u.input_tokens.zip(u.output_tokens).map(|(i, o)| i + o)
                                 });
@@ -1522,9 +1554,13 @@ impl Agent {
                                     clean_len = clean.len(),
                                     iterations = iteration,
                                     cleanup_tokens = ?cleanup_tokens,
-                                    "Auto output cleanup applied"
+                                    "Auto output cleanup applied (tool forcing)"
                                 );
                                 final_text = clean;
+                            } else {
+                                tracing::warn!(
+                                    "Auto output cleanup: could not extract response from tool call"
+                                );
                             }
                         }
                         Err(e) => {
@@ -2674,10 +2710,14 @@ mod tests {
             usage: None,
             reasoning_content: None,
         });
-        // Cleanup call: clean response
+        // Cleanup call: tool forcing returns structured_output with clean response
         responses.push(zeroclaw_providers::ChatResponse {
-            text: Some("☕ ¡Buen día! Hoy tienes *69 citas*.".into()),
-            tool_calls: vec![],
+            text: None,
+            tool_calls: vec![zeroclaw_providers::ToolCall {
+                id: "tc_cleanup".into(),
+                name: "structured_output".into(),
+                arguments: r#"{"response":"☕ ¡Buen día! Hoy tienes *69 citas*."}"#.into(),
+            }],
             usage: Some(zeroclaw_api::provider::TokenUsage {
                 input_tokens: Some(500),
                 output_tokens: Some(50),
