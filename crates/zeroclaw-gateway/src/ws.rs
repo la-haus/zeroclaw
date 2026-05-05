@@ -172,15 +172,13 @@ async fn handle_socket(
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
 
-    // Build a persistent Agent for this connection, reusing the shared observer
-    // from AppState to avoid re-creating OtelObserver + TracerProvider per connection.
+    // Build an Agent with a per-connection observer to prevent OTEL span
+    // interference between concurrent WebSocket sessions. The shared observer
+    // (state.observer) uses a single agent_context slot — when two connections
+    // process concurrently, AgentStart on one overwrites the other's trace context,
+    // causing orphaned spans and lost trace correlation.
     let config = state.config.lock().clone();
-    let mut agent = match zeroclaw_runtime::agent::Agent::from_config_with_observer(
-        &config,
-        state.observer.clone(),
-    )
-    .await
-    {
+    let mut agent = match zeroclaw_runtime::agent::Agent::from_config(&config).await {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(error = %e, "Agent initialization failed");
