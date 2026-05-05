@@ -1517,6 +1517,13 @@ pub struct AgentConfig {
     /// remains a plain string (not JSON). Default: false.
     #[serde(default)]
     pub output_schema_auto: bool,
+
+    /// Custom system prompt for the auto output cleanup call.
+    /// When set, overrides the default cleanup prompt. Use to tailor
+    /// the cleanup behavior to your agent's domain (e.g. WhatsApp formatting).
+    /// If empty/unset, uses the built-in default prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema_auto_prompt: Option<String>,
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -1570,6 +1577,7 @@ impl Default for AgentConfig {
             keep_tool_context_turns: default_keep_tool_context_turns(),
             error_fallback_message: None,
             output_schema_auto: false,
+            output_schema_auto_prompt: None,
         }
     }
 }
