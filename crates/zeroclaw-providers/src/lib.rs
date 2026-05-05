@@ -775,20 +775,24 @@ pub fn provider_runtime_options_from_config(
         api_path: fallback.and_then(|e| e.api_path.clone()),
         provider_max_tokens: fallback.and_then(|e| e.max_tokens),
         merge_system_into_user,
-        extended_thinking_budget: fallback
-            .and_then(|e| e.extended_thinking_budget)
-            .or_else(|| {
-                std::env::var("ZEROCLAW_EXTENDED_THINKING_BUDGET")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-            })
-            .or_else(|| {
-                config
-                    .agent
-                    .thinking
-                    .default_level
-                    .suggested_budget_tokens()
-            }),
+        extended_thinking_budget: {
+            let budget = fallback
+                .and_then(|e| e.extended_thinking_budget)
+                .or_else(|| {
+                    std::env::var("ZEROCLAW_EXTENDED_THINKING_BUDGET")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                })
+                .or_else(|| {
+                    config.agent.thinking.default_level.suggested_budget_tokens()
+                });
+            tracing::info!(
+                extended_thinking_budget = ?budget,
+                fallback_found = fallback.is_some(),
+                "Provider runtime options resolved"
+            );
+            budget
+        },
     }
 }
 
