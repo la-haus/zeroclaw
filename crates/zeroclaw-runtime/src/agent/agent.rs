@@ -1488,10 +1488,9 @@ impl Agent {
                 {
                     let cleanup_messages = vec![
                         ChatMessage::system(
-                            "The user asked a question and an AI assistant produced a response after \
-                             executing multiple tools. Extract ONLY the final user-facing message from \
-                             the response. Remove all reasoning, planning, data analysis, counting, \
-                             and internal commentary. Return ONLY the clean message as plain text."
+                            "Given the user's question and an assistant's response, return \
+                             ONLY the final message intended for the user. No reasoning, \
+                             no preambles, no commentary."
                                 .to_string(),
                         ),
                         ChatMessage::user(format!(
@@ -1515,10 +1514,14 @@ impl Agent {
                         Ok(resp) => {
                             let clean = resp.text.unwrap_or_default().trim().to_string();
                             if !clean.is_empty() {
+                                let cleanup_tokens = resp.usage.as_ref().and_then(|u| {
+                                    u.input_tokens.zip(u.output_tokens).map(|(i, o)| i + o)
+                                });
                                 tracing::info!(
                                     original_len = final_text.len(),
                                     clean_len = clean.len(),
                                     iterations = iteration,
+                                    cleanup_tokens = ?cleanup_tokens,
                                     "Auto output cleanup applied"
                                 );
                                 final_text = clean;
@@ -2640,5 +2643,181 @@ mod tests {
 
         // output_schema should be consumed (taken)
         assert!(agent.output_schema.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_cleanup_strips_reasoning_when_iterations_exceed_threshold() {
+        // 6 tool call iterations then final response with reasoning
+        // keep_tool_context_turns = 2, so iteration 6 >> 2 triggers auto cleanup
+        let mut responses = Vec::new();
+        // 6 iterations: each returns a native tool_call
+        for i in 0..6 {
+            responses.push(zeroclaw_providers::ChatResponse {
+                text: None,
+                tool_calls: vec![zeroclaw_providers::ToolCall {
+                    id: format!("tc_{i}"),
+                    name: "mock_tool".into(),
+                    arguments: "{}".into(),
+                }],
+                usage: None,
+                reasoning_content: None,
+            });
+        }
+        // Iteration 7: final response with reasoning contamination
+        responses.push(zeroclaw_providers::ChatResponse {
+            text: Some(
+                "Let me analyze the data. I found 69 visits.\n\n\
+                 ☕ ¡Buen día! Hoy tienes *69 citas*."
+                    .into(),
+            ),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+        });
+        // Cleanup call: clean response
+        responses.push(zeroclaw_providers::ChatResponse {
+            text: Some("☕ ¡Buen día! Hoy tienes *69 citas*.".into()),
+            tool_calls: vec![],
+            usage: Some(zeroclaw_api::provider::TokenUsage {
+                input_tokens: Some(500),
+                output_tokens: Some(50),
+                cached_input_tokens: None,
+            }),
+            reasoning_content: None,
+        });
+
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(responses),
+        });
+
+        let mut agent_config = zeroclaw_config::schema::AgentConfig::default();
+        agent_config.output_schema_auto = true;
+        agent_config.keep_tool_context_turns = 2;
+        agent_config.max_tool_iterations = 25;
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(agent_config)
+            .build()
+            .expect("agent build");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let result = agent.turn_streamed("Dame el briefing del día", tx).await;
+
+        assert!(result.is_ok(), "turn_streamed failed: {:?}", result.err());
+        let response = result.unwrap();
+
+        assert!(
+            !response.contains("Let me analyze"),
+            "Response should not contain reasoning: {response}"
+        );
+        assert!(
+            response.contains("69 citas"),
+            "Response should contain the briefing content: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_cleanup_skipped_when_output_schema_set() {
+        // When output_schema is set, auto cleanup should NOT trigger
+        // even if iterations exceed threshold
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![
+                // Final response with reasoning
+                zeroclaw_providers::ChatResponse {
+                    text: Some("Reasoning here. ☕ ¡Buen día!".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                // Forced structured_output tool call (from output_schema, not auto)
+                zeroclaw_providers::ChatResponse {
+                    text: None,
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "tc_forced".into(),
+                        name: "structured_output".into(),
+                        arguments: r#"{"message":"☕ ¡Buen día!","action":"SEND"}"#.into(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+        });
+
+        let mut agent_config = zeroclaw_config::schema::AgentConfig::default();
+        agent_config.output_schema_auto = true;
+        agent_config.keep_tool_context_turns = 5;
+        agent_config.max_tool_iterations = 25;
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(agent_config)
+            .build()
+            .expect("agent build");
+
+        // Set output_schema — this should take priority over auto cleanup
+        agent.set_output_schema(Some(serde_json::json!({
+            "type": "object",
+            "properties": {"message": {"type": "string"}, "action": {"type": "string"}},
+            "required": ["message", "action"]
+        })));
+
+        // Pre-fill history to simulate many iterations
+        for i in 0..6 {
+            agent.history.push(ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![zeroclaw_providers::ToolCall {
+                    id: format!("tc_{i}"),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning_content: None,
+            });
+            agent.history.push(ConversationMessage::ToolResults(vec![
+                zeroclaw_providers::ToolResultMessage {
+                    tool_call_id: format!("tc_{i}"),
+                    content: "ok".into(),
+                },
+            ]));
+        }
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let result = agent.turn_streamed("Generate report", tx).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+
+        // Should return JSON from structured output, NOT plain text from auto cleanup
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response).expect("Should be valid JSON from structured output");
+        assert_eq!(parsed["action"], "SEND");
     }
 }
