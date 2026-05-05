@@ -1511,6 +1511,12 @@ pub struct AgentConfig {
     /// Can also be set via `ZEROCLAW_ERROR_FALLBACK_MESSAGE` env var.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_fallback_message: Option<String>,
+
+    /// When true, automatically clean up reasoning from responses when
+    /// tool iterations exceed keep_tool_context_turns. The final response
+    /// remains a plain string (not JSON). Default: false.
+    #[serde(default)]
+    pub output_schema_auto: bool,
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -1563,6 +1569,7 @@ impl Default for AgentConfig {
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
             error_fallback_message: None,
+            output_schema_auto: false,
         }
     }
 }
