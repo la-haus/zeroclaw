@@ -1188,6 +1188,7 @@ impl Provider for AnthropicProvider {
         let client = self.http_client();
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
+        let has_thinking = self.extended_thinking_budget.is_some();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
@@ -1208,6 +1209,11 @@ impl Provider for AnthropicProvider {
                     .header("anthropic-dangerous-direct-browser-access", "true");
             } else {
                 req = req.header("x-api-key", &credential);
+                // Add the interleaved-thinking beta header for API-key auth
+                // when extended thinking is enabled (mirrors apply_auth logic).
+                if has_thinking {
+                    req = req.header("anthropic-beta", "interleaved-thinking-2025-05-14");
+                }
             }
 
             let response = match req.send().await {
