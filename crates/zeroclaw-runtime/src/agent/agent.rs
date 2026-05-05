@@ -1483,18 +1483,25 @@ impl Agent {
                 // make one extra LLM call to strip reasoning from the response.
                 // Returns a plain string (not JSON) — transparent to consumers.
                 if self.config.output_schema_auto
-                    && iteration >= self.config.keep_tool_context_turns
+                    && iteration + 1 >= self.config.keep_tool_context_turns
                     && self.output_schema.is_none()
                 {
-                    // Use tool forcing (same as structured output) to guarantee
-                    // clean extraction. Plain text completion fails because the
-                    // LLM returns the response unchanged.
+                    let default_prompt = "Extract the final user-facing message from this response. \
+                         Remove any reasoning, planning, internal commentary, and \
+                         duplicated content. If the message appears repeated, include \
+                         it only once. Keep all formatting, emojis, and data intact.";
+                    let prompt = self
+                        .config
+                        .output_schema_auto_prompt
+                        .as_deref()
+                        .unwrap_or(default_prompt);
+
                     let auto_schema = serde_json::json!({
                         "type": "object",
                         "properties": {
                             "response": {
                                 "type": "string",
-                                "description": "The final user-facing message. No reasoning, planning, or internal commentary."
+                                "description": prompt
                             }
                         },
                         "required": ["response"]
@@ -1505,13 +1512,7 @@ impl Agent {
                         parameters: auto_schema,
                     };
                     let cleanup_messages = vec![
-                        ChatMessage::system(
-                            "Extract the final user-facing message from this response. \
-                             Remove any reasoning, planning, internal commentary, and \
-                             duplicated content. If the message appears repeated, include \
-                             it only once. Keep all formatting, emojis, and data intact."
-                                .to_string(),
-                        ),
+                        ChatMessage::system(prompt.to_string()),
                         ChatMessage::user(final_text.clone()),
                     ];
                     let tool_specs_for_cleanup = [tool_spec];
