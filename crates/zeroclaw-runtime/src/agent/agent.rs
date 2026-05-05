@@ -548,7 +548,10 @@ impl Agent {
             }
         }
 
-        let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
+        let provider_name = fallback_provider_ag
+            .and_then(|e| e.name.as_deref())
+            .or(config.providers.fallback.as_deref())
+            .unwrap_or("openrouter");
 
         let model_name = fallback_provider_ag
             .and_then(|e| e.model.as_deref())

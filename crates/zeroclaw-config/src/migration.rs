@@ -113,57 +113,73 @@ impl V1Compat {
     }
 
     fn migrate_providers(&mut self) {
-        let fallback = self
-            .default_provider
-            .take()
-            .unwrap_or_else(|| "default".into());
+        // Only migrate legacy provider fields when they actually exist.
+        // V2 configs that just need a schema_version bump should not get
+        // a spurious "default" entry injected into providers.models.
+        let has_legacy_provider_fields = self.default_provider.is_some()
+            || !self.model_providers.is_empty()
+            || self.api_key.is_some()
+            || self.api_url.is_some()
+            || self.api_path.is_some()
+            || self.default_model.is_some()
+            || self.default_temperature.is_some()
+            || self.provider_timeout_secs.is_some()
+            || self.provider_max_tokens.is_some()
+            || self.extra_headers.as_ref().is_some_and(|h| !h.is_empty());
 
-        // First, move old model_providers entries into providers.models.
-        // These take precedence over top-level fields (more specific).
-        for (key, profile) in std::mem::take(&mut self.model_providers) {
-            self.config.providers.models.entry(key).or_insert(profile);
+        if has_legacy_provider_fields {
+            let fallback = self
+                .default_provider
+                .take()
+                .unwrap_or_else(|| "default".into());
+
+            // First, move old model_providers entries into providers.models.
+            // These take precedence over top-level fields (more specific).
+            for (key, profile) in std::mem::take(&mut self.model_providers) {
+                self.config.providers.models.entry(key).or_insert(profile);
+            }
+
+            // Then fill gaps in the fallback entry from top-level fields.
+            let entry = self
+                .config
+                .providers
+                .models
+                .entry(fallback.clone())
+                .or_default();
+
+            if entry.api_key.is_none() {
+                entry.api_key = self.api_key.take();
+            }
+            if entry.base_url.is_none() {
+                entry.base_url = self.api_url.take();
+            }
+            if entry.api_path.is_none() {
+                entry.api_path = self.api_path.take();
+            }
+            if entry.model.is_none() {
+                entry.model = self.default_model.take();
+            }
+            if entry.temperature.is_none() {
+                entry.temperature = self.default_temperature.take();
+            }
+            if entry.timeout_secs.is_none() {
+                entry.timeout_secs = self.provider_timeout_secs.take();
+            }
+            if entry.max_tokens.is_none() {
+                entry.max_tokens = self.provider_max_tokens.take();
+            }
+            if entry.extra_headers.is_empty()
+                && let Some(headers) = self.extra_headers.take()
+            {
+                entry.extra_headers = headers;
+            }
+
+            if self.config.providers.fallback.is_none() {
+                self.config.providers.fallback = Some(fallback);
+            }
         }
 
-        // Then fill gaps in the fallback entry from top-level fields.
-        let entry = self
-            .config
-            .providers
-            .models
-            .entry(fallback.clone())
-            .or_default();
-
-        if entry.api_key.is_none() {
-            entry.api_key = self.api_key.take();
-        }
-        if entry.base_url.is_none() {
-            entry.base_url = self.api_url.take();
-        }
-        if entry.api_path.is_none() {
-            entry.api_path = self.api_path.take();
-        }
-        if entry.model.is_none() {
-            entry.model = self.default_model.take();
-        }
-        if entry.temperature.is_none() {
-            entry.temperature = self.default_temperature.take();
-        }
-        if entry.timeout_secs.is_none() {
-            entry.timeout_secs = self.provider_timeout_secs.take();
-        }
-        if entry.max_tokens.is_none() {
-            entry.max_tokens = self.provider_max_tokens.take();
-        }
-        if entry.extra_headers.is_empty()
-            && let Some(headers) = self.extra_headers.take()
-        {
-            entry.extra_headers = headers;
-        }
-
-        if self.config.providers.fallback.is_none() {
-            self.config.providers.fallback = Some(fallback);
-        }
-
-        // Move routing rules into providers.
+        // Move routing rules into providers (applies to both legacy and V2 configs).
         if self.config.providers.model_routes.is_empty() && !self.model_routes.is_empty() {
             self.config.providers.model_routes = std::mem::take(&mut self.model_routes);
         }
@@ -347,5 +363,137 @@ fn toml_to_edit_value(v: &toml::Value) -> toml_edit::Value {
             }
             toml_edit::Value::InlineTable(inline)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// V2-style config with explicit `providers.fallback` and `providers.models.X`
+    /// should NOT get a spurious "default" entry injected during migration.
+    #[test]
+    fn v2_config_no_spurious_default_entry() {
+        let toml_str = r#"
+[providers]
+fallback = "anthropic"
+
+[providers.models.anthropic]
+name = "anthropic"
+model = "claude-sonnet-4-6"
+temperature = 0.7
+extended_thinking_budget = 32000
+"#;
+        let mut table: toml::Table = toml::from_str(toml_str).unwrap();
+        prepare_table(&mut table);
+        let prepared = toml::to_string(&table).unwrap();
+        let compat: V1Compat = toml::from_str(&prepared).unwrap();
+        let config = compat.into_config();
+
+        assert!(
+            !config.providers.models.contains_key("default"),
+            "Migration should not create a spurious 'default' model entry for V2 configs"
+        );
+        assert_eq!(config.providers.fallback.as_deref(), Some("anthropic"));
+        assert_eq!(
+            config.providers.models["anthropic"].extended_thinking_budget,
+            Some(32000)
+        );
+    }
+
+    /// V2 config with `fallback = "default"` and `[providers.models.default]`
+    /// should preserve the entry without corruption.
+    #[test]
+    fn v2_config_with_default_key_preserved() {
+        let toml_str = r#"
+[providers]
+fallback = "default"
+
+[providers.models.default]
+name = "anthropic"
+model = "claude-sonnet-4-6"
+temperature = 0.7
+extended_thinking_budget = 16000
+"#;
+        let mut table: toml::Table = toml::from_str(toml_str).unwrap();
+        prepare_table(&mut table);
+        let prepared = toml::to_string(&table).unwrap();
+        let compat: V1Compat = toml::from_str(&prepared).unwrap();
+        let config = compat.into_config();
+
+        assert_eq!(config.providers.fallback.as_deref(), Some("default"));
+        let entry = &config.providers.models["default"];
+        assert_eq!(entry.name.as_deref(), Some("anthropic"));
+        assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(entry.extended_thinking_budget, Some(16000));
+    }
+
+    /// Legacy V0/V1 config with top-level `default_provider` and `model`
+    /// should migrate into `providers.models.<provider>`.
+    #[test]
+    fn legacy_v0_config_migrates_correctly() {
+        let toml_str = r#"
+default_provider = "anthropic"
+model = "claude-sonnet-4-6"
+api_key = "sk-test-123"
+"#;
+        let mut table: toml::Table = toml::from_str(toml_str).unwrap();
+        prepare_table(&mut table);
+        let prepared = toml::to_string(&table).unwrap();
+        let compat: V1Compat = toml::from_str(&prepared).unwrap();
+        let config = compat.into_config();
+
+        assert_eq!(config.providers.fallback.as_deref(), Some("anthropic"));
+        let entry = &config.providers.models["anthropic"];
+        assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(entry.api_key.as_deref(), Some("sk-test-123"));
+    }
+
+    /// Legacy V0 config without `default_provider` should create a "default"
+    /// fallback entry (the only case where "default" key is appropriate).
+    #[test]
+    fn legacy_v0_without_provider_creates_default_entry() {
+        let toml_str = r#"
+model = "gpt-4"
+api_key = "sk-test-456"
+"#;
+        let mut table: toml::Table = toml::from_str(toml_str).unwrap();
+        prepare_table(&mut table);
+        let prepared = toml::to_string(&table).unwrap();
+        let compat: V1Compat = toml::from_str(&prepared).unwrap();
+        let config = compat.into_config();
+
+        assert_eq!(config.providers.fallback.as_deref(), Some("default"));
+        let entry = &config.providers.models["default"];
+        assert_eq!(entry.model.as_deref(), Some("gpt-4"));
+        assert_eq!(entry.api_key.as_deref(), Some("sk-test-456"));
+    }
+
+    /// Routing rules should still migrate even for V2 configs that only need
+    /// schema_version bump (no legacy provider fields).
+    #[test]
+    fn routing_rules_migrate_without_legacy_provider_fields() {
+        let toml_str = r#"
+[providers]
+fallback = "anthropic"
+
+[providers.models.anthropic]
+name = "anthropic"
+model = "claude-sonnet-4-6"
+
+[[model_routes]]
+hint = "fast"
+provider = "anthropic"
+model = "claude-haiku-4-5"
+"#;
+        let mut table: toml::Table = toml::from_str(toml_str).unwrap();
+        prepare_table(&mut table);
+        let prepared = toml::to_string(&table).unwrap();
+        let compat: V1Compat = toml::from_str(&prepared).unwrap();
+        let config = compat.into_config();
+
+        assert_eq!(config.providers.model_routes.len(), 1);
+        assert_eq!(config.providers.model_routes[0].hint, "fast");
+        assert!(!config.providers.models.contains_key("default"));
     }
 }
