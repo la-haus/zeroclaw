@@ -529,10 +529,9 @@ impl Observer for OtelObserver {
                     span.end();
                 }
 
-                // Reset shared trace context so logs after AgentEnd show "0"
-                if let Some(ref tc) = self.trace_context {
-                    *tc.lock() = ("0".into(), "0".into());
-                }
+                // Note: shared trace context is NOT reset here — it stays valid
+                // so the DatadogLogObserver can still read it when logging AgentEnd.
+                // It gets overwritten on the next AgentStart.
 
                 // Clear pending state
                 *self.pending_messages_count.lock() = None;

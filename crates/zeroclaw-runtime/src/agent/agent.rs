@@ -1507,8 +1507,9 @@ impl Agent {
                     let cleanup_messages = vec![
                         ChatMessage::system(
                             "Extract the final user-facing message from this response. \
-                             Remove any reasoning, planning, or internal commentary. \
-                             Keep all formatting, emojis, and data intact."
+                             Remove any reasoning, planning, internal commentary, and \
+                             duplicated content. If the message appears repeated, include \
+                             it only once. Keep all formatting, emojis, and data intact."
                                 .to_string(),
                         ),
                         ChatMessage::user(final_text.clone()),
