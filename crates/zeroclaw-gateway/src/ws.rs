@@ -18,6 +18,8 @@
 //! - `name` — optional human-readable label for the session
 //! - `token` — bearer auth token (alternative to Authorization header)
 
+use std::sync::Arc;
+
 use super::AppState;
 use axum::{
     extract::{
@@ -172,35 +174,39 @@ async fn handle_socket(
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
 
-    // Build a persistent Agent for this connection, reusing the shared observer
-    // from AppState to avoid re-creating OtelObserver + TracerProvider per connection.
+    // Build an Agent reusing shared provider/memory/tools from AppState but with
+    // a per-connection observer to prevent OTEL span interference between concurrent
+    // WebSocket sessions. The shared observer uses a single agent_context slot —
+    // when two connections process concurrently, AgentStart on one overwrites the
+    // other's trace context, causing orphaned spans and lost trace correlation.
     let config = state.config.lock().clone();
-    let mut agent = match zeroclaw_runtime::agent::Agent::from_config_with_observer(
-        &config,
-        state.observer.clone(),
-    )
-    .await
-    {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!(error = %e, "Agent initialization failed");
-            let err = serde_json::json!({
-                "type": "error",
-                "message": format!("Failed to initialise agent: {e}"),
-                "code": "AGENT_INIT_FAILED"
-            });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
-            let _ = sender
-                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                    code: 1011,
-                    reason: axum::extract::ws::Utf8Bytes::from_static(
-                        "Agent initialization failed",
-                    ),
-                })))
-                .await;
-            return;
-        }
-    };
+    let per_conn_observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::from(
+        zeroclaw_runtime::observability::create_observer(&config.observability),
+    );
+    let mut agent =
+        match zeroclaw_runtime::agent::Agent::from_config_with_observer(&config, per_conn_observer)
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(error = %e, "Agent initialization failed");
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": format!("Failed to initialise agent: {e}"),
+                    "code": "AGENT_INIT_FAILED"
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                let _ = sender
+                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: 1011,
+                        reason: axum::extract::ws::Utf8Bytes::from_static(
+                            "Agent initialization failed",
+                        ),
+                    })))
+                    .await;
+                return;
+            }
+        };
     agent.set_memory_session_id(Some(session_id.clone()));
     agent.user_id = user_id.clone();
     agent.session_id = Some(session_id.clone());

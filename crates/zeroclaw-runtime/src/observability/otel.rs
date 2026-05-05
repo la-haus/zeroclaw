@@ -9,7 +9,17 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use parking_lot::Mutex;
 use std::any::Any;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::SystemTime;
+
+/// Per-endpoint singleton providers. Creating a new OtelObserver reuses
+/// existing providers instead of replacing the global pipeline (which
+/// would destroy buffered spans from concurrent connections).
+struct SharedProviders {
+    tracer: SdkTracerProvider,
+    meter: SdkMeterProvider,
+}
+static PROVIDERS: OnceLock<Mutex<HashMap<String, SharedProviders>>> = OnceLock::new();
 
 /// When `ZEROCLAW_OTEL_LANGSMITH_COMPAT=true`, emit additional span attributes
 /// that LangSmith expects (gen_ai.usage.prompt_tokens, langsmith.span.kind, etc.).
@@ -75,51 +85,68 @@ impl OtelObserver {
         let service_name = service_name.unwrap_or("zeroclaw");
         let instance_name = instance_name.unwrap_or("otel-0").to_string();
 
-        // ── Instance-scoped tracer provider ─────────────────────
-        let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_endpoint(&traces_endpoint);
-        if let Some(ref h) = headers {
-            span_builder = span_builder.with_headers(h.clone());
-        }
-        let span_exporter = span_builder
-            .build()
-            .expect("Failed to create OTLP span exporter");
+        // ── Singleton providers per endpoint ──────────────────────
+        // Reuse existing TracerProvider/MeterProvider for the same endpoint
+        // to avoid destroying the batch exporter pipeline on recreation.
+        // TODO: key includes only traces_endpoint. If two connections share
+        // the same traces_endpoint but differ in headers or metrics_endpoint,
+        // the first one registered wins silently. Fine for current CX agents
+        // (fixed endpoints) but needs a composite key if endpoints vary.
+        let providers_map = PROVIDERS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut map = providers_map.lock();
+        let entry = map.entry(traces_endpoint.clone());
+        let providers = entry.or_insert_with(|| {
+            let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_endpoint(&traces_endpoint);
+            if let Some(ref h) = headers {
+                span_builder = span_builder.with_headers(h.clone());
+            }
+            let span_exporter = span_builder
+                .build()
+                .expect("Failed to create OTLP span exporter");
 
-        let tp = SdkTracerProvider::builder()
-            .with_batch_exporter(span_exporter)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name(service_name.to_string())
-                    .build(),
-            )
-            .build();
+            let tp = SdkTracerProvider::builder()
+                .with_batch_exporter(span_exporter)
+                .with_resource(
+                    opentelemetry_sdk::Resource::builder()
+                        .with_service_name(service_name.to_string())
+                        .build(),
+                )
+                .build();
 
-        // Set the first instance as the global provider (needed for tracer("zeroclaw"))
-        global::set_tracer_provider(tp.clone());
+            global::set_tracer_provider(tp.clone());
 
-        // ── Instance-scoped meter provider ──────────────────────
-        let mut metric_builder = opentelemetry_otlp::MetricExporter::builder()
-            .with_http()
-            .with_endpoint(&metrics_endpoint);
-        if let Some(ref h) = headers {
-            metric_builder = metric_builder.with_headers(h.clone());
-        }
-        let metric_exporter = metric_builder
-            .build()
-            .expect("Failed to create OTLP metric exporter");
+            let mut metric_builder = opentelemetry_otlp::MetricExporter::builder()
+                .with_http()
+                .with_endpoint(&metrics_endpoint);
+            if let Some(ref h) = headers {
+                metric_builder = metric_builder.with_headers(h.clone());
+            }
+            let metric_exporter = metric_builder
+                .build()
+                .expect("Failed to create OTLP metric exporter");
 
-        let metric_reader =
-            opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
+            let metric_reader =
+                opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
 
-        let mp = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-            .with_reader(metric_reader)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name(service_name.to_string())
-                    .build(),
-            )
-            .build();
+            let mp = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+                .with_reader(metric_reader)
+                .with_resource(
+                    opentelemetry_sdk::Resource::builder()
+                        .with_service_name(service_name.to_string())
+                        .build(),
+                )
+                .build();
+
+            SharedProviders {
+                tracer: tp,
+                meter: mp,
+            }
+        });
+        let tp = providers.tracer.clone();
+        let mp = providers.meter.clone();
+        drop(map);
 
         // ── Create metric instruments ────────────────────────────
         let meter = mp.meter("zeroclaw");
