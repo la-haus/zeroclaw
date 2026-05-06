@@ -84,6 +84,8 @@ pub struct Agent {
     /// When MCP deferred loading is enabled, tools are activated via `tool_search`
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// Multimodal configuration for image/document processing.
+    multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
@@ -123,6 +125,7 @@ pub struct AgentBuilder {
     autonomy_level: Option<crate::security::AutonomyLevel>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
 }
 
 impl Default for AgentBuilder {
@@ -161,6 +164,7 @@ impl AgentBuilder {
             autonomy_level: None,
             activated_tools: None,
             hook_runner: None,
+            multimodal_config: None,
         }
     }
 
@@ -314,6 +318,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn multimodal_config(mut self, config: zeroclaw_config::schema::MultimodalConfig) -> Self {
+        self.multimodal_config = Some(config);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -375,6 +384,7 @@ impl AgentBuilder {
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
             hook_runner: self.hook_runner,
+            multimodal_config: self.multimodal_config.unwrap_or_default(),
             output_schema: None,
         })
     }
@@ -634,6 +644,7 @@ impl Agent {
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(config.autonomy.level)
             .activated_tools(activated_tools)
+            .multimodal_config(config.multimodal.clone())
             .hook_runner(if config.hooks.enabled {
                 let mut runner = crate::hooks::HookRunner::new();
                 if config.hooks.builtin.command_logger {
@@ -963,7 +974,13 @@ impl Agent {
         let effective_model = self.classify_model(user_message);
 
         for _ in 0..self.config.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let raw_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
+                &raw_messages,
+                &self.multimodal_config,
+            )
+            .await?;
+            let messages = prepared.messages;
 
             // Response cache: check before LLM call (only for deterministic, text-only prompts)
             let cache_key = if self.temperature == 0.0 {
@@ -1200,7 +1217,16 @@ impl Agent {
 
         // ── Turn loop ──────────────────────────────────────────────────
         for iteration in 0..self.config.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let raw_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+
+            // Normalize multimodal content: download remote images, validate
+            // MIME types, trim excess images from old messages.
+            let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
+                &raw_messages,
+                &self.multimodal_config,
+            )
+            .await?;
+            let messages = prepared.messages;
 
             // Response cache check (same as turn)
             let cache_key = if self.temperature == 0.0 {
