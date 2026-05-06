@@ -306,7 +306,9 @@ async fn handle_socket(
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
+                let mut content = parsed["content"].as_str().unwrap_or("").to_string();
+                // Append structured attachments as inline markers for multimodal
+                append_attachment_markers(&mut content, &parsed);
                 // Per-message output_schema overrides connection-level schema
                 if let Some(schema) = parsed.get("output_schema") {
                     agent.set_output_schema(Some(schema.clone()));
@@ -381,7 +383,9 @@ async fn handle_socket(
                     continue;
                 }
 
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
+                let mut content = parsed["content"].as_str().unwrap_or("").to_string();
+                // Append structured attachments as inline markers for multimodal
+                append_attachment_markers(&mut content, &parsed);
                 // Per-message output_schema overrides connection-level schema
                 if let Some(schema) = parsed.get("output_schema") {
                     agent.set_output_schema(Some(schema.clone()));
@@ -619,6 +623,40 @@ async fn process_chat_message(
     }
 }
 
+/// Convert structured `attachments` array in a WS message to inline markers.
+///
+/// Supported types:
+/// - `"image"` → `[IMAGE:url]` (processed by the multimodal pipeline)
+/// - `"document"` → `[DOCUMENT:url]` (reserved for PDF support)
+///
+/// Unknown types are silently skipped.
+fn append_attachment_markers(content: &mut String, parsed: &serde_json::Value) {
+    let Some(attachments) = parsed.get("attachments").and_then(|v| v.as_array()) else {
+        return;
+    };
+    for att in attachments {
+        let url = att.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        let att_type = att.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if url.is_empty() {
+            continue;
+        }
+        match att_type {
+            "image" => {
+                content.push_str(&format!(" [IMAGE:{url}]"));
+            }
+            "document" => {
+                // Reserved for PDF support — currently passed through as a
+                // text reference since NativeContentOut::Document is not yet
+                // implemented in the Anthropic provider.
+                content.push_str(&format!("\n[El usuario envió un documento: {url}]"));
+            }
+            _ => {
+                tracing::debug!(url, att_type, "Skipping unsupported attachment type");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,5 +736,64 @@ mod tests {
             "zeroclaw.v1, bearer.zc_tok, other".parse().unwrap(),
         );
         assert_eq!(extract_ws_token(&headers, None), Some("zc_tok"));
+    }
+
+    #[test]
+    fn append_attachment_markers_image() {
+        let parsed = serde_json::json!({
+            "attachments": [
+                {"url": "https://cdn.example.com/photo.jpg", "type": "image"}
+            ]
+        });
+        let mut content = "Hello".to_string();
+        append_attachment_markers(&mut content, &parsed);
+        assert_eq!(content, "Hello [IMAGE:https://cdn.example.com/photo.jpg]");
+    }
+
+    #[test]
+    fn append_attachment_markers_document() {
+        let parsed = serde_json::json!({
+            "attachments": [
+                {"url": "https://cdn.example.com/contract.pdf", "type": "document"}
+            ]
+        });
+        let mut content = "Review this".to_string();
+        append_attachment_markers(&mut content, &parsed);
+        assert!(content.contains("[El usuario envió un documento:"));
+    }
+
+    #[test]
+    fn append_attachment_markers_mixed() {
+        let parsed = serde_json::json!({
+            "attachments": [
+                {"url": "https://cdn.example.com/photo.jpg", "type": "image"},
+                {"url": "https://cdn.example.com/doc.pdf", "type": "document"},
+                {"url": "https://cdn.example.com/song.mp3", "type": "audio"}
+            ]
+        });
+        let mut content = "Check these".to_string();
+        append_attachment_markers(&mut content, &parsed);
+        assert!(content.contains("[IMAGE:https://cdn.example.com/photo.jpg]"));
+        assert!(content.contains("documento"));
+        // audio is skipped
+        assert!(!content.contains("song.mp3"));
+    }
+
+    #[test]
+    fn append_attachment_markers_no_attachments() {
+        let parsed = serde_json::json!({"content": "hello"});
+        let mut content = "hello".to_string();
+        append_attachment_markers(&mut content, &parsed);
+        assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn append_attachment_markers_empty_url_skipped() {
+        let parsed = serde_json::json!({
+            "attachments": [{"url": "", "type": "image"}]
+        });
+        let mut content = "test".to_string();
+        append_attachment_markers(&mut content, &parsed);
+        assert_eq!(content, "test");
     }
 }
