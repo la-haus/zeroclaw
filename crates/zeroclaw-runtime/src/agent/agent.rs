@@ -84,6 +84,8 @@ pub struct Agent {
     /// When MCP deferred loading is enabled, tools are activated via `tool_search`
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// Multimodal configuration for image/document processing.
+    multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
@@ -123,6 +125,7 @@ pub struct AgentBuilder {
     autonomy_level: Option<crate::security::AutonomyLevel>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
 }
 
 impl Default for AgentBuilder {
@@ -161,6 +164,7 @@ impl AgentBuilder {
             autonomy_level: None,
             activated_tools: None,
             hook_runner: None,
+            multimodal_config: None,
         }
     }
 
@@ -314,6 +318,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn multimodal_config(mut self, config: zeroclaw_config::schema::MultimodalConfig) -> Self {
+        self.multimodal_config = Some(config);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -375,6 +384,7 @@ impl AgentBuilder {
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
             hook_runner: self.hook_runner,
+            multimodal_config: self.multimodal_config.unwrap_or_default(),
             output_schema: None,
         })
     }
@@ -634,6 +644,7 @@ impl Agent {
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(config.autonomy.level)
             .activated_tools(activated_tools)
+            .multimodal_config(config.multimodal.clone())
             .hook_runner(if config.hooks.enabled {
                 let mut runner = crate::hooks::HookRunner::new();
                 if config.hooks.builtin.command_logger {
@@ -963,7 +974,13 @@ impl Agent {
         let effective_model = self.classify_model(user_message);
 
         for _ in 0..self.config.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let raw_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
+                &raw_messages,
+                &self.multimodal_config,
+            )
+            .await?;
+            let messages = prepared.messages;
 
             // Response cache: check before LLM call (only for deterministic, text-only prompts)
             let cache_key = if self.temperature == 0.0 {
@@ -1200,7 +1217,16 @@ impl Agent {
 
         // ── Turn loop ──────────────────────────────────────────────────
         for iteration in 0..self.config.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let raw_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+
+            // Normalize multimodal content: download remote images, validate
+            // MIME types, trim excess images from old messages.
+            let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
+                &raw_messages,
+                &self.multimodal_config,
+            )
+            .await?;
+            let messages = prepared.messages;
 
             // Response cache check (same as turn)
             let cache_key = if self.temperature == 0.0 {
@@ -2684,6 +2710,126 @@ mod tests {
 
         // output_schema should be consumed (taken)
         assert!(agent.output_schema.is_none());
+    }
+
+    /// Verify that turn_streamed calls prepare_messages_for_provider, which
+    /// normalizes [IMAGE:data:...] markers into data URIs. A mock provider
+    /// captures the messages it receives so we can assert the marker was
+    /// preserved (not silently stripped).
+    #[tokio::test]
+    async fn turn_streamed_processes_image_markers_via_multimodal_pipeline() {
+        let messages_received: Arc<Mutex<Vec<Vec<zeroclaw_providers::ChatMessage>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let messages_clone = messages_received.clone();
+
+        // A tiny 1x1 red PNG as base64
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+        let image_marker = format!("[IMAGE:data:image/png;base64,{png_b64}]");
+        let user_msg = format!("What is this? {image_marker}");
+
+        struct MessageCaptureProvider {
+            captured: Arc<Mutex<Vec<Vec<zeroclaw_providers::ChatMessage>>>>,
+        }
+
+        #[async_trait]
+        impl Provider for MessageCaptureProvider {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: f64,
+            ) -> Result<String> {
+                Ok("ok".into())
+            }
+
+            fn stream_chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: f64,
+                _options: zeroclaw_providers::traits::StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+            > {
+                use futures_util::stream::{self, StreamExt};
+                self.captured.lock().push(request.messages.to_vec());
+                let chunk = zeroclaw_providers::traits::StreamEvent::TextDelta(
+                    zeroclaw_providers::traits::StreamChunk {
+                        delta: "I see a red pixel".into(),
+                        is_final: false,
+                        reasoning: None,
+                        token_count: 0,
+                    },
+                );
+                stream::iter(vec![
+                    Ok(chunk),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final { usage: None }),
+                ])
+                .boxed()
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+        }
+
+        let provider = Box::new(MessageCaptureProvider {
+            captured: messages_clone,
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+
+        let mut multimodal_cfg = zeroclaw_config::schema::MultimodalConfig::default();
+        multimodal_cfg.allow_remote_fetch = true;
+
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .multimodal_config(multimodal_cfg)
+            .build()
+            .expect("agent build");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let result = agent.turn_streamed(&user_msg, tx).await;
+        assert!(result.is_ok(), "turn_streamed failed: {:?}", result.err());
+
+        // Verify the provider received messages with the image marker preserved
+        let captured = messages_received.lock();
+        assert!(
+            !captured.is_empty(),
+            "Provider should have received messages"
+        );
+        let first_call_messages = &captured[0];
+        let user_messages: Vec<_> = first_call_messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .collect();
+        assert!(
+            !user_messages.is_empty(),
+            "Should have at least one user message"
+        );
+        // The image marker should still be present (normalized to data URI by
+        // prepare_messages_for_provider)
+        let last_user = user_messages.last().unwrap();
+        assert!(
+            last_user.content.contains("[IMAGE:data:image/png;base64,"),
+            "Image marker should be preserved after multimodal pipeline processing. Got: {}",
+            &last_user.content[..last_user.content.len().min(200)]
+        );
     }
 
     #[tokio::test]
