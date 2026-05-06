@@ -4570,7 +4570,8 @@ pub fn build_runtime_proxy_client_with_timeouts(
 
     let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
-        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .user_agent("ZeroClaw/0.7");
     let builder = apply_runtime_proxy_to_builder(builder, service_key);
     let client = builder.build().unwrap_or_else(|error| {
         tracing::warn!(
