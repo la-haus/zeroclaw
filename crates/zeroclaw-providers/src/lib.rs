@@ -784,7 +784,11 @@ pub fn provider_runtime_options_from_config(
                         .and_then(|v| v.parse().ok())
                 })
                 .or_else(|| {
-                    config.agent.thinking.default_level.suggested_budget_tokens()
+                    config
+                        .agent
+                        .thinking
+                        .default_level
+                        .suggested_budget_tokens()
                 });
             tracing::info!(
                 extended_thinking_budget = ?budget,
