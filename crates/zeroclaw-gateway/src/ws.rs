@@ -645,10 +645,7 @@ fn append_attachment_markers(content: &mut String, parsed: &serde_json::Value) {
                 content.push_str(&format!(" [IMAGE:{url}]"));
             }
             "document" => {
-                // Reserved for PDF support — currently passed through as a
-                // text reference since NativeContentOut::Document is not yet
-                // implemented in the Anthropic provider.
-                content.push_str(&format!("\n[El usuario envió un documento: {url}]"));
+                content.push_str(&format!(" [DOCUMENT:{url}]"));
             }
             _ => {
                 tracing::debug!(url, att_type, "Skipping unsupported attachment type");
@@ -759,7 +756,10 @@ mod tests {
         });
         let mut content = "Review this".to_string();
         append_attachment_markers(&mut content, &parsed);
-        assert!(content.contains("[El usuario envió un documento:"));
+        assert_eq!(
+            content,
+            "Review this [DOCUMENT:https://cdn.example.com/contract.pdf]"
+        );
     }
 
     #[test]
@@ -774,7 +774,7 @@ mod tests {
         let mut content = "Check these".to_string();
         append_attachment_markers(&mut content, &parsed);
         assert!(content.contains("[IMAGE:https://cdn.example.com/photo.jpg]"));
-        assert!(content.contains("documento"));
+        assert!(content.contains("[DOCUMENT:https://cdn.example.com/doc.pdf]"));
         // audio is skipped
         assert!(!content.contains("song.mp3"));
     }

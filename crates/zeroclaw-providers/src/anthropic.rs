@@ -94,6 +94,14 @@ struct ImageSource {
 }
 
 #[derive(Debug, Serialize)]
+struct DocumentSource {
+    #[serde(rename = "type")]
+    source_type: String,
+    media_type: String,
+    data: String,
+}
+
+#[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 enum NativeContentOut {
     #[serde(rename = "text")]
@@ -104,6 +112,8 @@ enum NativeContentOut {
     },
     #[serde(rename = "image")]
     Image { source: ImageSource },
+    #[serde(rename = "document")]
+    Document { source: DocumentSource },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -328,7 +338,9 @@ impl AnthropicProvider {
                 | NativeContentOut::ToolResult { cache_control, .. } => {
                     *cache_control = Some(CacheControl::ephemeral());
                 }
-                NativeContentOut::ToolUse { .. } | NativeContentOut::Image { .. } => {}
+                NativeContentOut::ToolUse { .. }
+                | NativeContentOut::Image { .. }
+                | NativeContentOut::Document { .. } => {}
             }
         }
     }
@@ -467,7 +479,8 @@ impl AnthropicProvider {
                 }
                 _ => {
                     // Parse image markers from user message content
-                    let (text, image_refs) = crate::multimodal::parse_image_markers(&msg.content);
+                    let (text_after_images, image_refs) =
+                        crate::multimodal::parse_image_markers(&msg.content);
                     let mut content_blocks: Vec<NativeContentOut> = Vec::new();
 
                     // Add image content blocks for each image reference
@@ -517,10 +530,42 @@ impl AnthropicProvider {
                         });
                     }
 
-                    // Add text content block (skip empty text when images are present)
-                    if text.is_empty() && !image_refs.is_empty() {
+                    // Parse document markers from text (after image markers removed)
+                    let (text, doc_refs) =
+                        crate::multimodal::parse_document_markers(&text_after_images);
+
+                    for doc_ref in &doc_refs {
+                        if doc_ref.starts_with("data:")
+                            && let Some(comma) = doc_ref.find(',')
+                        {
+                            let header = &doc_ref[5..comma];
+                            let mime = header
+                                .split(';')
+                                .next()
+                                .unwrap_or("application/pdf")
+                                .to_string();
+                            let b64 = doc_ref[comma + 1..].trim().to_string();
+                            content_blocks.push(NativeContentOut::Document {
+                                source: DocumentSource {
+                                    source_type: "base64".to_string(),
+                                    media_type: mime,
+                                    data: b64,
+                                },
+                            });
+                        }
+                    }
+
+                    let has_media = !image_refs.is_empty() || !doc_refs.is_empty();
+
+                    // Add text content block (skip empty text when media is present)
+                    if text.is_empty() && has_media {
+                        let placeholder = if !image_refs.is_empty() {
+                            "[image]"
+                        } else {
+                            "[document]"
+                        };
                         content_blocks.push(NativeContentOut::Text {
-                            text: "[image]".to_string(),
+                            text: placeholder.to_string(),
                             cache_control: None,
                         });
                     } else if !text.trim().is_empty() {
