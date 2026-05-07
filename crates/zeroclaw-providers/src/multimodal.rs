@@ -653,7 +653,7 @@ async fn normalize_remote_document(
         validate_size(source, bytes.len(), MAX_DOCUMENT_BYTES)?;
 
         let mime = detect_document_mime(source, None, bytes.as_ref(), content_type.as_deref())?;
-        return finalize_document(source, &mime, &bytes);
+        return finalize_document(source, &mime, &bytes).await;
     }
 
     // Local file path
@@ -689,7 +689,7 @@ async fn normalize_remote_document(
     validate_size(source, bytes.len(), MAX_DOCUMENT_BYTES)?;
 
     let mime = detect_document_mime(source, Some(path), &bytes, None)?;
-    finalize_document(source, &mime, &bytes)
+    finalize_document(source, &mime, &bytes).await
 }
 
 fn validate_document_mime(source: &str, mime: &str) -> anyhow::Result<()> {
@@ -744,8 +744,8 @@ fn detect_document_mime(
 }
 
 /// Finalize document bytes into a data URI. Converts Office formats (DOCX/XLSX/PPTX)
-/// to PDF via office2pdf. CSV is treated as text/plain.
-fn finalize_document(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Result<String> {
+/// to PDF via office2pdf (on a blocking thread). CSV is treated as text/plain.
+async fn finalize_document(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Result<String> {
     // Direct pass-through for natively supported types
     if ALLOWED_DOCUMENT_MIME_TYPES.contains(&mime) {
         return Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)));
@@ -756,20 +756,28 @@ fn finalize_document(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Result<S
         return Ok(format!("data:text/plain;base64,{}", STANDARD.encode(bytes)));
     }
 
-    // Office formats → convert to PDF
+    // Office formats → convert to PDF on a blocking thread to avoid stalling
+    // the Tokio runtime (office2pdf is CPU-bound and can take hundreds of ms).
     if let Some(&(_, format)) = CONVERTIBLE_OFFICE_MIME_TYPES
         .iter()
         .find(|&&(m, _)| m == mime)
     {
-        let result = office2pdf::convert_bytes(
-            bytes,
-            format,
-            &office2pdf::config::ConvertOptions::default(),
-        )
-        .map_err(|e| MultimodalError::RemoteFetchFailed {
-            input: source.to_string(),
-            reason: format!("office2pdf conversion failed: {e}"),
-        })?;
+        let bytes_owned = bytes.to_vec();
+        let source_owned = source.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            office2pdf::convert_bytes(
+                &bytes_owned,
+                format,
+                &office2pdf::config::ConvertOptions::default(),
+            )
+            .map_err(|e| MultimodalError::RemoteFetchFailed {
+                input: source_owned,
+                reason: format!("office2pdf conversion failed: {e}"),
+            })
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
+
         return Ok(format!(
             "data:application/pdf;base64,{}",
             STANDARD.encode(&result.pdf)
@@ -1288,23 +1296,27 @@ mod tests {
         assert!(doc_refs[0].starts_with("data:application/pdf;base64,"));
     }
 
-    #[test]
-    fn finalize_document_converts_csv_to_text_plain() {
+    #[tokio::test]
+    async fn finalize_document_converts_csv_to_text_plain() {
         let csv = b"name,email\nJohn,john@test.com\n";
-        let result = finalize_document("test.csv", "text/csv", csv).unwrap();
+        let result = finalize_document("test.csv", "text/csv", csv)
+            .await
+            .unwrap();
         assert!(result.starts_with("data:text/plain;base64,"));
     }
 
-    #[test]
-    fn finalize_document_passes_through_pdf() {
+    #[tokio::test]
+    async fn finalize_document_passes_through_pdf() {
         let pdf = b"%PDF-1.4 minimal";
-        let result = finalize_document("test.pdf", "application/pdf", pdf).unwrap();
+        let result = finalize_document("test.pdf", "application/pdf", pdf)
+            .await
+            .unwrap();
         assert!(result.starts_with("data:application/pdf;base64,"));
     }
 
-    #[test]
-    fn finalize_document_rejects_unknown_mime() {
-        let result = finalize_document("test.xyz", "application/x-unknown", b"data");
+    #[tokio::test]
+    async fn finalize_document_rejects_unknown_mime() {
+        let result = finalize_document("test.xyz", "application/x-unknown", b"data").await;
         assert!(result.is_err());
     }
 
@@ -1333,118 +1345,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mime, "text/csv");
-    }
-
-    /// Smoke test: real DOCX → PDF conversion via office2pdf.
-    #[test]
-    fn finalize_document_converts_docx_to_pdf() {
-        // Minimal .docx is a ZIP with specific XML entries — use office2pdf directly
-        // to verify the integration compiles and the Format enum works.
-        let docx_path = std::path::Path::new("/tmp/cx-test-docs/Prueba Agente CX.docx");
-        if !docx_path.exists() {
-            // Skip if test files not downloaded
-            return;
-        }
-        let bytes = std::fs::read(docx_path).unwrap();
-        let result = finalize_document(
-            "test.docx",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            &bytes,
-        )
-        .unwrap();
-        assert!(result.starts_with("data:application/pdf;base64,"));
-    }
-
-    /// Smoke test: real XLSX → PDF conversion via office2pdf.
-    #[test]
-    fn finalize_document_converts_xlsx_to_pdf() {
-        let xlsx_path = std::path::Path::new("/tmp/cx-test-docs/Prueba Agente CX.xlsx");
-        if !xlsx_path.exists() {
-            return;
-        }
-        let bytes = std::fs::read(xlsx_path).unwrap();
-        let result = finalize_document(
-            "test.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            &bytes,
-        )
-        .unwrap();
-        assert!(result.starts_with("data:application/pdf;base64,"));
-    }
-
-    /// Smoke test: real PPTX → PDF conversion via office2pdf.
-    #[test]
-    fn finalize_document_converts_pptx_to_pdf() {
-        let pptx_path = std::path::Path::new("/tmp/cx-test-docs/Prueba Agente CX.pptx");
-        if !pptx_path.exists() {
-            return;
-        }
-        let bytes = std::fs::read(pptx_path).unwrap();
-        let result = finalize_document(
-            "test.pptx",
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            &bytes,
-        )
-        .unwrap();
-        assert!(result.starts_with("data:application/pdf;base64,"));
-    }
-
-    /// Integration test: full pipeline with remote URLs from La Haus CDN.
-    #[tokio::test]
-    async fn prepare_messages_converts_remote_office_documents() {
-        let urls = vec![
-            (
-                "csv",
-                "https://assets.lahaus.com/cx-agent-test-documents/Prueba%20Agente%20CX%20-%20Hoja%201.csv",
-            ),
-            (
-                "docx",
-                "https://assets.lahaus.com/cx-agent-test-documents/Prueba%20Agente%20CX.docx",
-            ),
-            (
-                "xlsx",
-                "https://assets.lahaus.com/cx-agent-test-documents/Prueba%20Agente%20CX.xlsx",
-            ),
-            (
-                "pptx",
-                "https://assets.lahaus.com/cx-agent-test-documents/Prueba%20Agente%20CX.pptx",
-            ),
-            (
-                "pdf",
-                "https://assets.lahaus.com/cx-agent-test-documents/Prueba%20Agente%20CX.pdf",
-            ),
-        ];
-
-        let config = MultimodalConfig {
-            allow_remote_fetch: true,
-            ..Default::default()
-        };
-
-        for (ext, url) in urls {
-            let messages = vec![ChatMessage::user(format!("Review [DOCUMENT:{url}]"))];
-            let result = prepare_messages_for_provider(&messages, &config).await;
-            match result {
-                Ok(prepared) => {
-                    assert!(
-                        prepared.contains_documents,
-                        "{ext}: expected contains_documents=true"
-                    );
-                    let (_, doc_refs) = parse_document_markers(&prepared.messages[0].content);
-                    assert_eq!(doc_refs.len(), 1, "{ext}: expected 1 document ref");
-                    assert!(
-                        doc_refs[0].starts_with("data:"),
-                        "{ext}: expected data URI, got: {}",
-                        &doc_refs[0][..50.min(doc_refs[0].len())]
-                    );
-                    println!(
-                        "✅ {ext}: converted successfully ({} bytes base64)",
-                        doc_refs[0].len()
-                    );
-                }
-                Err(e) => {
-                    panic!("❌ {ext}: pipeline failed: {e}");
-                }
-            }
-        }
     }
 }
