@@ -117,62 +117,71 @@ pub enum MultimodalError {
 /// process them. URLs that already appear inside existing markers are skipped.
 /// Unsupported formats (HEIC/HEIF) are flagged with a descriptive placeholder.
 pub fn inject_url_markers(content: &str) -> String {
-    let mut result = content.to_string();
-    let mut injected = Vec::new();
+    // Collect (end_offset, marker_to_insert) pairs using actual regex match positions.
+    let mut insertions: Vec<(usize, String)> = Vec::new();
 
-    for caps in URL_WITH_EXTENSION_RE.captures_iter(content) {
-        let full_match = caps.get(0).unwrap().as_str();
-        // Get the URL without query string for extension detection
-        let base_url = caps.get(1).unwrap().as_str();
+    for m in URL_WITH_EXTENSION_RE.find_iter(content) {
+        let url = m.as_str();
+        let pos = m.start();
 
-        // Skip if already inside an existing marker
-        if let Some(pos) = content.find(full_match) {
-            let before = &content[..pos];
-            // Check if there's an unclosed [IMAGE: or [DOCUMENT: before this URL
-            let last_open_image = before.rfind(IMAGE_MARKER_PREFIX);
-            let last_open_doc = before.rfind(DOCUMENT_MARKER_PREFIX);
-            let last_close = before.rfind(']');
+        // Use the actual match position (not content.find) to check context
+        let before = &content[..pos];
+        let last_open_image = before.rfind(IMAGE_MARKER_PREFIX);
+        let last_open_doc = before.rfind(DOCUMENT_MARKER_PREFIX);
+        let last_close = before.rfind(']');
 
-            let inside_marker = match (last_open_image.or(last_open_doc), last_close) {
-                (Some(open), Some(close)) => open > close,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            if inside_marker {
-                continue;
-            }
+        let inside_marker = match (last_open_image.or(last_open_doc), last_close) {
+            (Some(open), Some(close)) => open > close,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if inside_marker {
+            continue;
         }
 
-        let ext = base_url
+        // Check if a marker already follows this URL
+        let after = &content[m.end()..];
+        if after.starts_with(" [IMAGE:") || after.starts_with(" [DOCUMENT:") {
+            continue;
+        }
+
+        // Extract extension from the URL path (before query string)
+        let url_path = url.split('?').next().unwrap_or(url);
+        let ext = url_path
             .rsplit('.')
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
 
-        if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
-            injected.push((full_match.to_string(), format!(" [IMAGE:{full_match}]")));
+        let marker = if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+            format!(" [IMAGE:{url}]")
         } else if DOCUMENT_EXTENSIONS.contains(&ext.as_str()) {
-            injected.push((full_match.to_string(), format!(" [DOCUMENT:{full_match}]")));
+            format!(" [DOCUMENT:{url}]")
         } else if UNSUPPORTED_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
-            injected.push((
-                full_match.to_string(),
-                format!(
-                    " [Unsupported file: {full_match} — HEIC/HEIF format is not supported by the AI provider. Ask the user to resend as JPEG or PNG.]"
-                ),
-            ));
-        }
+            format!(
+                " [Unsupported file: {url} — HEIC/HEIF format is not supported by the AI provider. Ask the user to resend as JPEG or PNG.]"
+            )
+        } else {
+            continue;
+        };
+
+        tracing::debug!(
+            url,
+            marker_kind = ext.as_str(),
+            "Injecting URL marker from plain text"
+        );
+        insertions.push((m.end(), marker));
     }
 
-    for (url, marker) in &injected {
-        // Append marker after the URL (don't replace — keep original URL visible)
-        if let Some(pos) = result.find(url.as_str()) {
-            let end = pos + url.len();
-            // Only inject if no marker already follows
-            let after = &result[end..];
-            if !after.starts_with(" [IMAGE:") && !after.starts_with(" [DOCUMENT:") {
-                result.insert_str(end, marker);
-            }
-        }
+    if insertions.is_empty() {
+        return content.to_string();
+    }
+
+    // Build result by inserting markers at correct positions (process right-to-left
+    // to preserve offsets when inserting into the string).
+    let mut result = content.to_string();
+    for (end_pos, marker) in insertions.into_iter().rev() {
+        result.insert_str(end_pos, &marker);
     }
 
     result
@@ -1585,6 +1594,20 @@ mod tests {
         let input = "File at https://cdn.example.com/FILE.PNG here";
         let result = inject_url_markers(input);
         assert!(result.contains("[IMAGE:https://cdn.example.com/FILE.PNG]"));
+    }
+
+    #[test]
+    fn inject_url_markers_same_url_inside_and_outside_marker() {
+        // Same URL appears twice: once inside a marker (skip), once outside (inject)
+        let input =
+            "[IMAGE:https://cdn.example.com/photo.png] and also https://cdn.example.com/photo.png";
+        let result = inject_url_markers(input);
+        // The one inside the marker should NOT get double-wrapped
+        assert!(result.starts_with("[IMAGE:https://cdn.example.com/photo.png]"));
+        // The one outside should get a marker
+        assert!(result.ends_with(
+            "https://cdn.example.com/photo.png [IMAGE:https://cdn.example.com/photo.png]"
+        ));
     }
 
     #[test]
