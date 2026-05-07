@@ -379,14 +379,46 @@ pub async fn prepare_messages_for_provider(
             }
         }
 
-        // --- Document processing (non-fatal) ---
+        // --- Document processing (non-fatal, with image reclassification) ---
         let (text_after_docs, doc_refs) = parse_document_markers(&text_after_images);
 
+        // Track URLs reclassified from document → image so compose_multimodal
+        // includes them in the image attachment list, not the document list.
+        let mut reclassified_image_urls: Vec<String> = Vec::new();
         let mut normalized_doc_refs = Vec::with_capacity(doc_refs.len());
         for reference in &doc_refs {
             match normalize_remote_document(reference, config, &remote_client).await {
                 Ok(data_uri) => normalized_doc_refs.push(data_uri),
                 Err(e) => {
+                    // Reclassify: if the "document" is actually an image (e.g. a .webp
+                    // sent with type=document by the messaging platform), route it
+                    // through the image pipeline instead of failing.
+                    if is_image_mime_error(&e) {
+                        tracing::info!(source = %reference, "Reclassifying document as image (MIME is image type)");
+                        match normalize_image_reference(
+                            reference,
+                            config,
+                            max_bytes,
+                            &remote_client,
+                        )
+                        .await
+                        {
+                            Ok(data_uri) => {
+                                normalized_image_refs.push(data_uri);
+                                reclassified_image_urls.push(reference.clone());
+                                continue;
+                            }
+                            Err(img_err) => {
+                                tracing::warn!(source = %reference, error = %img_err, "Reclassified image also failed");
+                                skipped_attachments.push(SkippedAttachment {
+                                    url: reference.clone(),
+                                    kind: "image (reclassified from document)",
+                                    reason: img_err.to_string(),
+                                });
+                                continue;
+                            }
+                        }
+                    }
                     tracing::warn!(source = %reference, error = %e, "Skipping invalid document in multimodal pipeline");
                     skipped_attachments.push(SkippedAttachment {
                         url: reference.clone(),
@@ -409,9 +441,13 @@ pub async fn prepare_messages_for_provider(
             has_documents = true;
         }
 
+        // Merge reclassified image URLs into the image URL list for compose
+        let mut all_image_urls = image_refs.clone();
+        all_image_urls.extend(reclassified_image_urls);
+
         let content = compose_multimodal_message_full(
             &text_after_docs,
-            &image_refs,
+            &all_image_urls,
             &normalized_image_refs,
             &doc_refs,
             &normalized_doc_refs,
@@ -945,6 +981,16 @@ async fn finalize_document(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Re
         mime: mime.to_string(),
     }
     .into())
+}
+
+/// Check if an error from document processing is an `UnsupportedMime` where
+/// the MIME type is actually an image format. Used to reclassify documents
+/// that are really images (e.g. a .webp sent as type=document).
+fn is_image_mime_error(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<MultimodalError>(),
+        Some(MultimodalError::UnsupportedMime { mime, .. }) if mime.starts_with("image/")
+    )
 }
 
 fn validate_size(source: &str, size_bytes: usize, max_bytes: usize) -> anyhow::Result<()> {
