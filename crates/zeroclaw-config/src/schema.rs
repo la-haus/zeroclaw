@@ -1424,6 +1424,7 @@ pub struct AgentConfig {
     #[serde(default = "default_agent_max_tool_iterations")]
     pub max_tool_iterations: usize,
     /// Maximum conversation history messages retained per session. Default: `50`.
+    /// This is the hard cap — messages beyond this limit are dropped (oldest first).
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
     /// Maximum estimated tokens for conversation history before compaction triggers.
@@ -1431,6 +1432,13 @@ pub struct AgentConfig {
     /// are summarized to preserve context while staying within budget. Default: `32000`.
     #[serde(default = "default_agent_max_context_tokens")]
     pub max_context_tokens: usize,
+    /// Trigger context compression after this many user turns, regardless of token count.
+    /// This is independent of `max_history_messages` (hard cap) and `max_context_tokens`
+    /// (token-based threshold). When `> 0`, compression runs every N user turns even if
+    /// the token budget has not been exceeded yet. `0` disables turn-based compression
+    /// (only token-based compression applies). Default: `0`.
+    #[serde(default)]
+    pub auto_compact_after_turns: usize,
     /// Enable parallel tool execution within a single iteration. Default: `false`.
     #[serde(default)]
     pub parallel_tools: bool,
@@ -1561,6 +1569,7 @@ impl Default for AgentConfig {
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
             max_context_tokens: default_agent_max_context_tokens(),
+            auto_compact_after_turns: 0,
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
@@ -12234,6 +12243,7 @@ reasoning_effort = "turbo"
         assert!(cfg.compact_context);
         assert_eq!(cfg.max_tool_iterations, 10);
         assert_eq!(cfg.max_history_messages, 50);
+        assert_eq!(cfg.auto_compact_after_turns, 0);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
     }
@@ -12246,6 +12256,7 @@ default_temperature = 0.7
 compact_context = true
 max_tool_iterations = 20
 max_history_messages = 80
+auto_compact_after_turns = 10
 parallel_tools = true
 tool_dispatcher = "xml"
 "#;
@@ -12253,6 +12264,7 @@ tool_dispatcher = "xml"
         assert!(parsed.agent.compact_context);
         assert_eq!(parsed.agent.max_tool_iterations, 20);
         assert_eq!(parsed.agent.max_history_messages, 80);
+        assert_eq!(parsed.agent.auto_compact_after_turns, 10);
         assert!(parsed.agent.parallel_tools);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
     }
