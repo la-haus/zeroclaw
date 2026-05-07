@@ -4541,15 +4541,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_rejects_oversized_image_payload() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = VisionProvider {
-            calls: Arc::clone(&calls),
+    async fn run_tool_call_loop_skips_oversized_image_gracefully() {
+        // Oversized images are now non-fatal: they get skipped with a warning
+        // in the message content, and the LLM call proceeds normally.
+        // Uses ScriptedProvider with vision=true (since the raw marker triggers
+        // the vision capability check before prepare_messages strips it).
+        let provider = {
+            let mut p = ScriptedProvider::from_text_responses(vec!["image skipped but ok"]);
+            p.capabilities.vision = true;
+            p
         };
 
         let oversized_payload = STANDARD.encode(vec![0_u8; (1024 * 1024) + 1]);
         let mut history = vec![ChatMessage::user(format!(
-            "[IMAGE:data:image/png;base64,{oversized_payload}]"
+            "Check this [IMAGE:data:image/png;base64,{oversized_payload}]"
         ))];
 
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
@@ -4561,7 +4566,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = run_tool_call_loop(
+        let result = run_tool_call_loop(
             &provider,
             &mut history,
             &tools_registry,
@@ -4588,14 +4593,15 @@ mod tests {
             None,
             None, // channel
         )
-        .await
-        .expect_err("oversized payload must fail");
+        .await;
 
+        // Oversized image skipped, LLM still called with remaining text + skip notice
         assert!(
-            err.to_string()
-                .contains("multimodal image size limit exceeded")
+            result.is_ok(),
+            "oversized image should be skipped, not fatal: {result:?}"
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let text = result.unwrap();
+        assert_eq!(text, "image skipped but ok");
     }
 
     #[tokio::test]

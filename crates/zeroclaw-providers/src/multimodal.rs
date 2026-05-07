@@ -1,6 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use regex::Regex;
 use reqwest::Client;
 use std::path::Path;
+use std::sync::LazyLock;
 use zeroclaw_api::provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
@@ -52,6 +54,31 @@ const CONVERTIBLE_OFFICE_MIME_TYPES: &[&str] = &[
 /// Maximum document size in bytes (32 MB — Anthropic PDF limit).
 const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
 
+/// Image file extensions that trigger `[IMAGE:url]` markers when detected in URLs.
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp"];
+
+/// Document file extensions that trigger `[DOCUMENT:url]` markers when detected in URLs.
+const DOCUMENT_EXTENSIONS: &[&str] = &["pdf", "csv", "txt", "docx", "xlsx", "pptx"];
+
+/// File extensions recognized but NOT supported — detected for descriptive skip messages.
+const UNSUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["heic", "heif"];
+
+/// Regex matching URLs (http/https) ending in a supported file extension.
+/// Built from IMAGE_EXTENSIONS, DOCUMENT_EXTENSIONS, and UNSUPPORTED_IMAGE_EXTENSIONS
+/// to guarantee they stay in sync.
+static URL_WITH_EXTENSION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    let all_exts: Vec<&str> = IMAGE_EXTENSIONS
+        .iter()
+        .chain(DOCUMENT_EXTENSIONS.iter())
+        .chain(UNSUPPORTED_IMAGE_EXTENSIONS.iter())
+        .copied()
+        .collect();
+    // Build alternation: png|jpg|jpeg|webp|... (jpeg gets special handling via jpe?g)
+    let alt = all_exts.join("|");
+    let pattern = format!(r"(?i)(https?://[^\s\]\)>]+\.(?:{alt}))(?:\?[^\s\]\)>]*)?");
+    Regex::new(&pattern).expect("URL_WITH_EXTENSION_RE must compile")
+});
+
 #[derive(Debug, Clone)]
 pub struct PreparedMessages {
     pub messages: Vec<ChatMessage>,
@@ -73,8 +100,12 @@ pub enum MultimodalError {
         max_bytes: usize,
     },
 
-    #[error("multimodal image MIME type is not allowed for '{input}': {mime}")]
-    UnsupportedMime { input: String, mime: String },
+    #[error("multimodal image MIME type is not allowed for '{input}': {mime}{}", hint.as_ref().map(|h| format!(" ({h})")).unwrap_or_default())]
+    UnsupportedMime {
+        input: String,
+        mime: String,
+        hint: Option<String>,
+    },
 
     #[error("multimodal remote image fetch is disabled for '{input}'")]
     RemoteFetchDisabled { input: String },
@@ -90,6 +121,81 @@ pub enum MultimodalError {
 
     #[error("failed to read local image '{input}': {reason}")]
     LocalReadFailed { input: String, reason: String },
+}
+
+/// Scan user message text for URLs with recognized file extensions and inject
+/// `[IMAGE:url]` or `[DOCUMENT:url]` markers so the multimodal pipeline can
+/// process them. URLs that already appear inside existing markers are skipped.
+/// Unsupported formats (HEIC/HEIF) are flagged with a descriptive placeholder.
+pub fn inject_url_markers(content: &str) -> String {
+    // Collect (end_offset, marker_to_insert) pairs using actual regex match positions.
+    let mut insertions: Vec<(usize, String)> = Vec::new();
+
+    for m in URL_WITH_EXTENSION_RE.find_iter(content) {
+        let url = m.as_str();
+        let pos = m.start();
+
+        // Use the actual match position (not content.find) to check context
+        let before = &content[..pos];
+        let last_open_image = before.rfind(IMAGE_MARKER_PREFIX);
+        let last_open_doc = before.rfind(DOCUMENT_MARKER_PREFIX);
+        let last_close = before.rfind(']');
+
+        let inside_marker = match (last_open_image.or(last_open_doc), last_close) {
+            (Some(open), Some(close)) => open > close,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if inside_marker {
+            continue;
+        }
+
+        // Check if a marker already follows this URL
+        let after = &content[m.end()..];
+        if after.starts_with(" [IMAGE:") || after.starts_with(" [DOCUMENT:") {
+            continue;
+        }
+
+        // Extract extension from the URL path (before query string)
+        let url_path = url.split('?').next().unwrap_or(url);
+        let ext = url_path
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        let marker = if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+            format!(" [IMAGE:{url}]")
+        } else if DOCUMENT_EXTENSIONS.contains(&ext.as_str()) {
+            format!(" [DOCUMENT:{url}]")
+        } else if UNSUPPORTED_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+            format!(
+                " [Unsupported file: {url} — HEIC/HEIF format is not supported by the AI provider. Ask the user to resend as JPEG or PNG.]"
+            )
+        } else {
+            continue;
+        };
+
+        tracing::debug!(
+            url,
+            marker_kind = ext.as_str(),
+            "Injecting URL marker from plain text"
+        );
+        insertions.push((m.end(), marker));
+    }
+
+    if insertions.is_empty() {
+        return content.to_string();
+    }
+
+    // Build result by inserting markers at correct positions (process right-to-left
+    // to preserve offsets when inserting into the string).
+    let mut result = content.to_string();
+    for (end_pos, marker) in insertions.into_iter().rev() {
+        result.insert_str(end_pos, &marker);
+    }
+
+    result
 }
 
 pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
@@ -208,12 +314,36 @@ pub async fn prepare_messages_for_provider(
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
-    let total_images = count_image_markers(messages);
-    let total_documents = count_document_markers(messages);
+    // Pre-process: detect URLs with supported file extensions in user messages
+    // and inject [IMAGE:url] or [DOCUMENT:url] markers automatically.
+    let enriched: Vec<ChatMessage> = messages
+        .iter()
+        .map(|m| {
+            if m.role == "user" && (m.content.contains("http://") || m.content.contains("https://"))
+            {
+                let injected = inject_url_markers(&m.content);
+                if injected != m.content {
+                    tracing::debug!(
+                        original_len = m.content.len(),
+                        enriched_len = injected.len(),
+                        "Injected URL markers from plain text"
+                    );
+                    return ChatMessage {
+                        role: m.role.clone(),
+                        content: injected,
+                    };
+                }
+            }
+            m.clone()
+        })
+        .collect();
+
+    let total_images = count_image_markers(&enriched);
+    let total_documents = count_document_markers(&enriched);
 
     if total_images == 0 && total_documents == 0 {
         return Ok(PreparedMessages {
-            messages: messages.to_vec(),
+            messages: enriched,
             contains_images: false,
             contains_documents: false,
         });
@@ -224,9 +354,9 @@ pub async fn prepare_messages_for_provider(
     // prevents conversations from becoming permanently stuck once the
     // cumulative image count crosses the threshold.
     let trimmed = if total_images > max_images {
-        trim_old_images(messages, max_images)
+        trim_old_images(&enriched, max_images)
     } else {
-        messages.to_vec()
+        enriched
     };
 
     let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
@@ -260,14 +390,46 @@ pub async fn prepare_messages_for_provider(
             }
         }
 
-        // --- Document processing (non-fatal) ---
+        // --- Document processing (non-fatal, with image reclassification) ---
         let (text_after_docs, doc_refs) = parse_document_markers(&text_after_images);
 
+        // Track URLs reclassified from document → image so compose_multimodal
+        // includes them in the image attachment list, not the document list.
+        let mut reclassified_image_urls: Vec<String> = Vec::new();
         let mut normalized_doc_refs = Vec::with_capacity(doc_refs.len());
         for reference in &doc_refs {
             match normalize_remote_document(reference, config, &remote_client).await {
                 Ok(data_uri) => normalized_doc_refs.push(data_uri),
                 Err(e) => {
+                    // Reclassify: if the "document" is actually an image (e.g. a .webp
+                    // sent with type=document by the messaging platform), route it
+                    // through the image pipeline instead of failing.
+                    if is_image_mime_error(&e) {
+                        tracing::info!(source = %reference, "Reclassifying document as image (MIME is image type)");
+                        match normalize_image_reference(
+                            reference,
+                            config,
+                            max_bytes,
+                            &remote_client,
+                        )
+                        .await
+                        {
+                            Ok(data_uri) => {
+                                normalized_image_refs.push(data_uri);
+                                reclassified_image_urls.push(reference.clone());
+                                continue;
+                            }
+                            Err(img_err) => {
+                                tracing::warn!(source = %reference, error = %img_err, "Reclassified image also failed");
+                                skipped_attachments.push(SkippedAttachment {
+                                    url: reference.clone(),
+                                    kind: "image (reclassified from document)",
+                                    reason: img_err.to_string(),
+                                });
+                                continue;
+                            }
+                        }
+                    }
                     tracing::warn!(source = %reference, error = %e, "Skipping invalid document in multimodal pipeline");
                     skipped_attachments.push(SkippedAttachment {
                         url: reference.clone(),
@@ -290,9 +452,13 @@ pub async fn prepare_messages_for_provider(
             has_documents = true;
         }
 
+        // Merge reclassified image URLs into the image URL list for compose
+        let mut all_image_urls = image_refs.clone();
+        all_image_urls.extend(reclassified_image_urls);
+
         let content = compose_multimodal_message_full(
             &text_after_docs,
-            &image_refs,
+            &all_image_urls,
             &normalized_image_refs,
             &doc_refs,
             &normalized_doc_refs,
@@ -551,6 +717,7 @@ async fn normalize_remote_image(
         MultimodalError::UnsupportedMime {
             input: source.to_string(),
             mime: "unknown".to_string(),
+            hint: None,
         }
     })?;
 
@@ -595,6 +762,7 @@ async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result
         detect_mime(Some(path), &bytes, None).ok_or_else(|| MultimodalError::UnsupportedMime {
             input: source.to_string(),
             mime: "unknown".to_string(),
+            hint: None,
         })?;
 
     validate_mime(source, &mime)?;
@@ -720,6 +888,7 @@ fn validate_document_mime(source: &str, mime: &str) -> anyhow::Result<()> {
     Err(MultimodalError::UnsupportedMime {
         input: source.to_string(),
         mime: mime.to_string(),
+        hint: None,
     }
     .into())
 }
@@ -760,6 +929,7 @@ fn detect_document_mime(
     Err(MultimodalError::UnsupportedMime {
         input: source.to_string(),
         mime: "unknown".to_string(),
+        hint: None,
     }
     .into())
 }
@@ -815,7 +985,8 @@ async fn finalize_document(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Re
         if CONVERTIBLE_OFFICE_MIME_TYPES.contains(&mime) {
             return Err(MultimodalError::UnsupportedMime {
                 input: source.to_string(),
-                mime: format!("{mime} (office-convert feature not enabled)"),
+                mime: mime.to_string(),
+                hint: Some("office-convert feature not enabled".to_string()),
             }
             .into());
         }
@@ -824,8 +995,19 @@ async fn finalize_document(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Re
     Err(MultimodalError::UnsupportedMime {
         input: source.to_string(),
         mime: mime.to_string(),
+        hint: None,
     }
     .into())
+}
+
+/// Check if an error from document processing is an `UnsupportedMime` where
+/// the MIME type is actually an image format. Used to reclassify documents
+/// that are really images (e.g. a .webp sent as type=document).
+fn is_image_mime_error(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<MultimodalError>(),
+        Some(MultimodalError::UnsupportedMime { mime, .. }) if mime.starts_with("image/")
+    )
 }
 
 fn validate_size(source: &str, size_bytes: usize, max_bytes: usize) -> anyhow::Result<()> {
@@ -846,9 +1028,19 @@ fn validate_mime(source: &str, mime: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let hint = if mime == "image/heic" || mime == "image/heif" {
+        Some(
+            "HEIC/HEIF not supported by AI provider — ask user to resend as JPEG or PNG"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
     Err(MultimodalError::UnsupportedMime {
         input: source.to_string(),
         mime: mime.to_string(),
+        hint,
     }
     .into())
 }
@@ -884,6 +1076,7 @@ fn mime_from_extension(ext: &str) -> Option<&'static str> {
         "webp" => Some("image/webp"),
         "gif" => Some("image/gif"),
         "bmp" => Some("image/bmp"),
+        "heic" | "heif" => Some("image/heic"),
         "pdf" => Some("application/pdf"),
         "txt" => Some("text/plain"),
         "csv" => Some("text/csv"),
@@ -913,6 +1106,14 @@ fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
 
     if bytes.len() >= 2 && bytes.starts_with(b"BM") {
         return Some("image/bmp");
+    }
+
+    // HEIC/HEIF: ISO BMFF container with ftyp box, brand starts at offset 8
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let brand = &bytes[8..12];
+        if brand == b"heic" || brand == b"heix" || brand == b"mif1" || brand == b"hevc" {
+            return Some("image/heic");
+        }
     }
 
     if bytes.len() >= 4 && bytes.starts_with(&[0x25, 0x50, 0x44, 0x46]) {
@@ -1383,5 +1584,133 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mime, "text/csv");
+    }
+
+    // ── URL extraction tests ────────────────────────────────────
+
+    #[test]
+    fn inject_url_markers_detects_image_urls() {
+        let input = "Check this https://cdn.example.com/photo.png please";
+        let result = inject_url_markers(input);
+        assert!(result.contains("[IMAGE:https://cdn.example.com/photo.png]"));
+    }
+
+    #[test]
+    fn inject_url_markers_detects_document_urls() {
+        let input = "Here is the report https://files.example.com/report.pdf";
+        let result = inject_url_markers(input);
+        assert!(result.contains("[DOCUMENT:https://files.example.com/report.pdf]"));
+    }
+
+    #[test]
+    fn inject_url_markers_detects_csv() {
+        let input = "Download https://storage.example.com/data.csv for analysis";
+        let result = inject_url_markers(input);
+        assert!(result.contains("[DOCUMENT:https://storage.example.com/data.csv]"));
+    }
+
+    #[test]
+    fn inject_url_markers_detects_office_formats() {
+        let input = "See https://a.com/file.docx and https://b.com/file.xlsx";
+        let result = inject_url_markers(input);
+        assert!(result.contains("[DOCUMENT:https://a.com/file.docx]"));
+        assert!(result.contains("[DOCUMENT:https://b.com/file.xlsx]"));
+    }
+
+    #[test]
+    fn inject_url_markers_skips_urls_already_in_markers() {
+        let input = "Look [IMAGE:https://cdn.example.com/photo.png] done";
+        let result = inject_url_markers(input);
+        // Should NOT double-wrap
+        assert!(!result.contains("[IMAGE:[IMAGE:"));
+        assert_eq!(
+            result.matches("[IMAGE:").count(),
+            1,
+            "should not duplicate marker"
+        );
+    }
+
+    #[test]
+    fn inject_url_markers_handles_heic() {
+        let input = "Photo https://cdn.example.com/IMG_1234.heic from iPhone";
+        let result = inject_url_markers(input);
+        assert!(result.contains("HEIC/HEIF format is not supported"));
+        assert!(!result.contains("[IMAGE:"));
+    }
+
+    #[test]
+    fn inject_url_markers_ignores_urls_without_extension() {
+        let input = "Visit https://example.com/api/data for info";
+        let result = inject_url_markers(input);
+        assert_eq!(result, input, "no markers should be injected");
+    }
+
+    #[test]
+    fn inject_url_markers_handles_query_strings() {
+        let input = "See https://cdn.example.com/photo.jpg?token=abc123&size=large please";
+        let result = inject_url_markers(input);
+        assert!(
+            result.contains("[IMAGE:https://cdn.example.com/photo.jpg?token=abc123&size=large]")
+        );
+    }
+
+    #[test]
+    fn inject_url_markers_case_insensitive() {
+        let input = "File at https://cdn.example.com/FILE.PNG here";
+        let result = inject_url_markers(input);
+        assert!(result.contains("[IMAGE:https://cdn.example.com/FILE.PNG]"));
+    }
+
+    #[test]
+    fn inject_url_markers_same_url_inside_and_outside_marker() {
+        // Same URL appears twice: once inside a marker (skip), once outside (inject)
+        let input =
+            "[IMAGE:https://cdn.example.com/photo.png] and also https://cdn.example.com/photo.png";
+        let result = inject_url_markers(input);
+        // The one inside the marker should NOT get double-wrapped
+        assert!(result.starts_with("[IMAGE:https://cdn.example.com/photo.png]"));
+        // The one outside should get a marker
+        assert!(result.ends_with(
+            "https://cdn.example.com/photo.png [IMAGE:https://cdn.example.com/photo.png]"
+        ));
+    }
+
+    #[test]
+    fn inject_url_markers_multiple_urls() {
+        let input = "https://a.com/img.jpg https://b.com/doc.pdf https://c.com/page.html";
+        let result = inject_url_markers(input);
+        assert!(result.contains("[IMAGE:https://a.com/img.jpg]"));
+        assert!(result.contains("[DOCUMENT:https://b.com/doc.pdf]"));
+        // .html is not supported, should not be tagged
+        assert!(!result.contains("[IMAGE:https://c.com/page.html]"));
+        assert!(!result.contains("[DOCUMENT:https://c.com/page.html]"));
+    }
+
+    // ── HEIC detection tests ────────────────────────────────────
+
+    #[test]
+    fn heic_extension_detected() {
+        assert_eq!(mime_from_extension("heic"), Some("image/heic"));
+        assert_eq!(mime_from_extension("heif"), Some("image/heic"));
+        assert_eq!(mime_from_extension("HEIC"), Some("image/heic"));
+    }
+
+    #[test]
+    fn heic_magic_bytes_detected() {
+        // Minimal HEIC ftyp box: 4 bytes size + "ftyp" + "heic" brand
+        let heic_bytes: Vec<u8> = vec![
+            0x00, 0x00, 0x00, 0x18, // size = 24
+            b'f', b't', b'y', b'p', // type = ftyp
+            b'h', b'e', b'i', b'c', // brand = heic
+        ];
+        assert_eq!(mime_from_magic(&heic_bytes), Some("image/heic"));
+    }
+
+    #[test]
+    fn heic_validate_mime_fails_with_helpful_message() {
+        let err = validate_mime("test.heic", "image/heic").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("HEIC/HEIF not supported"), "got: {msg}");
+        assert!(msg.contains("JPEG or PNG"), "got: {msg}");
     }
 }

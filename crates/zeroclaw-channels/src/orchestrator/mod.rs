@@ -157,6 +157,9 @@ impl Observer for ChannelNotifyObserver {
 type ConversationHistoryMap = Arc<Mutex<lru::LruCache<String, Vec<ChatMessage>>>>;
 /// Senders that requested `/new` and must force a fresh prompt on their next message.
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
+/// Per-sender turn counter for auto-compact: tracks user turns since last compression.
+/// Bounded by the same `MAX_CONVERSATION_SENDERS` as the conversation history LRU.
+type AutoCompactTurnCounter = Arc<Mutex<lru::LruCache<String, usize>>>;
 /// Maximum conversation senders kept in memory (LRU eviction beyond this).
 const MAX_CONVERSATION_SENDERS: usize = 1000;
 /// Maximum history messages to keep per sender.
@@ -375,6 +378,8 @@ struct ChannelRuntimeContext {
     max_tool_result_chars: usize,
     context_token_budget: usize,
     debouncer: Arc<zeroclaw_infra::debounce::MessageDebouncer>,
+    /// Per-sender turn counter for turn-based auto-compact.
+    auto_compact_counters: AutoCompactTurnCounter,
 }
 
 #[derive(Clone)]
@@ -1055,6 +1060,11 @@ fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: Chan
 
 fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
     ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pop(sender_key);
+    // Reset auto-compact turn counter for this sender
+    ctx.auto_compact_counters
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .pop(sender_key);
@@ -2767,11 +2777,30 @@ async fn process_channel_message(
     history.extend(prior_turns);
 
     // ── Proactive context compression ────────────────────────────
-    // Use the existing ContextCompressor to summarize older history
-    // before the LLM call, preventing context-window-exceeded errors
-    // and preserving key decisions through LLM-driven summarization.
+    // Two triggers: (1) token-based (existing) and (2) turn-based (new).
+    // Turn-based forces compression after N user turns even if below the
+    // token threshold, preventing gradual context degradation in long
+    // but individually short conversations.
     {
-        let cc_config = ctx.prompt_config.agent.context_compression.clone();
+        let auto_compact_threshold = ctx.prompt_config.agent.auto_compact_after_turns;
+        let force_turn_based = if auto_compact_threshold > 0 {
+            let mut counters = ctx
+                .auto_compact_counters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let count = counters.get_or_insert_mut(history_key.clone(), || 0);
+            *count += 1;
+            *count >= auto_compact_threshold
+        } else {
+            false
+        };
+
+        let mut cc_config = ctx.prompt_config.agent.context_compression.clone();
+        if force_turn_based {
+            // Override threshold to 0.0 so compression fires regardless of token count
+            cc_config.threshold_ratio = 0.0;
+        }
+
         let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
             cc_config,
             ctx.context_token_budget,
@@ -2788,8 +2817,17 @@ async fn process_channel_message(
                     tokens_before = result.tokens_before,
                     tokens_after = result.tokens_after,
                     passes = result.passes_used,
+                    turn_based = force_turn_based,
                     "Proactive context compression applied before LLM call"
                 );
+                // Reset turn counter after successful compression
+                if auto_compact_threshold > 0 {
+                    let mut counters = ctx
+                        .auto_compact_counters
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    counters.put(history_key.clone(), 0);
+                }
             }
             Err(e) => {
                 tracing::warn!("Context compression failed, proceeding without: {e}");
@@ -5580,6 +5618,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
             Duration::from_millis(config.channels.debounce_ms),
         )),
+        auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+        ))),
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
@@ -6103,6 +6144,9 @@ mod tests {
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -6229,6 +6273,9 @@ mod tests {
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -6312,6 +6359,9 @@ mod tests {
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -6412,6 +6462,9 @@ mod tests {
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         };
 
         assert!(rollback_orphan_user_turn(
@@ -7013,6 +7066,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -7105,6 +7161,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -7211,6 +7270,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -7302,6 +7364,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -7403,6 +7468,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -7525,6 +7593,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -7628,6 +7699,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -7746,6 +7820,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -7852,6 +7929,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -7948,6 +8028,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -8167,6 +8250,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
@@ -8281,6 +8367,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -8414,6 +8503,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -8544,6 +8636,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -8652,6 +8747,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -8741,6 +8839,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -8830,6 +8931,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -9625,6 +9729,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -9771,6 +9878,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -9958,6 +10068,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -10076,6 +10189,9 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -10700,6 +10816,9 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -10798,6 +10917,9 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -10928,6 +11050,9 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 std::time::Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
         });
@@ -11106,6 +11231,9 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -11228,6 +11356,9 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -11342,6 +11473,9 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -11476,6 +11610,9 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         process_channel_message(
@@ -11792,6 +11929,9 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
