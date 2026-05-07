@@ -67,7 +67,7 @@ path = "src/lib.rs"
 zeroclaw-api.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config.workspace = true
-zeroclaw-providers.workspace = true
+zeroclaw-providers = { workspace = true, features = ["office-convert"] }
 zeroclaw-memory.workspace = true
 zeroclaw-channels = { workspace = true, optional = true }
 zeroclaw-tools = { workspace = true, optional = true }
