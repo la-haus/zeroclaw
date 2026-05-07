@@ -64,12 +64,19 @@ const DOCUMENT_EXTENSIONS: &[&str] = &["pdf", "csv", "txt", "docx", "xlsx", "ppt
 const UNSUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["heic", "heif"];
 
 /// Regex matching URLs (http/https) ending in a supported file extension.
-/// Captures: full URL including optional query string, and the extension.
+/// Built from IMAGE_EXTENSIONS, DOCUMENT_EXTENSIONS, and UNSUPPORTED_IMAGE_EXTENSIONS
+/// to guarantee they stay in sync.
 static URL_WITH_EXTENSION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)(https?://[^\s\]\)>]+\.(?:png|jpe?g|webp|gif|bmp|pdf|csv|txt|docx|xlsx|pptx|heic|heif))(?:\?[^\s\]\)>]*)?"
-    )
-    .expect("URL_WITH_EXTENSION_RE must compile")
+    let all_exts: Vec<&str> = IMAGE_EXTENSIONS
+        .iter()
+        .chain(DOCUMENT_EXTENSIONS.iter())
+        .chain(UNSUPPORTED_IMAGE_EXTENSIONS.iter())
+        .copied()
+        .collect();
+    // Build alternation: png|jpg|jpeg|webp|... (jpeg gets special handling via jpe?g)
+    let alt = all_exts.join("|");
+    let pattern = format!(r"(?i)(https?://[^\s\]\)>]+\.(?:{alt}))(?:\?[^\s\]\)>]*)?");
+    Regex::new(&pattern).expect("URL_WITH_EXTENSION_RE must compile")
 });
 
 #[derive(Debug, Clone)]
@@ -93,8 +100,12 @@ pub enum MultimodalError {
         max_bytes: usize,
     },
 
-    #[error("multimodal image MIME type is not allowed for '{input}': {mime}")]
-    UnsupportedMime { input: String, mime: String },
+    #[error("multimodal image MIME type is not allowed for '{input}': {mime}{}", hint.as_ref().map(|h| format!(" ({h})")).unwrap_or_default())]
+    UnsupportedMime {
+        input: String,
+        mime: String,
+        hint: Option<String>,
+    },
 
     #[error("multimodal remote image fetch is disabled for '{input}'")]
     RemoteFetchDisabled { input: String },
@@ -706,6 +717,7 @@ async fn normalize_remote_image(
         MultimodalError::UnsupportedMime {
             input: source.to_string(),
             mime: "unknown".to_string(),
+            hint: None,
         }
     })?;
 
@@ -750,6 +762,7 @@ async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result
         detect_mime(Some(path), &bytes, None).ok_or_else(|| MultimodalError::UnsupportedMime {
             input: source.to_string(),
             mime: "unknown".to_string(),
+            hint: None,
         })?;
 
     validate_mime(source, &mime)?;
@@ -875,6 +888,7 @@ fn validate_document_mime(source: &str, mime: &str) -> anyhow::Result<()> {
     Err(MultimodalError::UnsupportedMime {
         input: source.to_string(),
         mime: mime.to_string(),
+        hint: None,
     }
     .into())
 }
@@ -915,6 +929,7 @@ fn detect_document_mime(
     Err(MultimodalError::UnsupportedMime {
         input: source.to_string(),
         mime: "unknown".to_string(),
+        hint: None,
     }
     .into())
 }
@@ -970,7 +985,8 @@ async fn finalize_document(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Re
         if CONVERTIBLE_OFFICE_MIME_TYPES.contains(&mime) {
             return Err(MultimodalError::UnsupportedMime {
                 input: source.to_string(),
-                mime: format!("{mime} (office-convert feature not enabled)"),
+                mime: mime.to_string(),
+                hint: Some("office-convert feature not enabled".to_string()),
             }
             .into());
         }
@@ -979,6 +995,7 @@ async fn finalize_document(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Re
     Err(MultimodalError::UnsupportedMime {
         input: source.to_string(),
         mime: mime.to_string(),
+        hint: None,
     }
     .into())
 }
@@ -1011,17 +1028,19 @@ fn validate_mime(source: &str, mime: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mime_msg = if mime == "image/heic" || mime == "image/heif" {
-        format!(
-            "{mime} (HEIC/HEIF not supported by AI provider — ask user to resend as JPEG or PNG)"
+    let hint = if mime == "image/heic" || mime == "image/heif" {
+        Some(
+            "HEIC/HEIF not supported by AI provider — ask user to resend as JPEG or PNG"
+                .to_string(),
         )
     } else {
-        mime.to_string()
+        None
     };
 
     Err(MultimodalError::UnsupportedMime {
         input: source.to_string(),
-        mime: mime_msg,
+        mime: mime.to_string(),
+        hint,
     }
     .into())
 }
