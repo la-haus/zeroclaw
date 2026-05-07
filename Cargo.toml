@@ -67,7 +67,7 @@ path = "src/lib.rs"
 zeroclaw-api.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config.workspace = true
-zeroclaw-providers = { workspace = true, features = ["office-convert"] }
+zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-channels = { workspace = true, optional = true }
 zeroclaw-tools = { workspace = true, optional = true }
@@ -236,6 +236,10 @@ default = [
     "observability-prometheus",
     "schema-export",
 ]
+
+# Office document conversion (DOCX/XLSX/PPTX → PDF via office2pdf).
+# Adds ~10MB to binary. Omit for lightweight agents that don't need file processing.
+office-convert = ["zeroclaw-providers/office-convert"]
 
 # Minimal agent runtime — agent loop, tools, gateway. No channels, no TUI.
 # Use this for API-only agents (e.g. CX agents) that only need WebSocket/REST.
