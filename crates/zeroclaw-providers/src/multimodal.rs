@@ -25,6 +25,7 @@ const ALLOWED_DOCUMENT_MIME_TYPES: &[&str] = &["application/pdf"];
 const TEXT_DOCUMENT_MIME_TYPES: &[&str] = &["text/plain", "text/csv"];
 
 /// MIME types that can be converted to PDF via office2pdf before sending.
+#[cfg(feature = "office-convert")]
 const CONVERTIBLE_OFFICE_MIME_TYPES: &[(&str, office2pdf::config::Format)] = &[
     (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -38,6 +39,14 @@ const CONVERTIBLE_OFFICE_MIME_TYPES: &[(&str, office2pdf::config::Format)] = &[
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         office2pdf::config::Format::Pptx,
     ),
+];
+
+/// Office MIME types (used for detection even when conversion is disabled).
+#[cfg(not(feature = "office-convert"))]
+const CONVERTIBLE_OFFICE_MIME_TYPES: &[&str] = &[
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 ];
 
 /// Maximum document size in bytes (32 MB — Anthropic PDF limit).
@@ -770,32 +779,46 @@ async fn finalize_document(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Re
         return Ok(format!("[INLINE_TEXT:{text}]"));
     }
 
-    // Office formats → convert to PDF on a blocking thread to avoid stalling
-    // the Tokio runtime (office2pdf is CPU-bound and can take hundreds of ms).
-    if let Some(&(_, format)) = CONVERTIBLE_OFFICE_MIME_TYPES
-        .iter()
-        .find(|&&(m, _)| m == mime)
+    // Office formats → convert to PDF (when the feature is enabled) or reject
+    // gracefully (when compiled without office-convert).
+    #[cfg(feature = "office-convert")]
     {
-        let bytes_owned = bytes.to_vec();
-        let source_owned = source.to_string();
-        let result = tokio::task::spawn_blocking(move || {
-            office2pdf::convert_bytes(
-                &bytes_owned,
-                format,
-                &office2pdf::config::ConvertOptions::default(),
-            )
-            .map_err(|e| MultimodalError::RemoteFetchFailed {
-                input: source_owned,
-                reason: format!("office2pdf conversion failed: {e}"),
+        if let Some(&(_, format)) = CONVERTIBLE_OFFICE_MIME_TYPES
+            .iter()
+            .find(|&&(m, _)| m == mime)
+        {
+            let bytes_owned = bytes.to_vec();
+            let source_owned = source.to_string();
+            let result = tokio::task::spawn_blocking(move || {
+                office2pdf::convert_bytes(
+                    &bytes_owned,
+                    format,
+                    &office2pdf::config::ConvertOptions::default(),
+                )
+                .map_err(|e| MultimodalError::RemoteFetchFailed {
+                    input: source_owned,
+                    reason: format!("office2pdf conversion failed: {e}"),
+                })
             })
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
 
-        return Ok(format!(
-            "data:application/pdf;base64,{}",
-            STANDARD.encode(&result.pdf)
-        ));
+            return Ok(format!(
+                "data:application/pdf;base64,{}",
+                STANDARD.encode(&result.pdf)
+            ));
+        }
+    }
+
+    #[cfg(not(feature = "office-convert"))]
+    {
+        if CONVERTIBLE_OFFICE_MIME_TYPES.contains(&mime) {
+            return Err(MultimodalError::UnsupportedMime {
+                input: source.to_string(),
+                mime: format!("{mime} (office-convert feature not enabled)"),
+            }
+            .into());
+        }
     }
 
     Err(MultimodalError::UnsupportedMime {
