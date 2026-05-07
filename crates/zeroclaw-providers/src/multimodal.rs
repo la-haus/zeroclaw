@@ -19,7 +19,10 @@ const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &[
     "image/gif",
     "image/bmp",
 ];
-const ALLOWED_DOCUMENT_MIME_TYPES: &[&str] = &["application/pdf", "text/plain"];
+const ALLOWED_DOCUMENT_MIME_TYPES: &[&str] = &["application/pdf"];
+
+/// MIME types that should be inlined as text in the message (not as document blocks).
+const TEXT_DOCUMENT_MIME_TYPES: &[&str] = &["text/plain", "text/csv"];
 
 /// MIME types that can be converted to PDF via office2pdf before sending.
 const CONVERTIBLE_OFFICE_MIME_TYPES: &[(&str, office2pdf::config::Format)] = &[
@@ -406,13 +409,22 @@ fn compose_multimodal_message_full(
         content.push('\n');
     }
 
+    const INLINE_TEXT_PREFIX: &str = "[INLINE_TEXT:";
     for (index, data_uri) in document_uris.iter().enumerate() {
         if index > 0 {
             content.push('\n');
         }
-        content.push_str(DOCUMENT_MARKER_PREFIX);
-        content.push_str(data_uri);
-        content.push(']');
+        if data_uri.starts_with(INLINE_TEXT_PREFIX) && data_uri.ends_with(']') {
+            // Text-based document (CSV, plain text) — inline as text, not document block
+            let text_content = &data_uri[INLINE_TEXT_PREFIX.len()..data_uri.len() - 1];
+            content.push_str("File content:\n```\n");
+            content.push_str(text_content);
+            content.push_str("\n```");
+        } else {
+            content.push_str(DOCUMENT_MARKER_PREFIX);
+            content.push_str(data_uri);
+            content.push(']');
+        }
     }
 
     content
@@ -746,14 +758,16 @@ fn detect_document_mime(
 /// Finalize document bytes into a data URI. Converts Office formats (DOCX/XLSX/PPTX)
 /// to PDF via office2pdf (on a blocking thread). CSV is treated as text/plain.
 async fn finalize_document(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Result<String> {
-    // Direct pass-through for natively supported types
+    // Direct pass-through for natively supported document types (PDF)
     if ALLOWED_DOCUMENT_MIME_TYPES.contains(&mime) {
         return Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)));
     }
 
-    // CSV → text/plain
-    if mime == "text/csv" {
-        return Ok(format!("data:text/plain;base64,{}", STANDARD.encode(bytes)));
+    // Text-based files (CSV, plain text) → inline as text, not document block.
+    // Anthropic only accepts application/pdf for document blocks via base64.
+    if TEXT_DOCUMENT_MIME_TYPES.contains(&mime) || mime == "text/csv" {
+        let text = String::from_utf8_lossy(bytes);
+        return Ok(format!("[INLINE_TEXT:{text}]"));
     }
 
     // Office formats → convert to PDF on a blocking thread to avoid stalling
@@ -1297,12 +1311,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_document_converts_csv_to_text_plain() {
+    async fn finalize_document_converts_csv_to_inline_text() {
         let csv = b"name,email\nJohn,john@test.com\n";
         let result = finalize_document("test.csv", "text/csv", csv)
             .await
             .unwrap();
-        assert!(result.starts_with("data:text/plain;base64,"));
+        assert!(result.starts_with("[INLINE_TEXT:"));
+        assert!(result.contains("name,email"));
     }
 
     #[tokio::test]
