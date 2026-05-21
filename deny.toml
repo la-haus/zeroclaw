@@ -26,6 +26,8 @@ ignore = [
     { id = "RUSTSEC-2026-0049", reason = "rustls-webpki CRL matching bug; transitive duplicate copy remains after #5786 bump; awaiting dep tree cleanup" },
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki URI name constraints; transitive duplicate copy remains after #5786 bump; awaiting dep tree cleanup" },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki wildcard name constraints; transitive duplicate copy remains after #5786 bump; awaiting dep tree cleanup" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL parse panic; we don't parse CRLs and the dep is the same transitive duplicate as the other RUSTSEC-2026-* entries above" },
+    { id = "RUSTSEC-2026-0141", reason = "lettre boring-tls hostname verification bypass; we build lettre with `rustls-tls` feature, not boring-tls — not exploitable in our config" },
 ]
 
 [licenses]
