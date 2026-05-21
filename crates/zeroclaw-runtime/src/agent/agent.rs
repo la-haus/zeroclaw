@@ -2789,8 +2789,10 @@ mod tests {
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
 
-        let mut multimodal_cfg = zeroclaw_config::schema::MultimodalConfig::default();
-        multimodal_cfg.allow_remote_fetch = true;
+        let multimodal_cfg = zeroclaw_config::schema::MultimodalConfig {
+            allow_remote_fetch: true,
+            ..Default::default()
+        };
 
         let mut agent = Agent::builder()
             .provider(provider)
@@ -2881,10 +2883,12 @@ mod tests {
             responses: Mutex::new(responses),
         });
 
-        let mut agent_config = zeroclaw_config::schema::AgentConfig::default();
-        agent_config.output_schema_auto = true;
-        agent_config.keep_tool_context_turns = 2;
-        agent_config.max_tool_iterations = 25;
+        let agent_config = zeroclaw_config::schema::AgentConfig {
+            output_schema_auto: true,
+            keep_tool_context_turns: 2,
+            max_tool_iterations: 25,
+            ..Default::default()
+        };
 
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
@@ -2949,10 +2953,12 @@ mod tests {
             ]),
         });
 
-        let mut agent_config = zeroclaw_config::schema::AgentConfig::default();
-        agent_config.output_schema_auto = true;
-        agent_config.keep_tool_context_turns = 5;
-        agent_config.max_tool_iterations = 25;
+        let agent_config = zeroclaw_config::schema::AgentConfig {
+            output_schema_auto: true,
+            keep_tool_context_turns: 5,
+            max_tool_iterations: 25,
+            ..Default::default()
+        };
 
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
