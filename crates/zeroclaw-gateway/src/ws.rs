@@ -332,7 +332,8 @@ async fn handle_socket(
                         .await;
                 }
             } else if parsed["type"].as_str() == Some("notification") {
-                handle_notification_frame(&state, &mut sender, &session_key, &parsed).await;
+                handle_notification_frame(&state, &mut agent, &mut sender, &session_key, &parsed)
+                    .await;
             } else {
                 let unknown_type = parsed["type"].as_str().unwrap_or("unknown");
                 let err = serde_json::json!({
@@ -383,7 +384,27 @@ async fn handle_socket(
 
                 let msg_type = parsed["type"].as_str().unwrap_or("");
                 if msg_type == "notification" {
-                    handle_notification_frame(&state, &mut sender, &session_key, &parsed).await;
+                    // Serialize with concurrent message turns on the same session.
+                    let _session_guard = match state.session_queue.acquire(&session_key).await {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            let err = serde_json::json!({
+                                "type": "error",
+                                "message": e.to_string(),
+                                "code": "SESSION_BUSY"
+                            });
+                            let _ = sender.send(Message::Text(err.to_string().into())).await;
+                            continue;
+                        }
+                    };
+                    handle_notification_frame(
+                        &state,
+                        &mut agent,
+                        &mut sender,
+                        &session_key,
+                        &parsed,
+                    )
+                    .await;
                     continue;
                 }
                 if msg_type != "message" {
@@ -454,16 +475,19 @@ async fn handle_socket(
 /// emitted now (and do not want it auto-saved as a memory).
 ///
 /// The message is appended verbatim as a user-role chat message so it shows
-/// up in `seed_history()` on the next connection / turn. The agent's normal
-/// `auto_save` path is bypassed entirely (we don't call `turn_streamed`),
+/// up both in the live agent history (seeded via [`Agent::seed_history`] so
+/// subsequent turns on this same connection have the context) and in the
+/// persisted session_backend (so it survives reconnect). The agent's normal
+/// `auto_save` path is bypassed entirely — `turn_streamed` is never called,
 /// so brain.db stays clean.
 async fn handle_notification_frame(
     state: &AppState,
+    agent: &mut zeroclaw_runtime::agent::Agent,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     session_key: &str,
     parsed: &serde_json::Value,
 ) {
-    let content = parsed["content"].as_str().unwrap_or("").to_string();
+    let mut content = parsed["content"].as_str().unwrap_or("").to_string();
     if content.is_empty() {
         let err = serde_json::json!({
             "type": "error",
@@ -474,12 +498,20 @@ async fn handle_notification_frame(
         return;
     }
 
+    // Process structured attachments the same way real user messages do, so
+    // an image/document carried by a notification ends up referenced inline.
+    append_attachment_markers(&mut content, parsed);
+    let msg = zeroclaw_providers::ChatMessage::user(&content);
+
+    // Update the live agent history so any subsequent user turn on this same
+    // connection has the notification as context. seed_history() takes a slice.
+    agent.seed_history(std::slice::from_ref(&msg));
+
     let mut persisted = false;
-    if let Some(ref backend) = state.session_backend {
-        let msg = zeroclaw_providers::ChatMessage::user(&content);
-        if backend.append(session_key, &msg).is_ok() {
-            persisted = true;
-        }
+    if let Some(ref backend) = state.session_backend
+        && backend.append(session_key, &msg).is_ok()
+    {
+        persisted = true;
     }
 
     let ack = serde_json::json!({
