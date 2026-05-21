@@ -332,8 +332,26 @@ async fn handle_socket(
                         .await;
                 }
             } else if parsed["type"].as_str() == Some("notification") {
-                handle_notification_frame(&state, &mut agent, &mut sender, &session_key, &parsed)
-                    .await;
+                match state.session_queue.acquire(&session_key).await {
+                    Ok(_session_guard) => {
+                        handle_notification_frame(
+                            &state,
+                            &mut agent,
+                            &mut sender,
+                            &session_key,
+                            &parsed,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": e.to_string(),
+                            "code": "SESSION_BUSY"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    }
+                }
             } else {
                 let unknown_type = parsed["type"].as_str().unwrap_or("unknown");
                 let err = serde_json::json!({
