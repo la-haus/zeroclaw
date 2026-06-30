@@ -1528,7 +1528,7 @@ async fn process_chat_message(
 ///
 /// Supported types:
 /// - `"image"` → ` [IMAGE:url]` (resolved by the multimodal pipeline)
-/// - `"document"` → a text reference (reserved for native PDF support)
+/// - `"document"` → ` [DOCUMENT:url]` (PDF/Office/CSV resolved by the pipeline)
 ///
 /// Entries without a `url` and unknown types are silently skipped.
 fn append_attachment_markers(content: &mut String, parsed: &serde_json::Value) {
@@ -1546,9 +1546,10 @@ fn append_attachment_markers(content: &mut String, parsed: &serde_json::Value) {
                 content.push_str(&format!(" [IMAGE:{url}]"));
             }
             "document" => {
-                // Reserved for native PDF support; passed through as a text
-                // reference until the provider exposes a document content type.
-                content.push_str(&format!("\n[El usuario envió un documento: {url}]"));
+                // Resolved by the multimodal pipeline: downloaded, Office→PDF
+                // converted, and sent as a native Anthropic `document` block
+                // (or inlined for CSV/plain text).
+                content.push_str(&format!(" [DOCUMENT:{url}]"));
             }
             _ => {
                 ::zeroclaw_log::record!(
@@ -2092,7 +2093,10 @@ mod tests {
         });
         let mut content = "Review this".to_string();
         append_attachment_markers(&mut content, &parsed);
-        assert!(content.contains("[El usuario envió un documento:"));
+        assert_eq!(
+            content,
+            "Review this [DOCUMENT:https://cdn.example.com/contract.pdf]"
+        );
     }
 
     #[test]
@@ -2107,7 +2111,7 @@ mod tests {
         let mut content = "Check these".to_string();
         append_attachment_markers(&mut content, &parsed);
         assert!(content.contains("[IMAGE:https://cdn.example.com/photo.jpg]"));
-        assert!(content.contains("documento"));
+        assert!(content.contains("[DOCUMENT:https://cdn.example.com/doc.pdf]"));
         // audio is skipped
         assert!(!content.contains("song.mp3"));
     }

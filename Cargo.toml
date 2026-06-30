@@ -286,6 +286,10 @@ default = [
     "schema-export",
 ]
 
+# Office document conversion (DOCX/XLSX/PPTX → PDF via office2pdf).
+# Adds ~10MB to binary. Omit for lightweight agents that don't need file processing.
+office-convert = ["zeroclaw-providers/office-convert"]
+
 # The core agent runtime — agent loop, tools, persistence subsystems.
 # Without this, you get the kernel: config + providers + memory + CLI chat.
 # Channels are opt-in via the lean `default-channels` bundle, `channels-full`,

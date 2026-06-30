@@ -9163,7 +9163,11 @@ pub fn build_runtime_proxy_client_with_timeouts(
 
     let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
-        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        // Some servers (e.g. Wikipedia, CDNs) return 403 when no User-Agent is
+        // sent. Set a default UA on the shared client used by the multimodal
+        // pipeline for remote image/document downloads.
+        .user_agent("ZeroClaw/0.7");
     let builder = apply_runtime_proxy_to_builder(builder, service_key);
     let client = builder.build().unwrap_or_else(|error| {
         ::zeroclaw_log::record!(
