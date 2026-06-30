@@ -28,6 +28,8 @@ pub enum ObserverEvent {
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
+        /// Optional user identifier (phone, user ID, job name) for tracing/logging.
+        user_id: Option<String>,
     },
     /// A request is about to be sent to an LLM model_provider.
     ///

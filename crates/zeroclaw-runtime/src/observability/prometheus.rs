@@ -300,6 +300,7 @@ impl Observer for PrometheusObserver {
                 channel: _,
                 agent_alias: _,
                 turn_id: _,
+                user_id: _,
             } => {
                 self.agent_starts
                     .with_label_values(&[model_provider, model])
@@ -487,6 +488,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            user_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -563,6 +565,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            user_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),

@@ -9,6 +9,7 @@
 //! Server -> Client: {"type":"chunk","content":"Hi! "}
 //! Server -> Client: {"type":"tool_call","name":"shell","args":{...}}
 //! Server -> Client: {"type":"tool_result","name":"shell","output":"..."}
+//! Server -> Client: {"type":"llm_call","model":"...","input_tokens":N,"output_tokens":N,"duration_ms":N,"input_preview":"...","output_preview":"..."}
 //! Server -> Client: {"type":"done","full_response":"..."}
 //! ```
 //!
@@ -113,6 +114,8 @@ pub struct WsQuery {
     pub session_id: Option<String>,
     /// Optional human-readable name for the session.
     pub name: Option<String>,
+    /// Optional user identifier (phone, user ID, job name, etc.) for tracing/logging.
+    pub user_id: Option<String>,
     /// Configured agent alias to run as. Required — every WebSocket
     /// session is bound to an explicit agent (no default agent exists).
     #[serde(default, alias = "agentAlias", alias = "agent")]
@@ -224,6 +227,7 @@ pub async fn handle_ws_chat(
     let session_id = params.session_id;
     let session_name = params.name;
     let session_cwd = params.cwd.or(params.workspace_dir);
+    let session_user_id = params.user_id;
     ws.on_upgrade(move |socket| {
         handle_socket(
             socket,
@@ -232,6 +236,7 @@ pub async fn handle_ws_chat(
             session_id,
             session_name,
             session_cwd,
+            session_user_id,
         )
     })
     .into_response()
@@ -268,6 +273,7 @@ async fn handle_socket(
     session_id: Option<String>,
     session_name: Option<String>,
     session_cwd: Option<String>,
+    user_id: Option<String>,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -333,6 +339,9 @@ async fn handle_socket(
     });
     if let Some(ref name) = effective_name {
         session_start["name"] = serde_json::Value::String(name.clone());
+    }
+    if let Some(ref uid) = user_id {
+        session_start["user_id"] = serde_json::Value::String(uid.clone());
     }
     let _ = sender
         .send(Message::Text(session_start.to_string().into()))
@@ -454,6 +463,15 @@ async fn handle_socket(
         };
     agent.set_channel_name("wss".to_string());
     agent.set_memory_session_id(Some(memory_session_id));
+    agent.user_id = user_id.clone();
+    if let Some(ref uid) = user_id {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"user_id": uid, "session_id": &session_id})),
+            "User ID attached to WebSocket session"
+        );
+    }
     if !stored_messages.is_empty() {
         agent.seed_history(&stored_messages);
     }
@@ -506,7 +524,9 @@ async fn handle_socket(
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
+                let mut content = parsed["content"].as_str().unwrap_or("").to_string();
+                // Append structured attachments as inline markers for multimodal.
+                append_attachment_markers(&mut content, &parsed);
                 if !content.is_empty() {
                     // Per-message `output_schema` forces structured JSON output
                     // for this turn (single-message sessions).
@@ -642,7 +662,9 @@ async fn handle_socket(
                     continue;
                 }
 
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
+                let mut content = parsed["content"].as_str().unwrap_or("").to_string();
+                // Append structured attachments as inline markers for multimodal.
+                append_attachment_markers(&mut content, &parsed);
                 if content.is_empty() {
                     let err = serde_json::json!({
                         "type": "error",
@@ -1191,6 +1213,22 @@ async fn process_chat_message(
                             "kept_turns": kept_turns,
                             "reason": reason,
                         }),
+                        TurnEvent::LlmCall {
+                            model,
+                            input_tokens,
+                            output_tokens,
+                            duration_ms,
+                            input_preview,
+                            output_preview,
+                        } => serde_json::json!({
+                            "type": "llm_call",
+                            "model": model,
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "duration_ms": duration_ms,
+                            "input_preview": input_preview,
+                            "output_preview": output_preview,
+                        }),
                     };
                     let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
                 }
@@ -1481,6 +1519,45 @@ async fn process_chat_message(
                     })),
                 "gateway_ws_turn"
             );
+        }
+    }
+}
+
+/// Convert a structured `attachments` array in a WS message to inline markers
+/// appended to `content` for the multimodal pipeline.
+///
+/// Supported types:
+/// - `"image"` → ` [IMAGE:url]` (resolved by the multimodal pipeline)
+/// - `"document"` → a text reference (reserved for native PDF support)
+///
+/// Entries without a `url` and unknown types are silently skipped.
+fn append_attachment_markers(content: &mut String, parsed: &serde_json::Value) {
+    let Some(attachments) = parsed.get("attachments").and_then(|v| v.as_array()) else {
+        return;
+    };
+    for att in attachments {
+        let url = att.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        let att_type = att.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if url.is_empty() {
+            continue;
+        }
+        match att_type {
+            "image" => {
+                content.push_str(&format!(" [IMAGE:{url}]"));
+            }
+            "document" => {
+                // Reserved for native PDF support; passed through as a text
+                // reference until the provider exposes a document content type.
+                content.push_str(&format!("\n[El usuario envió un documento: {url}]"));
+            }
+            _ => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"url": url, "att_type": att_type})),
+                    "Skipping unsupported attachment type"
+                );
+            }
         }
     }
 }
@@ -1992,5 +2069,64 @@ mod tests {
             "persist_conversation_messages must not resurrect a session whose \
              session_exists() returned false (see #7126)"
         );
+    }
+
+    #[test]
+    fn append_attachment_markers_image() {
+        let parsed = serde_json::json!({
+            "attachments": [
+                {"url": "https://cdn.example.com/photo.jpg", "type": "image"}
+            ]
+        });
+        let mut content = "Hello".to_string();
+        append_attachment_markers(&mut content, &parsed);
+        assert_eq!(content, "Hello [IMAGE:https://cdn.example.com/photo.jpg]");
+    }
+
+    #[test]
+    fn append_attachment_markers_document() {
+        let parsed = serde_json::json!({
+            "attachments": [
+                {"url": "https://cdn.example.com/contract.pdf", "type": "document"}
+            ]
+        });
+        let mut content = "Review this".to_string();
+        append_attachment_markers(&mut content, &parsed);
+        assert!(content.contains("[El usuario envió un documento:"));
+    }
+
+    #[test]
+    fn append_attachment_markers_mixed() {
+        let parsed = serde_json::json!({
+            "attachments": [
+                {"url": "https://cdn.example.com/photo.jpg", "type": "image"},
+                {"url": "https://cdn.example.com/doc.pdf", "type": "document"},
+                {"url": "https://cdn.example.com/song.mp3", "type": "audio"}
+            ]
+        });
+        let mut content = "Check these".to_string();
+        append_attachment_markers(&mut content, &parsed);
+        assert!(content.contains("[IMAGE:https://cdn.example.com/photo.jpg]"));
+        assert!(content.contains("documento"));
+        // audio is skipped
+        assert!(!content.contains("song.mp3"));
+    }
+
+    #[test]
+    fn append_attachment_markers_no_attachments() {
+        let parsed = serde_json::json!({"content": "hello"});
+        let mut content = "hello".to_string();
+        append_attachment_markers(&mut content, &parsed);
+        assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn append_attachment_markers_empty_url_skipped() {
+        let parsed = serde_json::json!({
+            "attachments": [{"url": "", "type": "image"}]
+        });
+        let mut content = "test".to_string();
+        append_attachment_markers(&mut content, &parsed);
+        assert_eq!(content, "test");
     }
 }

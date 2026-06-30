@@ -65,4 +65,19 @@ pub enum TurnEvent {
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
     },
+    /// Summary of a completed LLM call surfaced to streaming clients for
+    /// real-time cost/latency observability (model, tokens, duration, and
+    /// truncated input/output previews). Emitted once per provider call,
+    /// alongside [`TurnEvent::Usage`]. Distinct from `Usage`, which carries
+    /// only the accumulating token/cost totals: `LlmCall` adds the model
+    /// label, wall-clock duration, and previews that the gateway WebSocket
+    /// relays to the CX frontend without depending on OTEL traces.
+    LlmCall {
+        model: String,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        duration_ms: u64,
+        input_preview: String,
+        output_preview: String,
+    },
 }

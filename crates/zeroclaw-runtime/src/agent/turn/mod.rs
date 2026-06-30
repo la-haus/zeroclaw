@@ -593,6 +593,13 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             response_streamed_live,
         ) = match chat_result {
             Ok(resp) => {
+                // Trailing user turn = input preview for the per-call LlmCall
+                // observability event (mirrors the P1 ingress text selection).
+                let turn_input_preview = history
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "user")
+                    .map_or("", |m| m.content.as_str());
                 let interpreted = interpret_chat_response(
                     &ctx,
                     resp,
@@ -601,6 +608,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     llm_started_at,
                     iteration,
                     knobs.detect_protocol_without_tools,
+                    turn_input_preview,
                 )
                 .await;
                 (

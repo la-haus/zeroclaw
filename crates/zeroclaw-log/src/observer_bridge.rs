@@ -110,6 +110,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             channel: channel_opt,
             agent_alias: agent_alias_opt,
             turn_id: turn_id_opt,
+            user_id: None,
         }),
         "agent_end" => Some(ObserverEvent::AgentEnd {
             model_provider,

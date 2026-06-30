@@ -115,6 +115,7 @@ pub(crate) async fn interpret_chat_response(
     llm_started_at: Instant,
     iteration: usize,
     detect_protocol_without_tools: bool,
+    input_preview: &str,
 ) -> InterpretedResponse {
     let (resp_input_tokens, resp_output_tokens) = resp
         .usage
@@ -148,15 +149,31 @@ pub(crate) async fn interpret_chat_response(
 
     // Per-LLM-call usage event, right after the observer success event
     // (upstream E2 parity, agent.rs Usage emission).
-    if let Some(tx) = ctx.event_tx
-        && let Some(ref usage) = resp.usage
-    {
+    if let Some(tx) = ctx.event_tx {
+        if let Some(ref usage) = resp.usage {
+            let _ = tx
+                .send(TurnEvent::Usage {
+                    input_tokens: usage.input_tokens,
+                    cached_input_tokens: usage.cached_input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cost_usd: call_cost_usd,
+                })
+                .await;
+        }
+        // Per-call observability for streaming clients (gateway WS / CX
+        // frontend): model + duration + tokens + truncated previews. Emitted
+        // even when the provider omits token usage so latency/model are always
+        // surfaced. `Usage` carries only the accumulating token totals; this
+        // adds the per-call detail the frontend renders without OTEL access.
         let _ = tx
-            .send(TurnEvent::Usage {
-                input_tokens: usage.input_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                output_tokens: usage.output_tokens,
-                cost_usd: call_cost_usd,
+            .send(TurnEvent::LlmCall {
+                model: ctx.model.to_string(),
+                input_tokens: resp_input_tokens,
+                output_tokens: resp_output_tokens,
+                duration_ms: u64::try_from(llm_started_at.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+                input_preview: crate::util::truncate_with_ellipsis(input_preview, 500),
+                output_preview: crate::util::truncate_with_ellipsis(resp.text_or_empty(), 500),
             })
             .await;
     }
@@ -442,7 +459,7 @@ mod cost_usd_regression_tests {
         let now = std::time::Instant::now();
         crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(cost_ctx), async {
-                interpret_chat_response(&ctx, resp, &specs, false, now, 0, false).await;
+                interpret_chat_response(&ctx, resp, &specs, false, now, 0, false, "hello").await;
             })
             .await;
 

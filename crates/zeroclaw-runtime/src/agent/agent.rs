@@ -169,6 +169,8 @@ pub struct Agent {
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     auto_save: bool,
     memory_session_id: Option<String>,
+    /// Optional user identifier for tracing/logging (phone, user ID, job name).
+    pub user_id: Option<String>,
     history: Vec<ConversationMessage>,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
     available_hints: Vec<String>,
@@ -688,6 +690,7 @@ impl AgentBuilder {
                 self.auto_save.unwrap_or(false)
             },
             memory_session_id: self.memory_session_id,
+            user_id: None,
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
@@ -2180,6 +2183,7 @@ impl Agent {
             channel: Some(self.channel_name.clone()),
             agent_alias: self.observer_agent_alias(),
             turn_id: Some(turn_id.clone()),
+            user_id: self.user_id.clone(),
         });
 
         let mut guard = TurnGuard {
@@ -2549,6 +2553,7 @@ impl Agent {
             channel: Some(self.channel_name.clone()),
             agent_alias: self.observer_agent_alias(),
             turn_id: Some(turn_id.clone()),
+            user_id: self.user_id.clone(),
         });
 
         let mut guard = TurnGuard {

@@ -3881,6 +3881,10 @@ fn notification_for_turn_event(
                 max_context_tokens,
             }
         }
+        // The local RPC/TUI surface has no per-call observability shape (it
+        // renders ContextUsage instead); skip emitting an update. The gateway
+        // WebSocket and ACP paths relay `LlmCall` for the CX frontend.
+        TurnEvent::LlmCall { .. } => return None,
     };
 
     let params = serde_json::to_value(update).ok()?;

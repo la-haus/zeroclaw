@@ -2057,6 +2057,33 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                 }
             }),
         },
+        // Per-call observability event. Surfaced to ACP clients as a custom
+        // `session/update` kind (same extension pattern as `history_trimmed`)
+        // so cost/latency telemetry reaches IDE/TUI sessions, not only the
+        // gateway WebSocket.
+        TurnEvent::LlmCall {
+            model,
+            input_tokens,
+            output_tokens,
+            duration_ms,
+            input_preview,
+            output_preview,
+        } => JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "llm_call",
+                    "model": model,
+                    "inputTokens": input_tokens,
+                    "outputTokens": output_tokens,
+                    "durationMs": duration_ms,
+                    "inputPreview": input_preview,
+                    "outputPreview": output_preview,
+                }
+            }),
+        },
         // Usage events are filtered out at every call site (ACP has no
         // `session/update` shape for them; the cost tracker records them
         // out-of-band). Reaching this arm means a caller forgot the filter.

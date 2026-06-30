@@ -40,6 +40,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            user_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "test".into(),

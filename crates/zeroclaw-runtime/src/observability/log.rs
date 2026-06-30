@@ -25,13 +25,17 @@ impl Observer for LogObserver {
                 channel: _,
                 agent_alias: _,
                 turn_id: _,
+                user_id,
             } => {
+                let mut attrs =
+                    ::serde_json::json!({"model_provider": model_provider, "model": model});
+                if let Some(uid) = user_id {
+                    attrs["user_id"] = ::serde_json::json!(uid);
+                }
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(
-                            ::serde_json::json!({"model_provider": model_provider, "model": model})
-                        ),
+                        .with_attrs(attrs),
                     "agent.start"
                 );
             }
@@ -321,6 +325,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            user_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),

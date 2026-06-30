@@ -256,6 +256,7 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                user_id,
             } => {
                 self.agent_starts.add(
                     1,
@@ -265,19 +266,21 @@ impl Observer for OtelObserver {
                     ],
                 );
 
+                let mut span_attrs = vec![
+                    KeyValue::new("gen_ai.provider.name", model_provider.clone()),
+                    KeyValue::new("gen_ai.request.model", model.clone()),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
+                ];
+                if let Some(uid) = user_id {
+                    span_attrs.push(KeyValue::new("user_id", uid.clone()));
+                }
+
                 let span = tracer.build(
                     opentelemetry::trace::SpanBuilder::from_name("gen_ai.agent.invoke")
                         .with_kind(SpanKind::Internal)
-                        .with_attributes(vec![
-                            KeyValue::new("gen_ai.provider.name", model_provider.clone()),
-                            KeyValue::new("gen_ai.request.model", model.clone()),
-                            KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
-                            KeyValue::new(
-                                "gen_ai.agent.name",
-                                agent_alias.clone().unwrap_or_default(),
-                            ),
-                            KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
-                        ]),
+                        .with_attributes(span_attrs),
                 );
 
                 if let Some(tid) = turn_id {
@@ -803,6 +806,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            user_id: None,
         });
         obs.record_event(&ObserverEvent::LlmRequest {
             model_provider: "openrouter".into(),
@@ -1062,6 +1066,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            user_id: None,
         });
 
         assert!(
