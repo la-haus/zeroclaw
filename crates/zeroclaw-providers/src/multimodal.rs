@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
 use zeroclaw_api::model_provider::ChatMessage;
-use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
+use zeroclaw_config::schema::{MultimodalConfig, build_remote_fetch_client, validate_remote_host};
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 // MIME types we will inline for vision providers. Deliberately excludes
@@ -180,6 +180,9 @@ pub enum MultimodalError {
 
     #[error("multimodal remote image fetch is disabled for '{input}'")]
     RemoteFetchDisabled { input: String },
+
+    #[error("multimodal remote fetch blocked for '{input}': {reason}")]
+    RemoteFetchBlocked { input: String, reason: String },
 
     #[error("multimodal image source not found or unreadable: '{input}'")]
     ImageSourceNotFound { input: String },
@@ -753,7 +756,12 @@ async fn prepare_messages_inner(
     // The post-normalization cap keeps the most recent successful images and
     // prevents conversations from sticking once the cumulative count crosses
     // the threshold, so no pre-normalization trim is needed here.
-    let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
+    let remote_client = build_remote_fetch_client(
+        "model_provider.ollama",
+        30,
+        10,
+        &config.remote_fetch_allowed_hosts,
+    );
     let latest_tool_indices = latest_tool_result_indices(messages);
 
     let mut normalized_messages = Vec::with_capacity(messages.len());
@@ -901,7 +909,12 @@ async fn apply_document_processing(
     config: &MultimodalConfig,
     max_bytes: usize,
 ) -> (Vec<ChatMessage>, bool) {
-    let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
+    let remote_client = build_remote_fetch_client(
+        "model_provider.ollama",
+        30,
+        10,
+        &config.remote_fetch_allowed_hosts,
+    );
     let mut has_documents = false;
     let mut out = Vec::with_capacity(messages.len());
 
@@ -1327,6 +1340,7 @@ fn multimodal_error_kind(error: &anyhow::Error) -> &'static str {
         Some(MultimodalError::ImageTooLarge { .. }) => "image_too_large",
         Some(MultimodalError::UnsupportedMime { .. }) => "unsupported_mime",
         Some(MultimodalError::RemoteFetchDisabled { .. }) => "remote_fetch_disabled",
+        Some(MultimodalError::RemoteFetchBlocked { .. }) => "remote_fetch_blocked",
         Some(MultimodalError::ImageSourceNotFound { .. }) => "image_source_not_found",
         Some(MultimodalError::InvalidMarker { .. }) => "invalid_marker",
         Some(MultimodalError::RemoteFetchFailed { .. }) => "remote_fetch_failed",
@@ -1339,6 +1353,7 @@ fn multimodal_error_reason(error: &anyhow::Error) -> Option<String> {
     match error.downcast_ref::<MultimodalError>() {
         Some(MultimodalError::InvalidMarker { input, reason })
         | Some(MultimodalError::RemoteFetchFailed { input, reason })
+        | Some(MultimodalError::RemoteFetchBlocked { input, reason })
         | Some(MultimodalError::LocalReadFailed { input, reason }) => {
             Some(reason.replace(input, "<source>"))
         }
@@ -1365,7 +1380,13 @@ async fn normalize_image_reference(
             .into());
         }
 
-        return normalize_remote_image(source, max_bytes, remote_client).await;
+        return normalize_remote_image(
+            source,
+            max_bytes,
+            remote_client,
+            &config.remote_fetch_allowed_hosts,
+        )
+        .await;
     }
 
     match cache {
@@ -1416,11 +1437,37 @@ fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> 
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(decoded)))
 }
 
+/// SSRF pre-fetch guard for a remote multimodal URL.
+///
+/// Resolves the URL's host and rejects it before any request is sent when it
+/// maps to an internal/non-routable address (RFC1918, loopback, link-local incl.
+/// the IMDS endpoint, IPv6 ULA/link-local), unless the host is in `allowed_hosts`.
+/// Redirect hops are validated independently by the client's redirect policy.
+fn guard_remote_fetch_target(source: &str, allowed_hosts: &[String]) -> anyhow::Result<()> {
+    let host = reqwest::Url::parse(source)
+        .ok()
+        .and_then(|url| url.host_str().map(ToString::to_string))
+        .ok_or_else(|| MultimodalError::RemoteFetchBlocked {
+            input: source.to_string(),
+            reason: "could not parse host from remote URL".to_string(),
+        })?;
+    validate_remote_host(&host, allowed_hosts).map_err(|error| {
+        MultimodalError::RemoteFetchBlocked {
+            input: source.to_string(),
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(())
+}
+
 async fn normalize_remote_image(
     source: &str,
     max_bytes: usize,
     remote_client: &Client,
+    allowed_hosts: &[String],
 ) -> anyhow::Result<String> {
+    guard_remote_fetch_target(source, allowed_hosts)?;
+
     let response = remote_client.get(source).send().await.map_err(|error| {
         MultimodalError::RemoteFetchFailed {
             input: source.to_string(),
@@ -1625,6 +1672,8 @@ async fn normalize_remote_document(
             }
             .into());
         }
+
+        guard_remote_fetch_target(source, &config.remote_fetch_allowed_hosts)?;
 
         let response = remote_client.get(source).send().await.map_err(|error| {
             MultimodalError::RemoteFetchFailed {
@@ -1945,6 +1994,63 @@ fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod ssrf_fetch_tests {
+    use super::guard_remote_fetch_target;
+    use zeroclaw_config::schema::build_remote_fetch_client;
+
+    #[test]
+    fn guard_blocks_internal_and_imds_targets() {
+        // No allowlist: internal / IMDS literal hosts are rejected pre-fetch.
+        assert!(
+            guard_remote_fetch_target("http://169.254.169.254/latest/meta-data/", &[]).is_err()
+        );
+        assert!(guard_remote_fetch_target("http://10.0.0.5/secret", &[]).is_err());
+        assert!(guard_remote_fetch_target("http://127.0.0.1:8080/", &[]).is_err());
+    }
+
+    #[test]
+    fn guard_allows_public_and_allowlisted() {
+        // Public literal host passes (no DNS round-trip needed).
+        assert!(guard_remote_fetch_target("https://1.1.1.1/img.png", &[]).is_ok());
+        // Allowlisted internal host passes (operator opted in).
+        let allow = vec!["10.0.0.5".to_string()];
+        assert!(guard_remote_fetch_target("http://10.0.0.5/doc.pdf", &allow).is_ok());
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_blocks_hop_into_internal_space() {
+        use axum::response::Redirect;
+        use axum::routing::get;
+
+        // A public-looking server that 302s into the IMDS link-local range,
+        // mimicking an open redirect used for SSRF.
+        let app = axum::Router::new().route(
+            "/open-redirect",
+            get(|| async { Redirect::temporary("http://169.254.169.254/latest/meta-data/") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let _server = zeroclaw_spawn::spawn!(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = build_remote_fetch_client("test.ssrf", 5, 5, &[]);
+        let result = client
+            .get(format!("http://{addr}/open-redirect"))
+            .send()
+            .await;
+        // The 302 hop to 169.254.169.254 must be refused by the redirect policy,
+        // so the request errors instead of reaching the metadata endpoint.
+        assert!(
+            result.is_err(),
+            "redirect into internal space must be blocked, got {result:?}"
+        );
+    }
 }
 
 #[cfg(test)]

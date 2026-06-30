@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
@@ -5802,6 +5803,22 @@ pub struct MultimodalConfig {
     /// Allow fetching remote image URLs (http/https). Disabled by default.
     #[serde(default)]
     pub allow_remote_fetch: bool,
+    /// Hostnames that are exempt from the SSRF internal-address guard applied to
+    /// remote multimodal fetches.
+    ///
+    /// When `allow_remote_fetch` is enabled, every remote image/document URL is
+    /// resolved before the request is sent and rejected if any resolved IP falls
+    /// inside a private/loopback/link-local range (RFC1918, `127/8`, `169.254/16`
+    /// — which includes the cloud IMDS endpoint — `fc00::/7`, `fe80::/10`, …).
+    /// This protects against SSRF via user-pasted URLs. Hosts listed here bypass
+    /// that check, so an operator can explicitly allow a *trusted* internal
+    /// service (e.g. an in-cluster Chatwoot/active_storage host) to be fetched.
+    /// Each redirect hop is validated against the same rules and allowlist.
+    ///
+    /// Empty by default. Only add hosts you fully control — entries here punch a
+    /// hole in the SSRF protection.
+    #[serde(default)]
+    pub remote_fetch_allowed_hosts: Vec<String>,
     /// ModelProvider name to use for vision/image messages (e.g. `"ollama"`).
     /// When set, messages containing `[IMAGE:]` markers are routed to this
     /// model_provider instead of the default text model_provider.
@@ -5837,6 +5854,7 @@ impl Default for MultimodalConfig {
             max_image_size_mb: default_multimodal_max_image_size_mb(),
             max_image_turns: 0,
             allow_remote_fetch: false,
+            remote_fetch_allowed_hosts: Vec::new(),
             vision_model_provider: None,
             vision_model: None,
         }
@@ -9200,6 +9218,200 @@ pub fn build_runtime_proxy_client_with_timeouts(
                     ::serde_json::json!({"service_key": service_key, "error": format!("{}", error)})
                 ),
             "Failed to build proxied timeout client: "
+        );
+        reqwest::Client::new()
+    });
+    set_runtime_proxy_cached_client(cache_key, client.clone());
+    client
+}
+
+// ── SSRF guard for remote multimodal fetches ────────────────────
+//
+// Remote image/document URLs originate from user content (`inject_url_markers`
+// auto-wraps any pasted URL), so a server-side `GET` of them is a classic SSRF
+// vector: a user can aim the fetch at the cloud metadata service
+// (`169.254.169.254` → node credentials), an RFC1918 host, or an internal
+// service. We resolve the target host before fetching and reject any host that
+// maps to a non-routable / internal address, and we re-validate every redirect
+// hop with the same rules so a public URL can't 302 into internal space.
+
+/// Maximum number of redirects followed by the remote-fetch client. Each hop is
+/// SSRF-validated; this bounds redirect chains regardless of validation.
+const MAX_REMOTE_FETCH_REDIRECTS: usize = 5;
+
+/// Returns `true` when `ip` belongs to a non-routable / internal range that a
+/// server-side fetch of user-supplied URLs must never reach.
+///
+/// Covers IPv4 private (`10/8`, `172.16/12`, `192.168/16`), loopback (`127/8`),
+/// link-local (`169.254/16` — includes the IMDS endpoint `169.254.169.254`),
+/// broadcast and unspecified (`0.0.0.0`); and IPv6 loopback (`::1`),
+/// unspecified (`::`), link-local unicast (`fe80::/10`) and unique-local
+/// (`fc00::/7`).
+#[must_use]
+pub fn is_internal_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()        // 10/8, 172.16/12, 192.168/16
+                || v4.is_loopback()    // 127/8
+                || v4.is_link_local()  // 169.254/16 (incl. IMDS 169.254.169.254)
+                || v4.is_broadcast()   // 255.255.255.255
+                || v4.is_unspecified() // 0.0.0.0
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()           // ::1
+                || v6.is_unspecified() // ::
+                || is_ipv6_link_local(v6) // fe80::/10
+                || is_ipv6_unique_local(v6) // fc00::/7
+        }
+    }
+}
+
+/// IPv6 link-local unicast `fe80::/10` (first 10 bits `1111 1110 10`).
+/// `Ipv6Addr::is_unicast_link_local` is still unstable, so check manually.
+fn is_ipv6_link_local(addr: Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// IPv6 unique-local `fc00::/7` (first 7 bits `1111 110`).
+/// `Ipv6Addr::is_unique_local` is still unstable, so check manually.
+fn is_ipv6_unique_local(addr: Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xfe00) == 0xfc00
+}
+
+/// Case-insensitive membership test for the remote-fetch allowlist.
+fn host_in_allowlist(host: &str, allowed_hosts: &[String]) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    allowed_hosts
+        .iter()
+        .any(|allowed| allowed.trim().eq_ignore_ascii_case(host))
+}
+
+/// Error raised when a remote host fails the SSRF pre-fetch validation.
+#[derive(Debug, thiserror::Error)]
+pub enum RemoteHostError {
+    /// The host resolved to (or is) an internal/non-routable address.
+    #[error("remote host '{host}' resolves to internal address {ip}; blocked to prevent SSRF")]
+    InternalAddress { host: String, ip: IpAddr },
+    /// The host could not be resolved to any address.
+    #[error("failed to resolve remote host '{host}': {reason}")]
+    ResolutionFailed { host: String, reason: String },
+}
+
+/// Validate an already-resolved set of IPs for `host` against the SSRF rules.
+///
+/// Pure (no DNS / no I/O) so the classification logic is unit-testable with
+/// injected IPs. If `host` is in `allowed_hosts` the check is skipped (an
+/// operator has explicitly trusted it); otherwise any internal IP rejects.
+pub fn validate_resolved_ips(
+    host: &str,
+    ips: &[IpAddr],
+    allowed_hosts: &[String],
+) -> Result<(), RemoteHostError> {
+    if host_in_allowlist(host, allowed_hosts) {
+        return Ok(());
+    }
+    for ip in ips {
+        if is_internal_ip(*ip) {
+            return Err(RemoteHostError::InternalAddress {
+                host: host.to_string(),
+                ip: *ip,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Resolve `host` via DNS and reject it if any resolved address is internal.
+///
+/// Allowlisted hosts short-circuit to `Ok` without resolving. Uses blocking
+/// `ToSocketAddrs`; callers run it either before an async fetch (acceptable, the
+/// pipeline already awaits network I/O) or inside the synchronous redirect
+/// policy callback (where blocking DNS is the only option).
+pub fn validate_remote_host(host: &str, allowed_hosts: &[String]) -> Result<(), RemoteHostError> {
+    if host_in_allowlist(host, allowed_hosts) {
+        return Ok(());
+    }
+    let ips: Vec<IpAddr> = (host, 0u16)
+        .to_socket_addrs()
+        .map_err(|error| RemoteHostError::ResolutionFailed {
+            host: host.to_string(),
+            reason: error.to_string(),
+        })?
+        .map(|addr| addr.ip())
+        .collect();
+    if ips.is_empty() {
+        return Err(RemoteHostError::ResolutionFailed {
+            host: host.to_string(),
+            reason: "no addresses resolved".to_string(),
+        });
+    }
+    validate_resolved_ips(host, &ips, allowed_hosts)
+}
+
+/// Build a `reqwest::redirect::Policy` that SSRF-validates every redirect hop.
+///
+/// Each hop's host is resolved and checked against [`is_internal_ip`] /
+/// `allowed_hosts`: a public (or allowlisted) destination is followed, an
+/// internal one aborts the request. This deliberately keeps following *public*
+/// redirects so Chatwoot `active_storage` 302s (→ S3 and similar public storage)
+/// still resolve, while a 302 into internal space is cut.
+fn ssrf_redirect_policy(allowed_hosts: Vec<String>) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        let url = attempt.url().to_string();
+        if attempt.previous().len() >= MAX_REMOTE_FETCH_REDIRECTS {
+            return attempt.error(RemoteHostError::ResolutionFailed {
+                host: url,
+                reason: format!("exceeded {MAX_REMOTE_FETCH_REDIRECTS} redirects"),
+            });
+        }
+        match attempt.url().host_str().map(ToString::to_string) {
+            Some(host) => match validate_remote_host(&host, &allowed_hosts) {
+                Ok(()) => attempt.follow(),
+                Err(error) => attempt.error(error),
+            },
+            None => attempt.error(RemoteHostError::ResolutionFailed {
+                host: url,
+                reason: "redirect target has no host".to_string(),
+            }),
+        }
+    })
+}
+
+/// Build the HTTP client used for remote multimodal fetches, wired with the
+/// SSRF-validating redirect policy (each hop checked against `allowed_hosts`).
+///
+/// The initial URL is validated separately by the caller before `.send()`; this
+/// policy guards the redirect chain. Cached per (service, timeouts, allowlist).
+pub fn build_remote_fetch_client(
+    service_key: &str,
+    timeout_secs: u64,
+    connect_timeout_secs: u64,
+    allowed_hosts: &[String],
+) -> reqwest::Client {
+    let cache_key = format!(
+        "{}|remote_fetch|timeout={timeout_secs}|connect_timeout={connect_timeout_secs}|hosts={}",
+        service_key.trim().to_ascii_lowercase(),
+        allowed_hosts.join(",").to_ascii_lowercase()
+    );
+    if let Some(client) = runtime_proxy_cached_client(&cache_key) {
+        return client;
+    }
+
+    let builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .user_agent("ZeroClaw/0.7")
+        .redirect(ssrf_redirect_policy(allowed_hosts.to_vec()));
+    let builder = apply_runtime_proxy_to_builder(builder, service_key);
+    let client = builder.build().unwrap_or_else(|error| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(
+                    ::serde_json::json!({"service_key": service_key, "error": format!("{}", error)})
+                ),
+            "Failed to build remote-fetch client: "
         );
         reqwest::Client::new()
     });
@@ -19925,6 +20137,73 @@ impl HasPropKind for serde_json::Value {
     // objects still use `zeroclaw config set --json` or hand-edit the
     // `config.toml`.
     const PROP_KIND: PropKind = PropKind::String;
+}
+
+#[cfg(test)]
+mod ssrf_guard_tests {
+    use super::{is_internal_ip, validate_remote_host, validate_resolved_ips};
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("valid IP literal")
+    }
+
+    #[test]
+    fn is_internal_ip_flags_internal_ranges() {
+        for addr in [
+            "169.254.169.254", // IMDS link-local
+            "10.0.0.1",        // RFC1918
+            "172.16.0.1",      // RFC1918
+            "192.168.1.1",     // RFC1918
+            "127.0.0.1",       // loopback v4
+            "0.0.0.0",         // unspecified v4
+            "::1",             // loopback v6
+            "::",              // unspecified v6
+            "fe80::1",         // link-local v6
+            "fc00::1",         // unique-local v6
+        ] {
+            assert!(is_internal_ip(ip(addr)), "{addr} should be internal");
+        }
+    }
+
+    #[test]
+    fn is_internal_ip_allows_public_addresses() {
+        for addr in ["1.1.1.1", "8.8.8.8", "93.184.216.34", "2606:4700::1111"] {
+            assert!(!is_internal_ip(ip(addr)), "{addr} should be public");
+        }
+    }
+
+    #[test]
+    fn validate_resolved_ips_rejects_internal() {
+        let err = validate_resolved_ips("evil.example", &[ip("169.254.169.254")], &[]);
+        assert!(err.is_err(), "internal resolution must be rejected");
+    }
+
+    #[test]
+    fn validate_resolved_ips_allows_public() {
+        assert!(validate_resolved_ips("ok.example", &[ip("93.184.216.34")], &[]).is_ok());
+    }
+
+    #[test]
+    fn validate_resolved_ips_allowlist_overrides_internal() {
+        let allow = vec!["internal.chatwoot.svc".to_string()];
+        assert!(
+            validate_resolved_ips("internal.chatwoot.svc", &[ip("10.0.0.5")], &allow).is_ok(),
+            "allowlisted host must pass even when it resolves internally"
+        );
+    }
+
+    #[test]
+    fn validate_remote_host_literal_ips() {
+        // Literal IPs resolve without touching DNS, so these are deterministic.
+        assert!(validate_remote_host("169.254.169.254", &[]).is_err());
+        assert!(validate_remote_host("10.0.0.1", &[]).is_err());
+        assert!(validate_remote_host("1.1.1.1", &[]).is_ok());
+        // Allowlist bypasses the check even for an internal literal IP — this is
+        // also the per-hop decision used by the redirect policy.
+        let allow = vec!["10.0.0.1".to_string()];
+        assert!(validate_remote_host("10.0.0.1", &allow).is_ok());
+    }
 }
 
 #[cfg(test)]
