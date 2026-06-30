@@ -1618,7 +1618,16 @@ impl ModelProvider for AnthropicModelProvider {
                         )
                         .header("anthropic-dangerous-direct-browser-access", "true");
                 } else {
-                    req = req.header("x-api-key", &credential);
+                    // This branch only runs with native thinking active (the
+                    // `thinking_config.is_some()` fallback). Interleaved
+                    // thinking is auth-agnostic and GA-independent: API-key
+                    // auth (used by all CX agents) needs this beta header to
+                    // reason *between* tool calls, otherwise it only thinks
+                    // before the first tool call. The OAuth-only tokens
+                    // (`claude-code`, `oauth-*`) must NOT be sent on x-api-key.
+                    req = req
+                        .header("x-api-key", &credential)
+                        .header("anthropic-beta", "interleaved-thinking-2025-05-14");
                 }
                 let response = req
                     .send()
