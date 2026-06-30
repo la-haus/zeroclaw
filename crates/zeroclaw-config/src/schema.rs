@@ -9316,6 +9316,12 @@ pub fn is_internal_ip(ip: IpAddr) -> bool {
                 || v4.is_unspecified() // 0.0.0.0
         }
         IpAddr::V6(v6) => {
+            // Unwrap IPv4-mapped addresses (::ffff:a.b.c.d) and classify by the
+            // v4 rules, so `[::ffff:169.254.169.254]` (IMDS) and `[::ffff:10.x]`
+            // can't bypass the v4 internal-range checks (SSRF follow-up).
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_internal_ip(IpAddr::V4(v4));
+            }
             v6.is_loopback()           // ::1
                 || v6.is_unspecified() // ::
                 || is_ipv6_link_local(v6) // fe80::/10
@@ -20219,6 +20225,8 @@ mod ssrf_guard_tests {
             "::",              // unspecified v6
             "fe80::1",         // link-local v6
             "fc00::1",         // unique-local v6
+            "::ffff:169.254.169.254", // IPv4-mapped IMDS (must not bypass)
+            "::ffff:10.0.0.1",        // IPv4-mapped RFC1918 (must not bypass)
         ] {
             assert!(is_internal_ip(ip(addr)), "{addr} should be internal");
         }
