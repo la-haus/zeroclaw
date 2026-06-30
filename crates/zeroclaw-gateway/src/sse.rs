@@ -172,6 +172,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                prompt_content: _,
             } => {
                 let mut json = serde_json::json!({
                     "type": "llm_request",
@@ -242,6 +243,8 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 agent_alias,
                 turn_id,
                 user_id: _,
+                session_id,
+                message_id,
             } => {
                 let mut json = serde_json::json!({
                     "type": "agent_start",
@@ -253,6 +256,8 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 add_optional_string(&mut json, "channel", channel);
                 add_optional_string(&mut json, "agent_alias", agent_alias);
                 add_optional_string(&mut json, "turn_id", turn_id);
+                add_optional_string(&mut json, "session_id", session_id);
+                add_optional_string(&mut json, "message_id", message_id);
                 json
             }
             zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
@@ -526,6 +531,7 @@ mod tests {
                 channel: None,
                 agent_alias: None,
                 turn_id: None,
+                prompt_content: None,
             },
             ObserverEvent::ToolCall {
                 tool: "shell".into(),
@@ -557,6 +563,8 @@ mod tests {
                 agent_alias: None,
                 turn_id: None,
                 user_id: None,
+                session_id: None,
+                message_id: None,
             },
             ObserverEvent::AgentEnd {
                 model_provider: "p".into(),

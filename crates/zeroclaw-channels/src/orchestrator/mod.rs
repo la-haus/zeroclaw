@@ -4977,6 +4977,8 @@ async fn process_channel_message_body(
                             agent_alias: Some(ctx.agent_alias.to_string()),
                             turn_id: Some(turn_id.clone()),
                             user_id: None,
+                            session_id: None,
+                            message_id: None,
                         });
 
                         continue;

@@ -59,6 +59,20 @@ pub(crate) async fn announce_llm_request(
         let _ = tx.send(StreamDelta::Status(phase)).await;
     }
 
+    // Opt-in prompt content (ZEROCLAW_OTEL_TRACE_CONTENT, default off). When
+    // enabled, serialise the scrubbed message history so OTEL/LangSmith can
+    // render it in the Input tab; otherwise stay content-free.
+    let prompt_content = if crate::observability::trace_content_enabled() {
+        let rendered: Vec<::serde_json::Value> = history
+            .iter()
+            .map(|m| ::serde_json::json!({"role": m.role.as_str(), "content": m.content.as_str()}))
+            .collect();
+        let serialized = ::serde_json::to_string(&rendered).unwrap_or_default();
+        Some(scrub_credentials(&serialized))
+    } else {
+        None
+    };
+
     ctx.observer.record_event(&ObserverEvent::LlmRequest {
         model_provider: active_model_provider_name.to_string(),
         model: active_model.to_string(),
@@ -66,6 +80,7 @@ pub(crate) async fn announce_llm_request(
         channel: Some(ctx.channel_name.to_string()),
         agent_alias: ctx.agent_alias.map(|s| s.to_string()),
         turn_id: Some(ctx.turn_id.to_string()),
+        prompt_content,
     });
     {
         let _provider_guard = ::zeroclaw_log::attribution_span!(active_model_provider).entered();

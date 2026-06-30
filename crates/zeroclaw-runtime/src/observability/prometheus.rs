@@ -301,6 +301,8 @@ impl Observer for PrometheusObserver {
                 agent_alias: _,
                 turn_id: _,
                 user_id: _,
+                session_id: _,
+                message_id: _,
             } => {
                 self.agent_starts
                     .with_label_values(&[model_provider, model])
@@ -489,6 +491,8 @@ mod tests {
             agent_alias: None,
             turn_id: None,
             user_id: None,
+            session_id: None,
+            message_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -566,6 +570,8 @@ mod tests {
             agent_alias: None,
             turn_id: None,
             user_id: None,
+            session_id: None,
+            message_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
@@ -689,6 +695,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "openrouter".into(),
@@ -701,6 +708,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            response_content: None,
         });
 
         let output = obs.encode();
@@ -730,6 +738,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            response_content: None,
         });
 
         let output = obs.encode();

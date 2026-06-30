@@ -2742,6 +2742,8 @@ async fn handle_webhook(
             agent_alias: agent_alias.map(|s| s.to_string()),
             turn_id: Some(turn_id.clone()),
             user_id: None,
+            session_id: session_id.clone(),
+            message_id: None,
         },
     );
     state.observer.record_event(
@@ -2752,6 +2754,7 @@ async fn handle_webhook(
             channel: Some(channel_name.to_string()),
             agent_alias: agent_alias.map(|s| s.to_string()),
             turn_id: Some(turn_id.clone()),
+            prompt_content: None,
         },
     );
 
@@ -2789,6 +2792,7 @@ async fn handle_webhook(
                     channel: Some(channel_name.to_string()),
                     agent_alias: agent_alias.map(|s| s.to_string()),
                     turn_id: Some(turn_id.clone()),
+                    response_content: None,
                 },
             );
             state.observer.record_metric(
@@ -2826,6 +2830,7 @@ async fn handle_webhook(
                     channel: Some(channel_name.to_string()),
                     agent_alias: agent_alias.map(|s| s.to_string()),
                     turn_id: Some(turn_id.clone()),
+                    response_content: None,
                 },
             );
             state.observer.record_metric(

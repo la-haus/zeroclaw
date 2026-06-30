@@ -171,6 +171,12 @@ pub struct Agent {
     memory_session_id: Option<String>,
     /// Optional user identifier for tracing/logging (phone, user ID, job name).
     pub user_id: Option<String>,
+    /// Optional conversation/session identifier for trace correlation. Set by
+    /// front-ends (e.g. the gateway WS handler) so `AgentStart` events carry
+    /// the session id alongside the per-turn `turn_id`.
+    pub session_id: Option<String>,
+    /// Optional inbound-message identifier for trace correlation.
+    pub message_id: Option<String>,
     history: Vec<ConversationMessage>,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
     available_hints: Vec<String>,
@@ -691,6 +697,8 @@ impl AgentBuilder {
             },
             memory_session_id: self.memory_session_id,
             user_id: None,
+            session_id: None,
+            message_id: None,
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
@@ -2184,6 +2192,8 @@ impl Agent {
             agent_alias: self.observer_agent_alias(),
             turn_id: Some(turn_id.clone()),
             user_id: self.user_id.clone(),
+            session_id: self.session_id.clone(),
+            message_id: self.message_id.clone(),
         });
 
         let mut guard = TurnGuard {
@@ -2554,6 +2564,8 @@ impl Agent {
             agent_alias: self.observer_agent_alias(),
             turn_id: Some(turn_id.clone()),
             user_id: self.user_id.clone(),
+            session_id: self.session_id.clone(),
+            message_id: self.message_id.clone(),
         });
 
         let mut guard = TurnGuard {

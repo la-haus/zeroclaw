@@ -123,6 +123,13 @@ pub(crate) async fn interpret_chat_response(
         .map(|u| (u.input_tokens, u.output_tokens))
         .unwrap_or((None, None));
 
+    // Opt-in response content (ZEROCLAW_OTEL_TRACE_CONTENT, default off).
+    let response_content = if crate::observability::trace_content_enabled() {
+        resp.text.clone()
+    } else {
+        None
+    };
+
     ctx.observer.record_event(&ObserverEvent::LlmResponse {
         model_provider: ctx.provider_name.to_string(),
         model: ctx.model.to_string(),
@@ -134,6 +141,7 @@ pub(crate) async fn interpret_chat_response(
         channel: Some(ctx.channel_name.to_string()),
         agent_alias: ctx.agent_alias.map(|s| s.to_string()),
         turn_id: Some(ctx.turn_id.to_string()),
+        response_content,
     });
 
     // Record cost via the task-local tracker (no-op when not scoped) and keep

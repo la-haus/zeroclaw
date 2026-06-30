@@ -26,6 +26,8 @@ impl Observer for LogObserver {
                 agent_alias: _,
                 turn_id: _,
                 user_id,
+                session_id: _,
+                message_id: _,
             } => {
                 let mut attrs =
                     ::serde_json::json!({"model_provider": model_provider, "model": model});
@@ -185,6 +187,7 @@ impl Observer for LogObserver {
                 channel: _,
                 agent_alias: _,
                 turn_id: _,
+                prompt_content: _,
             } => {
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "model": model, "messages_count": messages_count})), "llm.request");
             }
@@ -199,6 +202,7 @@ impl Observer for LogObserver {
                 channel: _,
                 agent_alias: _,
                 turn_id: _,
+                response_content: _,
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "model": model, "duration_ms": ms, "success": success, "error": error_message, "input_tokens": input_tokens, "output_tokens": output_tokens})), "llm.response");
@@ -326,6 +330,8 @@ mod tests {
             agent_alias: None,
             turn_id: None,
             user_id: None,
+            session_id: None,
+            message_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -358,6 +364,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "openrouter".into(),
@@ -370,6 +377,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),

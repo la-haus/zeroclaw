@@ -308,6 +308,8 @@ impl Observer for OtelObserver {
                 agent_alias,
                 turn_id,
                 user_id,
+                session_id,
+                message_id,
             } => {
                 self.agent_starts.add(
                     1,
@@ -331,6 +333,12 @@ impl Observer for OtelObserver {
                 if let Some(uid) = user_id {
                     span_attrs.push(KeyValue::new("user_id", uid.clone()));
                 }
+                if let Some(sid) = session_id {
+                    span_attrs.push(KeyValue::new("session.id", sid.clone()));
+                }
+                if let Some(mid) = message_id {
+                    span_attrs.push(KeyValue::new("message.id", mid.clone()));
+                }
                 if langsmith_compat_enabled() {
                     span_attrs.push(KeyValue::new("langsmith.span.kind", "chain"));
                     span_attrs.push(KeyValue::new(
@@ -339,6 +347,14 @@ impl Observer for OtelObserver {
                     ));
                     if let Some(uid) = user_id {
                         span_attrs.push(KeyValue::new("langsmith.metadata.user_id", uid.clone()));
+                    }
+                    if let Some(sid) = session_id {
+                        span_attrs
+                            .push(KeyValue::new("langsmith.metadata.session_id", sid.clone()));
+                    }
+                    if let Some(mid) = message_id {
+                        span_attrs
+                            .push(KeyValue::new("langsmith.metadata.message_id", mid.clone()));
                     }
                     if let Some(ch) = channel {
                         span_attrs.push(KeyValue::new("langsmith.metadata.channel", ch.clone()));
@@ -402,26 +418,35 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                prompt_content,
             } => {
+                let mut span_attrs = vec![
+                    KeyValue::new("gen_ai.provider.name", model_provider.clone()),
+                    KeyValue::new("gen_ai.request.model", model.clone()),
+                    KeyValue::new("gen_ai.operation.name", "llm.request"),
+                    KeyValue::new(
+                        "zeroclaw.messages_count",
+                        i64::try_from(*messages_count).unwrap_or(i64::MAX),
+                    ),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
+                ];
+                // Opt-in prompt content (only ever `Some` when
+                // ZEROCLAW_OTEL_TRACE_CONTENT is enabled at the emit site).
+                if let Some(content) = prompt_content {
+                    span_attrs.push(KeyValue::new("gen_ai.content.prompt", content.clone()));
+                    // LangSmith reads gen_ai.prompt / input.value for the Input tab.
+                    if langsmith_compat_enabled() {
+                        span_attrs.push(KeyValue::new("gen_ai.prompt", content.clone()));
+                        span_attrs.push(KeyValue::new("input.value", content.clone()));
+                    }
+                }
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
                 let mut span = tracer.build_with_context(
                     opentelemetry::trace::SpanBuilder::from_name("llm.request")
                         .with_kind(SpanKind::Client)
-                        .with_attributes(vec![
-                            KeyValue::new("gen_ai.provider.name", model_provider.clone()),
-                            KeyValue::new("gen_ai.request.model", model.clone()),
-                            KeyValue::new("gen_ai.operation.name", "llm.request"),
-                            KeyValue::new(
-                                "zeroclaw.messages_count",
-                                i64::try_from(*messages_count).unwrap_or(i64::MAX),
-                            ),
-                            KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
-                            KeyValue::new(
-                                "gen_ai.agent.name",
-                                agent_alias.clone().unwrap_or_default(),
-                            ),
-                            KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
-                        ]),
+                        .with_attributes(span_attrs),
                     &parent_cx,
                 );
                 span.end();
@@ -616,6 +641,7 @@ impl Observer for OtelObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                response_content,
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
@@ -655,6 +681,16 @@ impl Observer for OtelObserver {
                 }
                 if let Some(err) = error_message {
                     span_attrs.push(KeyValue::new("error.message", err.clone()));
+                }
+                // Opt-in response content (only ever `Some` when
+                // ZEROCLAW_OTEL_TRACE_CONTENT is enabled at the emit site).
+                if let Some(content) = response_content {
+                    span_attrs.push(KeyValue::new("gen_ai.content.completion", content.clone()));
+                    // LangSmith reads gen_ai.completion / output.value for the Output tab.
+                    if langsmith_compat_enabled() {
+                        span_attrs.push(KeyValue::new("gen_ai.completion", content.clone()));
+                        span_attrs.push(KeyValue::new("output.value", content.clone()));
+                    }
                 }
 
                 // LangSmith compat: mirror tokens/model under the names the
@@ -976,6 +1012,8 @@ mod tests {
             agent_alias: Some("cx".into()),
             turn_id: Some("turn-corr".into()),
             user_id: Some("user-1".into()),
+            session_id: Some("session-corr".into()),
+            message_id: Some("msg-corr".into()),
         });
 
         // The agent span's 64-bit trace id + span id must be published so the
@@ -1003,6 +1041,8 @@ mod tests {
             agent_alias: Some("cx".into()),
             turn_id: Some("turn-ls".into()),
             user_id: Some("user-1".into()),
+            session_id: Some("session-ls".into()),
+            message_id: Some("msg-ls".into()),
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "anthropic".into(),
@@ -1015,6 +1055,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("cx".into()),
             turn_id: Some("turn-ls".into()),
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "lead_lookup".into(),
@@ -1043,6 +1084,8 @@ mod tests {
             agent_alias: None,
             turn_id: None,
             user_id: None,
+            session_id: None,
+            message_id: None,
         });
         obs.record_event(&ObserverEvent::LlmRequest {
             model_provider: "openrouter".into(),
@@ -1051,6 +1094,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            prompt_content: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "openrouter".into(),
@@ -1063,6 +1107,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -1272,6 +1317,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            response_content: None,
         });
     }
 
@@ -1303,6 +1349,8 @@ mod tests {
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
             user_id: None,
+            session_id: Some("session-1".into()),
+            message_id: Some("msg-1".into()),
         });
 
         assert!(
@@ -1320,6 +1368,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            prompt_content: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "anthropic".into(),
@@ -1332,6 +1381,7 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),
@@ -1414,6 +1464,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),

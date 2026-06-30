@@ -30,6 +30,14 @@ pub enum ObserverEvent {
         turn_id: Option<String>,
         /// Optional user identifier (phone, user ID, job name) for tracing/logging.
         user_id: Option<String>,
+        /// Optional conversation/session identifier for trace correlation
+        /// (e.g. the gateway session id). Distinct from the per-turn
+        /// `turn_id`: a session can span many turns.
+        session_id: Option<String>,
+        /// Optional inbound-message identifier for trace correlation
+        /// (e.g. the originating channel message id). `None` when the
+        /// caller has no message-level id to attribute the turn to.
+        message_id: Option<String>,
     },
     /// A request is about to be sent to an LLM model_provider.
     ///
@@ -42,6 +50,10 @@ pub enum ObserverEvent {
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
+        /// Serialised prompt content. Populated **only** when content tracing
+        /// is opted in via `ZEROCLAW_OTEL_TRACE_CONTENT`; `None` otherwise so
+        /// the default event stream stays content-free.
+        prompt_content: Option<String>,
     },
     /// Result of a single LLM model_provider call.
     LlmResponse {
@@ -55,6 +67,10 @@ pub enum ObserverEvent {
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
+        /// LLM response text. Populated **only** when content tracing is
+        /// opted in via `ZEROCLAW_OTEL_TRACE_CONTENT`; `None` otherwise so
+        /// the default event stream stays content-free.
+        response_content: Option<String>,
     },
     /// The agent session has finished.
     ///

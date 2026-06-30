@@ -125,6 +125,11 @@ pub struct WsQuery {
     pub name: Option<String>,
     /// Optional user identifier (phone, user ID, job name, etc.) for tracing/logging.
     pub user_id: Option<String>,
+    /// Optional inbound-message identifier for trace correlation (e.g. the
+    /// originating channel/Chatwoot message id). Propagated to `AgentStart`
+    /// events so traces can be correlated back to the triggering message.
+    #[serde(default, alias = "messageId")]
+    pub message_id: Option<String>,
     /// Configured agent alias to run as. Required — every WebSocket
     /// session is bound to an explicit agent (no default agent exists).
     #[serde(default, alias = "agentAlias", alias = "agent")]
@@ -237,6 +242,7 @@ pub async fn handle_ws_chat(
     let session_name = params.name;
     let session_cwd = params.cwd.or(params.workspace_dir);
     let session_user_id = params.user_id;
+    let session_message_id = params.message_id;
     ws.on_upgrade(move |socket| {
         handle_socket(
             socket,
@@ -246,6 +252,7 @@ pub async fn handle_ws_chat(
             session_name,
             session_cwd,
             session_user_id,
+            session_message_id,
         )
     })
     .into_response()
@@ -283,6 +290,7 @@ async fn handle_socket(
     session_name: Option<String>,
     session_cwd: Option<String>,
     user_id: Option<String>,
+    message_id: Option<String>,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -473,6 +481,18 @@ async fn handle_socket(
     agent.set_channel_name("wss".to_string());
     agent.set_memory_session_id(Some(memory_session_id));
     agent.user_id = user_id.clone();
+    // Carry the conversation/session id and (optional) inbound message id so
+    // AgentStart events emit them for Datadog/LangSmith trace correlation.
+    agent.session_id = Some(session_id.clone());
+    agent.message_id = message_id.clone();
+    if let Some(ref mid) = message_id {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"message_id": mid, "session_id": &session_id})),
+            "Message ID attached to WebSocket session"
+        );
+    }
     if let Some(ref uid) = user_id {
         ::zeroclaw_log::record!(
             INFO,

@@ -29,6 +29,7 @@ impl Observer for VerboseObserver {
                 channel: _,
                 agent_alias: _,
                 turn_id: _,
+                prompt_content: _,
             } => {
                 eprintln!("> Thinking");
                 eprintln!(
@@ -93,6 +94,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            prompt_content: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "openrouter".into(),
@@ -105,6 +107,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),

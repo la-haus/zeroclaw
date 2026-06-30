@@ -1477,6 +1477,8 @@ pub async fn run(
             agent_alias: Some(agent_alias.to_string()),
             turn_id: Some(turn_id.clone()),
             user_id: None,
+            session_id: None,
+            message_id: None,
         });
 
         // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
@@ -2014,6 +2016,8 @@ pub async fn run(
                                 agent_alias: Some(agent_alias.to_string()),
                                 turn_id: Some(turn_id.clone()),
                                 user_id: None,
+                                session_id: None,
+                                message_id: None,
                             });
 
                             continue;
@@ -2538,6 +2542,8 @@ pub async fn run(
                                     agent_alias: Some(agent_alias.to_string()),
                                     turn_id: Some(turn_id.clone()),
                                     user_id: None,
+                                    session_id: None,
+                                    message_id: None,
                                 });
 
                                 continue;

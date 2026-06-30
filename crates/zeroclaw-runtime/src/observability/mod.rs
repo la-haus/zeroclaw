@@ -42,6 +42,18 @@ use zeroclaw_config::schema::{ObservabilityBackend, ObservabilityConfig};
 /// into). Initialized to `("0", "0")`.
 pub type SharedTraceContext = Arc<parking_lot::Mutex<(String, String)>>;
 
+/// Whether prompt/response text may be attached to observer events and OTEL
+/// spans. Gated by `ZEROCLAW_OTEL_TRACE_CONTENT` (accepts `true`/`1`) and
+/// **off by default**, so the event stream stays content-free unless an
+/// operator explicitly opts in. When this returns `false`, emit sites leave
+/// `LlmRequest::prompt_content` / `LlmResponse::response_content` as `None`
+/// and never pay the cost of serialising prompt/response text.
+pub fn trace_content_enabled() -> bool {
+    std::env::var("ZEROCLAW_OTEL_TRACE_CONTENT")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
 /// Process-wide broadcast hook installed by long-running subsystems (today: the
 /// gateway) so that events emitted by observers built in *other* subsystems —
 /// notably the agent loop's `process_message` — also fan out to the SSE
@@ -296,6 +308,40 @@ fn create_otel_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trace_content_gate_defaults_off_and_honors_env() {
+        // SAFETY: single-threaded test; the env var is unique to this gate and
+        // not read concurrently by any other test.
+        unsafe {
+            std::env::remove_var("ZEROCLAW_OTEL_TRACE_CONTENT");
+        }
+        assert!(
+            !trace_content_enabled(),
+            "content tracing must be OFF by default"
+        );
+        unsafe {
+            std::env::set_var("ZEROCLAW_OTEL_TRACE_CONTENT", "true");
+        }
+        assert!(
+            trace_content_enabled(),
+            "`true` must enable content tracing"
+        );
+        unsafe {
+            std::env::set_var("ZEROCLAW_OTEL_TRACE_CONTENT", "1");
+        }
+        assert!(trace_content_enabled(), "`1` must enable content tracing");
+        unsafe {
+            std::env::set_var("ZEROCLAW_OTEL_TRACE_CONTENT", "no");
+        }
+        assert!(
+            !trace_content_enabled(),
+            "any other value must leave content tracing OFF"
+        );
+        unsafe {
+            std::env::remove_var("ZEROCLAW_OTEL_TRACE_CONTENT");
+        }
+    }
 
     #[test]
     fn factory_none_returns_noop() {

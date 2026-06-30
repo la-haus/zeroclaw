@@ -117,6 +117,8 @@ impl Observer for DatadogLogObserver {
                 agent_alias,
                 turn_id,
                 user_id,
+                session_id,
+                message_id,
             } => {
                 let mut attrs = json!({
                     "provider": model_provider,
@@ -124,6 +126,12 @@ impl Observer for DatadogLogObserver {
                 });
                 if let Some(uid) = user_id {
                     attrs["user_id"] = json!(uid);
+                }
+                if let Some(sid) = session_id {
+                    attrs["session_id"] = json!(sid);
+                }
+                if let Some(mid) = message_id {
+                    attrs["message_id"] = json!(mid);
                 }
                 if let Some(ch) = channel {
                     attrs["channel"] = json!(ch);
@@ -295,6 +303,8 @@ mod tests {
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
             user_id: Some("user-42".into()),
+            session_id: Some("session-7".into()),
+            message_id: Some("msg-9".into()),
         }
     }
 
@@ -315,6 +325,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            prompt_content: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "anthropic".into(),
@@ -327,6 +338,7 @@ mod tests {
             channel: None,
             agent_alias: None,
             turn_id: None,
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),

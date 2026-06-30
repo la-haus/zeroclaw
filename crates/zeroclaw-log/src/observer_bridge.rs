@@ -111,6 +111,16 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             agent_alias: agent_alias_opt,
             turn_id: turn_id_opt,
             user_id: None,
+            session_id: event
+                .attributes
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            message_id: event
+                .attributes
+                .get("message_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
         }),
         "agent_end" => Some(ObserverEvent::AgentEnd {
             model_provider,
@@ -152,6 +162,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             channel: channel_opt,
             agent_alias: agent_alias_opt,
             turn_id: turn_id_opt,
+            prompt_content: None,
         }),
         "llm_response" => Some(ObserverEvent::LlmResponse {
             model_provider,
@@ -174,6 +185,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             channel: channel_opt,
             agent_alias: agent_alias_opt,
             turn_id: turn_id_opt,
+            response_content: None,
         }),
         "tool_call_start" => Some(ObserverEvent::ToolCallStart {
             tool,
@@ -356,6 +368,7 @@ mod tests {
                 channel,
                 agent_alias,
                 turn_id,
+                ..
             } => {
                 assert_eq!(model_provider, "anthropic");
                 assert_eq!(model, "claude-sonnet-4-6");

@@ -34,6 +34,8 @@ pub(crate) fn record_llm_failure(
         channel: Some(ctx.channel_name.to_string()),
         agent_alias: ctx.agent_alias.map(|s| s.to_string()),
         turn_id: Some(ctx.turn_id.to_string()),
+        // Failure path carries no response text.
+        response_content: None,
     });
     ::zeroclaw_log::record!(
         WARN,
