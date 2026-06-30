@@ -2510,6 +2510,12 @@ impl Agent {
             }
         }
 
+        // Capture this message's structured-output schema up-front and clear it
+        // on `self`. The gateway reuses one Agent across many WS messages;
+        // consuming the schema only on the happy path below leaked it into the
+        // *next* message whenever this turn errored before reaching that point.
+        let mut output_schema = self.output_schema.take();
+
         // See `Agent::turn` for the rationale. Same guard: blank input would
         // push a timestamp-only user message into history and the model would
         // narrate the trailing prompt-template sentinel instead of replying.
@@ -2793,7 +2799,7 @@ impl Agent {
                     let tool_iterations = Self::count_tool_iterations(&new_msgs);
                     if self.config.resolved.output_schema_auto
                         && tool_iterations + 1 >= self.config.resolved.keep_tool_context_turns
-                        && self.output_schema.is_none()
+                        && output_schema.is_none()
                         && let Some((clean, tokens)) = self
                             .forced_auto_cleanup(&committed_response, &effective_model)
                             .await
@@ -2830,7 +2836,7 @@ impl Agent {
                     // response and is appended to history. Bypasses the response
                     // cache (schema is per-message) and the receipts block
                     // (which would corrupt the JSON).
-                    if let Some(schema) = self.output_schema.take()
+                    if let Some(schema) = output_schema.take()
                         && let Some((json_str, tokens)) = self
                             .forced_structured_output(&committed_response, schema, &effective_model)
                             .await
@@ -3189,6 +3195,30 @@ mod tests {
             .await
             .expect_err("whitespace-only streamed turn must fail");
         assert_eq!(err.to_string(), BLANK_TURN_ERROR);
+    }
+
+    #[tokio::test]
+    async fn output_schema_does_not_leak_after_failed_turn() {
+        // The gateway reuses one Agent across many WS messages and sets the
+        // structured-output schema per message. A turn that errors before the
+        // structured-output step must NOT leave the schema set, or it would be
+        // applied to the next (unrelated) message. We use the blank-input early
+        // return as the failing path: the schema is taken up-front, so it must
+        // be cleared even though the turn never reaches the happy-path consume.
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let mut agent = blank_input_agent(model_provider);
+        agent.set_output_schema(Some(serde_json::json!({ "type": "object" })));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+        let _ = agent
+            .turn_streamed_with_steering_state("", event_tx, None, None)
+            .await
+            .expect_err("blank turn must fail");
+        assert!(
+            agent.output_schema.is_none(),
+            "output_schema must be cleared after a failed turn, not leak to the next message"
+        );
     }
 
     struct ModelCaptureModelProvider {
