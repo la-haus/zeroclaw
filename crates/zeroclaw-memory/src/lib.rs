@@ -190,6 +190,13 @@ pub fn should_skip_autosave_content(content: &str) -> bool {
         || lowered.starts_with("[distilled_")
         || starts_with_ignore_ascii_case(normalized, MEMORY_CONTEXT_OPEN)
         || lowered.contains("distilled_index_sig:")
+        // System-injected context envelopes. These carry per-turn user/session
+        // metadata (SYSTEM_CONTEXT) or out-of-band channel notifications
+        // (SYSTEM_NOTIFICATION). They are only useful as transient session
+        // context; persisting them as memories poisons recall (every
+        // re-injection grows verbatim and pollutes semantic search).
+        || lowered.starts_with("system_notification:")
+        || lowered.starts_with("system_context:")
 }
 
 fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
@@ -676,6 +683,23 @@ mod tests {
         )));
         assert!(!should_skip_autosave_content(
             "User prefers concise answers."
+        ));
+    }
+
+    #[test]
+    fn autosave_content_filter_drops_system_envelopes() {
+        assert!(should_skip_autosave_content(
+            "SYSTEM_NOTIFICATION: scheduled broadcast — no response required"
+        ));
+        assert!(should_skip_autosave_content(
+            "system_notification: lowercased prefix also caught"
+        ));
+        assert!(should_skip_autosave_content(
+            "SYSTEM_CONTEXT: user=Lina, phone=+57…"
+        ));
+        // Prefix must be at the start — embedded mentions are real user content.
+        assert!(!should_skip_autosave_content(
+            "El cliente preguntó por SYSTEM_NOTIFICATION en sus correos."
         ));
     }
 

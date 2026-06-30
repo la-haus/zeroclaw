@@ -6,12 +6,21 @@
 //! ```text
 //! Server -> Client: {"type":"session_start","session_id":"...","name":"...","resumed":true,"message_count":42}
 //! Client -> Server: {"type":"message","content":"Hello"}
+//! Client -> Server: {"type":"notification","content":"..."}     (persist-only: no LLM call, no auto-save)
 //! Server -> Client: {"type":"chunk","content":"Hi! "}
 //! Server -> Client: {"type":"tool_call","name":"shell","args":{...}}
 //! Server -> Client: {"type":"tool_result","name":"shell","output":"..."}
 //! Server -> Client: {"type":"llm_call","model":"...","input_tokens":N,"output_tokens":N,"duration_ms":N,"input_preview":"...","output_preview":"..."}
 //! Server -> Client: {"type":"done","full_response":"..."}
+//! Server -> Client: {"type":"notification_ack","persisted":true}
 //! ```
+//!
+//! `notification` is for out-of-band context (system events, broadcasts,
+//! delivery receipts) that must appear in session history so the next user
+//! turn has it as context — but must NOT trigger an LLM turn nor be
+//! auto-saved as a memory. Running the LLM wastes tokens since the caller
+//! already knows it does not expect a response, and persisting it as a
+//! memory pollutes semantic recall.
 //!
 //! ## Tool approvals
 //!
@@ -558,6 +567,28 @@ async fn handle_socket(
                     )
                     .await;
                 }
+            } else if parsed["type"].as_str() == Some("notification") {
+                // Serialize with concurrent message turns on the same session.
+                match state.session_queue.acquire(&session_key).await {
+                    Ok(_session_guard) => {
+                        handle_notification_frame(
+                            &state,
+                            &mut agent,
+                            &mut sender,
+                            &session_key,
+                            &parsed,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": e.to_string(),
+                            "code": session_queue_ws_error_code(&e)
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    }
+                }
             } else {
                 let unknown_type = parsed["type"].as_str().unwrap_or("unknown");
                 let err = serde_json::json!({
@@ -647,6 +678,32 @@ async fn handle_socket(
                     } else {
                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request");
                     }
+                    continue;
+                }
+
+                // ── notification (persist-only, no LLM turn, no auto-save) ──
+                if msg_type == "notification" {
+                    // Serialize with concurrent message turns on the same session.
+                    let _session_guard = match state.session_queue.acquire(&session_key).await {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            let err = serde_json::json!({
+                                "type": "error",
+                                "message": e.to_string(),
+                                "code": session_queue_ws_error_code(&e)
+                            });
+                            let _ = sender.send(Message::Text(err.to_string().into())).await;
+                            continue;
+                        }
+                    };
+                    handle_notification_frame(
+                        &state,
+                        &mut agent,
+                        &mut sender,
+                        &session_key,
+                        &parsed,
+                    )
+                    .await;
                     continue;
                 }
 
@@ -910,6 +967,58 @@ fn is_global_chat_event(event: &serde_json::Value) -> bool {
 /// that `BroadcastObserver` (sse.rs) stamps on every emission.
 fn is_observability_telemetry(event: &serde_json::Value) -> bool {
     event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
+}
+
+/// Persist an out-of-band `notification` frame into session history without
+/// invoking the agent. Used by upstream services that need the agent to see
+/// the event as context on a *future* user turn but do not want a response
+/// emitted now (and do not want it auto-saved as a memory).
+///
+/// The message is appended verbatim as a user-role chat message so it shows
+/// up both in the live agent history (seeded via [`Agent::seed_history`] so
+/// subsequent turns on this same connection have the context) and in the
+/// persisted session_backend (so it survives reconnect). The agent's normal
+/// `auto_save` path is bypassed entirely — `turn_streamed` is never called,
+/// so brain.db stays clean.
+async fn handle_notification_frame(
+    state: &AppState,
+    agent: &mut zeroclaw_runtime::agent::Agent,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    session_key: &str,
+    parsed: &serde_json::Value,
+) {
+    let mut content = parsed["content"].as_str().unwrap_or("").to_string();
+    if content.is_empty() {
+        let err = serde_json::json!({
+            "type": "error",
+            "message": "Notification content cannot be empty",
+            "code": "EMPTY_CONTENT"
+        });
+        let _ = sender.send(Message::Text(err.to_string().into())).await;
+        return;
+    }
+
+    // Process structured attachments the same way real user messages do, so
+    // an image/document carried by a notification ends up referenced inline.
+    append_attachment_markers(&mut content, parsed);
+    let msg = zeroclaw_providers::ChatMessage::user(&content);
+
+    // Update the live agent history so any subsequent user turn on this same
+    // connection has the notification as context. seed_history() takes a slice.
+    agent.seed_history(std::slice::from_ref(&msg));
+
+    let mut persisted = false;
+    if let Some(ref backend) = state.session_backend
+        && backend.append(session_key, &msg).is_ok()
+    {
+        persisted = true;
+    }
+
+    let ack = serde_json::json!({
+        "type": "notification_ack",
+        "persisted": persisted,
+    });
+    let _ = sender.send(Message::Text(ack.to_string().into())).await;
 }
 
 /// Process a single chat message through the agent and send the response.
