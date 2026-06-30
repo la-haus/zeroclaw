@@ -5476,15 +5476,24 @@ async fn process_channel_message_body(
                         ChatMessage::assistant("[Task failed — not continuing this request]"),
                     );
                 }
+                // Friendly fallback overrides the raw error in user-facing
+                // channels when configured; the error itself is already logged
+                // above for observability.
+                let user_facing_error = ctx
+                    .agent_cfg
+                    .resolved
+                    .error_fallback_message
+                    .clone()
+                    .unwrap_or_else(|| format!("⚠️ Error: {e}"));
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                            .finalize_draft(&msg.reply_target, draft_id, &user_facing_error)
                             .await;
                     } else {
                         let _ = channel
                             .send(
-                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                                &SendMessage::new(user_facing_error, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;

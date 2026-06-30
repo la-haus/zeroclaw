@@ -3301,6 +3301,13 @@ pub struct ResolvedRuntime {
     /// long but individually short conversations. `0` disables it (token-based
     /// trimming only). Default: `0`.
     pub auto_compact_after_turns: usize,
+    /// Friendly fallback message sent to the user when the agent fails to
+    /// process a message (provider error, max iterations). When set, this
+    /// message replaces the raw `⚠️ Error: …` text in user-facing channels;
+    /// the actual error is still logged for observability. Can also be set via
+    /// the `ZEROCLAW_ERROR_FALLBACK_MESSAGE` env var. `None` keeps the raw
+    /// error reply. Default: `None`.
+    pub error_fallback_message: Option<String>,
 }
 
 impl ResolvedRuntime {
@@ -3341,6 +3348,7 @@ impl Default for ResolvedRuntime {
             output_schema_auto: false,
             output_schema_auto_prompt: None,
             auto_compact_after_turns: 0,
+            error_fallback_message: None,
         }
     }
 }
@@ -3836,6 +3844,19 @@ impl Config {
             .map_or(0, |p| p.auto_compact_after_turns)
     }
 
+    /// Friendly fallback message shown to the user when the agent fails to
+    /// process a message. Resolves the runtime profile's
+    /// `error_fallback_message`, then falls back to the
+    /// `ZEROCLAW_ERROR_FALLBACK_MESSAGE` env var. Empty values are treated as
+    /// unset so the raw error reply is preserved.
+    #[must_use]
+    pub fn effective_error_fallback_message(&self, agent_alias: &str) -> Option<String> {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.error_fallback_message.clone())
+            .or_else(|| std::env::var("ZEROCLAW_ERROR_FALLBACK_MESSAGE").ok())
+            .filter(|s| !s.trim().is_empty())
+    }
+
     /// Return a clone of the named agent's `AliasedAgentConfig` with all
     /// runtime-profile overrides baked in. Use this when an `Agent` (or
     /// any other struct) needs to own a self-contained, already-resolved
@@ -3863,6 +3884,7 @@ impl Config {
             max_system_prompt_chars: self.effective_max_system_prompt_chars(agent_alias),
             max_tool_result_chars: self.effective_max_tool_result_chars(agent_alias),
             keep_tool_context_turns: self.effective_keep_tool_context_turns(agent_alias),
+            error_fallback_message: self.effective_error_fallback_message(agent_alias),
             ..ResolvedRuntime::default()
         };
         if let Some(profile) = self.runtime_profile_for_agent(agent_alias) {
@@ -10771,6 +10793,12 @@ pub struct RuntimeProfileConfig {
     /// Force a context compaction after this many user turns, regardless of
     /// token count. `0` disables it (token-based trimming only). Default: `0`.
     pub auto_compact_after_turns: usize,
+    /// Friendly fallback message sent to the user when the agent fails to
+    /// process a message. When set, replaces the raw error reply in
+    /// user-facing channels; the actual error is still logged. Can also be set
+    /// via the `ZEROCLAW_ERROR_FALLBACK_MESSAGE` env var. `None` inherits the
+    /// env var (if present) or keeps the raw error reply. Default: `None`.
+    pub error_fallback_message: Option<String>,
 }
 
 impl Default for RuntimeProfileConfig {
@@ -10805,6 +10833,7 @@ impl Default for RuntimeProfileConfig {
             output_schema_auto: false,
             output_schema_auto_prompt: None,
             auto_compact_after_turns: 0,
+            error_fallback_message: None,
         }
     }
 }
