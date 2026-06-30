@@ -206,8 +206,21 @@ impl Observer for ChannelNotifyObserver {
 type ConversationHistoryMap = Arc<Mutex<lru::LruCache<String, Vec<ChatMessage>>>>;
 /// Senders that requested `/new` or `/clear` and must force a fresh prompt on their next message.
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
+/// Per-sender turn counter for turn-based auto-compaction: tracks user turns
+/// since the last forced compaction. Bounded by the same
+/// `MAX_CONVERSATION_SENDERS` LRU as the conversation history map so senders
+/// evicted from history never leak a stale counter.
+type AutoCompactTurnCounter = Arc<Mutex<lru::LruCache<String, usize>>>;
 /// Maximum conversation senders kept in memory (LRU eviction beyond this).
 const MAX_CONVERSATION_SENDERS: usize = 1000;
+/// Forced token budget used when turn-based auto-compaction fires. v0.8.2 has
+/// no LLM summarizer — compaction is the runtime's deterministic whole-turn
+/// trim (`history_trim::trim_to_recent_turns`), which keeps the most recent
+/// whole turns that fit a token budget and always preserves leading system
+/// messages plus at least the latest turn. Passing `1` forces the maximal
+/// compaction (drop every older turn, keep only the current one), the v0.8.2
+/// equivalent of the fork's "compress everything older" threshold override.
+const AUTO_COMPACT_FORCED_BUDGET_TOKENS: usize = 1;
 /// Maximum history messages to keep per sender.
 const MAX_CHANNEL_HISTORY: usize = 50;
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -502,6 +515,9 @@ struct ChannelRuntimeContext {
     pacing: zeroclaw_config::schema::PacingConfig,
     max_tool_result_chars: usize,
     context_token_budget: usize,
+    /// Per-sender turn counter for turn-based auto-compaction. Empty/unused
+    /// when `agent.resolved.auto_compact_after_turns == 0`.
+    auto_compact_counters: AutoCompactTurnCounter,
     debouncer: Arc<zeroclaw_infra::debounce::MessageDebouncer>,
     /// HMAC receipt generator. `Some` when `[agent.resolved.tool_receipts] enabled = true`.
     /// Threaded into `run_tool_call_loop` so `tool_execution::execute_one_tool`
@@ -1791,6 +1807,36 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .pop(sender_key);
+    // Reset the turn-based auto-compaction counter for this sender so a `/new`
+    // or `/clear` starts the count fresh.
+    ctx.auto_compact_counters
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pop(sender_key);
+}
+
+/// Increment the per-sender turn-based auto-compaction counter and report
+/// whether this turn should force a context compaction. Returns `false` when
+/// disabled (`threshold == 0`). On the turn it fires the counter resets to
+/// zero, so compaction recurs every `threshold` user turns. The backing LRU is
+/// bounded by `MAX_CONVERSATION_SENDERS`.
+fn auto_compact_should_force(
+    counters: &AutoCompactTurnCounter,
+    sender_key: &str,
+    threshold: usize,
+) -> bool {
+    if threshold == 0 {
+        return false;
+    }
+    let mut counters = counters.lock().unwrap_or_else(|e| e.into_inner());
+    let count = counters.get_or_insert_mut(sender_key.to_string(), || 0usize);
+    *count += 1;
+    if *count >= threshold {
+        *count = 0;
+        true
+    } else {
+        false
+    }
 }
 
 fn mark_sender_for_new_session(ctx: &ChannelRuntimeContext, sender_key: &str) {
@@ -4767,6 +4813,29 @@ async fn process_channel_message_body(
     });
     let loop_knobs = LoopKnobs::default();
     let turn_id = uuid::Uuid::new_v4().to_string();
+    // Turn-based auto-compaction: count this user turn once (outside the
+    // provider-fallback retry loop so retries never double-count) and, every
+    // `auto_compact_after_turns` turns, force the runtime's whole-turn trim by
+    // shrinking the token budget for this single turn. `0` keeps the normal
+    // token-based behavior.
+    let context_token_budget = if auto_compact_should_force(
+        &ctx.auto_compact_counters,
+        &history_key,
+        ctx.agent_cfg.resolved.auto_compact_after_turns,
+    ) {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "auto_compact_after_turns": ctx.agent_cfg.resolved.auto_compact_after_turns,
+                })
+            ),
+            "Turn-based auto-compaction: forcing context trim for this turn"
+        );
+        AUTO_COMPACT_FORCED_BUDGET_TOKENS
+    } else {
+        ctx.context_token_budget
+    };
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -4809,7 +4878,7 @@ async fn process_channel_message_body(
                         .agent(ctx.agent_alias.as_str())
                         .is_some_and(|agent| agent.resolved.parallel_tools),
                     max_tool_result_chars: ctx.max_tool_result_chars,
-                    context_token_budget: ctx.context_token_budget,
+                    context_token_budget,
                     receipt_generator: ctx.receipt_generator.as_ref(),
                     knobs: &loop_knobs,
                 },
@@ -9549,6 +9618,9 @@ pub async fn start_channels(
             pacing: config.pacing.clone(),
             max_tool_result_chars: agent.resolved.max_tool_result_chars,
             context_token_budget: agent.resolved.max_context_tokens,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::from_millis(config.channels.debounce_ms),
             )),
@@ -10009,6 +10081,37 @@ mod tests {
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
     #[test]
+    fn auto_compact_counter_fires_every_threshold_and_is_bounded() {
+        let counters: AutoCompactTurnCounter = Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+        )));
+
+        // Disabled (threshold 0) never forces.
+        assert!(!auto_compact_should_force(&counters, "a", 0));
+        assert!(!auto_compact_should_force(&counters, "a", 0));
+
+        // Threshold 3: fires on the 3rd turn, resets, fires again on the 6th.
+        assert!(!auto_compact_should_force(&counters, "a", 3));
+        assert!(!auto_compact_should_force(&counters, "a", 3));
+        assert!(auto_compact_should_force(&counters, "a", 3));
+        assert!(!auto_compact_should_force(&counters, "a", 3));
+        assert!(!auto_compact_should_force(&counters, "a", 3));
+        assert!(auto_compact_should_force(&counters, "a", 3));
+
+        // Per-sender counters are independent.
+        assert!(!auto_compact_should_force(&counters, "b", 2));
+        assert!(auto_compact_should_force(&counters, "b", 2));
+
+        // The backing LRU is bounded by MAX_CONVERSATION_SENDERS: inserting more
+        // distinct senders evicts the oldest instead of leaking memory.
+        for i in 0..(MAX_CONVERSATION_SENDERS + 50) {
+            let _ = auto_compact_should_force(&counters, &format!("s{i}"), 5);
+        }
+        let len = counters.lock().unwrap().len();
+        assert_eq!(len, MAX_CONVERSATION_SENDERS);
+    }
+
+    #[test]
     fn no_real_time_channels_message_points_at_quickstart_not_onboard() {
         // The "no channels configured" message must point operators at the
         // current command (zeroclaw quickstart), not the deleted `zeroclaw onboard`.
@@ -10436,6 +10539,9 @@ temperature = 0.3
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -11028,6 +11134,9 @@ temperature = 0.3
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -11501,6 +11610,9 @@ api_key = "anthropic-key"
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -11595,6 +11707,9 @@ api_key = "anthropic-key"
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -11707,6 +11822,9 @@ api_key = "anthropic-key"
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -11823,6 +11941,9 @@ api_key = "anthropic-key"
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -12221,6 +12342,9 @@ api_key = "anthropic-key"
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -12959,6 +13083,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -13041,6 +13168,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -13156,6 +13286,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -13281,6 +13414,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -13431,6 +13567,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -13552,6 +13691,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -13689,6 +13831,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -13812,6 +13957,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -13920,6 +14068,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -14048,6 +14199,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -14193,6 +14347,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -14401,6 +14558,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -14507,6 +14667,9 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -14620,6 +14783,9 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -14989,6 +15155,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -15131,6 +15300,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -15283,6 +15455,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -15438,6 +15613,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -15583,6 +15761,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -15710,6 +15891,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -15818,6 +16002,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -17425,6 +17612,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -17593,6 +17783,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -18017,6 +18210,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -18160,6 +18356,9 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -19642,6 +19841,9 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -19757,6 +19959,9 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -19909,6 +20114,9 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 50000,
             context_token_budget: 128_000,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 std::time::Duration::ZERO,
             )),
@@ -20140,6 +20348,9 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -20288,6 +20499,9 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -20428,6 +20642,9 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -20588,6 +20805,9 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -20987,6 +21207,9 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            auto_compact_counters: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),

@@ -3293,6 +3293,14 @@ pub struct ResolvedRuntime {
     /// overrides the default cleanup prompt (e.g. WhatsApp formatting).
     /// `None`/empty uses the built-in default prompt.
     pub output_schema_auto_prompt: Option<String>,
+    /// Force a context compaction after this many user turns, regardless of
+    /// token count. Independent of `max_history_messages` (hard cap) and
+    /// `max_context_tokens` (token-based threshold): when `> 0`, the channel
+    /// orchestrator forces the runtime's whole-turn trim every N user turns
+    /// even while under the token budget, preventing gradual context growth in
+    /// long but individually short conversations. `0` disables it (token-based
+    /// trimming only). Default: `0`.
+    pub auto_compact_after_turns: usize,
 }
 
 impl ResolvedRuntime {
@@ -3332,6 +3340,7 @@ impl Default for ResolvedRuntime {
             tool_receipts: ToolReceiptsConfig::default(),
             output_schema_auto: false,
             output_schema_auto_prompt: None,
+            auto_compact_after_turns: 0,
         }
     }
 }
@@ -3821,6 +3830,12 @@ impl Config {
             .and_then(|p| p.output_schema_auto_prompt.clone())
     }
 
+    #[must_use]
+    pub fn effective_auto_compact_after_turns(&self, agent_alias: &str) -> usize {
+        self.runtime_profile_for_agent(agent_alias)
+            .map_or(0, |p| p.auto_compact_after_turns)
+    }
+
     /// Return a clone of the named agent's `AliasedAgentConfig` with all
     /// runtime-profile overrides baked in. Use this when an `Agent` (or
     /// any other struct) needs to own a self-contained, already-resolved
@@ -3861,6 +3876,7 @@ impl Config {
             resolved.tool_filter_groups = profile.tool_filter_groups.clone();
             resolved.output_schema_auto = profile.output_schema_auto;
             resolved.output_schema_auto_prompt = profile.output_schema_auto_prompt.clone();
+            resolved.auto_compact_after_turns = profile.auto_compact_after_turns;
         }
         out.resolved = resolved;
         Some(out)
@@ -10709,6 +10725,9 @@ pub struct RuntimeProfileConfig {
     /// Custom system prompt for the auto output cleanup call. `None` uses the
     /// built-in default prompt.
     pub output_schema_auto_prompt: Option<String>,
+    /// Force a context compaction after this many user turns, regardless of
+    /// token count. `0` disables it (token-based trimming only). Default: `0`.
+    pub auto_compact_after_turns: usize,
 }
 
 impl Default for RuntimeProfileConfig {
@@ -10742,6 +10761,7 @@ impl Default for RuntimeProfileConfig {
             tool_filter_groups: Vec::new(),
             output_schema_auto: false,
             output_schema_auto_prompt: None,
+            auto_compact_after_turns: 0,
         }
     }
 }
