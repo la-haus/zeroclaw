@@ -9,6 +9,12 @@ unmaintained = "all"
 yanked = "deny"
 # Ignore known unmaintained transitive deps we cannot easily replace
 ignore = [
+    # anyhow -- borrow-rules UB only when calling Error::downcast_mut() on an
+    # Error that had context added via Error::context(). Published after the
+    # v0.8.2 base froze this list. anyhow is a global transitive dep; we never
+    # call downcast_mut() on a context-wrapped error in our code. Awaiting an
+    # anyhow patched release to bump workspace-wide.
+    { id = "RUSTSEC-2026-0190", reason = "anyhow downcast_mut-after-context UB; not exercised in our code (no downcast_mut on context-wrapped errors); awaiting anyhow patch release" },
     # bincode -- unmaintained advisory (informational only, no CVE); team ceased
     # development after a doxxing/harassment incident; advisory affects all
     # versions including 2.x. In our tree, bincode is pulled in only via

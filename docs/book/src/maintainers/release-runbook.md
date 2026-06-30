@@ -366,7 +366,7 @@ If `gh-pages` is ever deleted or needs to be fully recreated, seed the versions 
 3. **Current master:** `workflow_dispatch` with tag `master`
 
 > [!IMPORTANT]
-> `master` must be deployed **last** during bootstrapping. It writes the definitive `_shared/` chrome layer that all other versions use.
+`master` must be deployed **last** during bootstrapping. It writes the definitive `_shared/` chrome layer that all other versions use.
 
 > [!NOTE]
 > Stable resolves from `docs/book/stable-version.txt` (committed in source, published to the gh-pages root as `stable-version.txt`). After bootstrapping, confirm that file names the intended GA release; the root redirect and the "Stable (latest release)" selector entry follow it. No `/stable/` directory is created.
