@@ -1,6 +1,9 @@
+use super::SharedTraceContext;
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
-use opentelemetry::metrics::{Counter, Gauge, Histogram};
-use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt as _, Tracer};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider as _};
+use opentelemetry::trace::{
+    Span, SpanKind, Status, TraceContextExt as _, Tracer, TracerProvider as _,
+};
 use opentelemetry::{Context, KeyValue, global};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -10,8 +13,33 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+/// When `ZEROCLAW_OTEL_LANGSMITH_COMPAT=true` (or `1`), emit additional span
+/// attributes that the LangSmith OTLP ingester expects (`langsmith.span.kind`,
+/// `ls_model_name`, `gen_ai.usage.prompt_tokens`, `langsmith.usage_metadata`,
+/// etc.) so traces render correctly in the LangSmith UI without disturbing the
+/// pure `gen_ai.*` semconv used by every other backend.
+fn langsmith_compat_enabled() -> bool {
+    std::env::var("ZEROCLAW_OTEL_LANGSMITH_COMPAT")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
 pub struct OtelObserver {
+    /// Instance label (e.g. `"otel-0"`, `"otel-1"`) so multi-endpoint fan-out
+    /// can be told apart in diagnostics.
+    instance_name: String,
+    /// `service.name` reported on the resource and mirrored as a span attribute
+    /// (Datadog `service`, LangSmith `langsmith.metadata.service_name`).
+    service_name: String,
+    /// Shared trace context for log↔trace correlation: this observer writes the
+    /// active agent span's `(trace_id_64, span_id)` here on `AgentStart` so the
+    /// `DatadogLogObserver` can stamp `dd.trace_id`/`dd.span_id` on every log
+    /// line without relying on the global OTel context. `None` for instances
+    /// that should not own correlation (e.g. the LangSmith endpoint, whose
+    /// trace IDs would overwrite Datadog's).
+    trace_context: Option<SharedTraceContext>,
+
     tracer_provider: SdkTracerProvider,
     meter_provider: SdkMeterProvider,
 
@@ -36,7 +64,9 @@ pub struct OtelObserver {
     rag_retrieve_duration: Histogram<f64>,
 
     // Turn span tracking for parent/child correlation
-    active_agent_spans: Mutex<HashMap<String, (global::BoxedSpan, Context)>>,
+    // Spans created via the *instance* tracer are concrete `SdkSpan`s (not the
+    // erased `global::BoxedSpan`), which is what makes per-endpoint fan-out work.
+    active_agent_spans: Mutex<HashMap<String, (opentelemetry_sdk::trace::Span, Context)>>,
 }
 
 impl OtelObserver {
@@ -49,10 +79,23 @@ impl OtelObserver {
         service_name: Option<&str>,
         headers: Option<HashMap<String, String>>,
     ) -> Result<Self, String> {
+        Self::with_options(endpoint, service_name, headers, None, None)
+    }
+
+    /// Full constructor used by the multi-endpoint factory. Adds an instance
+    /// label and an optional [`SharedTraceContext`] for log↔trace correlation.
+    pub fn with_options(
+        endpoint: Option<&str>,
+        service_name: Option<&str>,
+        headers: Option<HashMap<String, String>>,
+        instance_name: Option<&str>,
+        trace_context: Option<SharedTraceContext>,
+    ) -> Result<Self, String> {
         let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
         let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
         let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
         let service_name = service_name.unwrap_or("zeroclaw");
+        let instance_name = instance_name.unwrap_or("otel-0").to_string();
 
         // ── Trace exporter ──────────────────────────────────────
         let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
@@ -103,7 +146,10 @@ impl OtelObserver {
         global::set_meter_provider(meter_provider);
 
         // ── Create metric instruments ────────────────────────────
-        let meter = global::meter("zeroclaw");
+        // Bind instruments to *this instance's* meter provider (not the global
+        // one) so multi-endpoint fan-out exports metrics to every configured
+        // backend instead of only the last one that set the global provider.
+        let meter = meter_provider_clone.meter("zeroclaw");
 
         let agent_starts = meter
             .u64_counter("zeroclaw.agent.starts")
@@ -207,6 +253,9 @@ impl OtelObserver {
             .build();
 
         Ok(Self {
+            instance_name,
+            service_name: service_name.to_string(),
+            trace_context,
             tracer_provider,
             meter_provider: meter_provider_clone,
             agent_starts,
@@ -247,7 +296,9 @@ impl OtelObserver {
 
 impl Observer for OtelObserver {
     fn record_event(&self, event: &ObserverEvent) {
-        let tracer = global::tracer("zeroclaw");
+        // Use this instance's tracer (not the global one) so each endpoint in a
+        // multi-endpoint fan-out receives its own copy of every span.
+        let tracer = self.tracer_provider.tracer("zeroclaw");
 
         match event {
             ObserverEvent::AgentStart {
@@ -269,6 +320,10 @@ impl Observer for OtelObserver {
                 let mut span_attrs = vec![
                     KeyValue::new("gen_ai.provider.name", model_provider.clone()),
                     KeyValue::new("gen_ai.request.model", model.clone()),
+                    // `service.name` mirrored as a span attribute so Datadog APM
+                    // groups the trace under the service and LangSmith can read
+                    // it from the span.
+                    KeyValue::new("service.name", self.service_name.clone()),
                     KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
                     KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
                     KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
@@ -276,12 +331,60 @@ impl Observer for OtelObserver {
                 if let Some(uid) = user_id {
                     span_attrs.push(KeyValue::new("user_id", uid.clone()));
                 }
+                if langsmith_compat_enabled() {
+                    span_attrs.push(KeyValue::new("langsmith.span.kind", "chain"));
+                    span_attrs.push(KeyValue::new(
+                        "langsmith.metadata.service_name",
+                        self.service_name.clone(),
+                    ));
+                    if let Some(uid) = user_id {
+                        span_attrs.push(KeyValue::new("langsmith.metadata.user_id", uid.clone()));
+                    }
+                    if let Some(ch) = channel {
+                        span_attrs.push(KeyValue::new("langsmith.metadata.channel", ch.clone()));
+                    }
+                    if let Some(alias) = agent_alias {
+                        span_attrs.push(KeyValue::new(
+                            "langsmith.metadata.agent_alias",
+                            alias.clone(),
+                        ));
+                    }
+                    if let Some(tid) = turn_id {
+                        span_attrs.push(KeyValue::new("langsmith.metadata.turn_id", tid.clone()));
+                    }
+                    // Free-form tenant/enterprise filtering: ZEROCLAW_OTEL_METADATA
+                    // = "key=value,key=value" (e.g. enterprise_code=af9b,agent_type=cx).
+                    if let Ok(metadata) = std::env::var("ZEROCLAW_OTEL_METADATA") {
+                        for pair in metadata.split(',') {
+                            if let Some((k, v)) = pair.split_once('=') {
+                                span_attrs.push(KeyValue::new(
+                                    format!("langsmith.metadata.{}", k.trim()),
+                                    v.trim().to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
 
                 let span = tracer.build(
                     opentelemetry::trace::SpanBuilder::from_name("gen_ai.agent.invoke")
                         .with_kind(SpanKind::Internal)
                         .with_attributes(span_attrs),
                 );
+
+                // Publish the agent span's trace/span id to the shared context so
+                // the DatadogLogObserver can correlate logs with this trace.
+                // Datadog uses 64-bit trace IDs: take the lower 64 bits of the
+                // 128-bit OTel trace ID (same transform as lahaus-datadog).
+                if let Some(ref tc) = self.trace_context {
+                    let sc = span.span_context().clone();
+                    if sc.is_valid() {
+                        let trace_id_128 = u128::from_be_bytes(sc.trace_id().to_bytes());
+                        let trace_id_64 = (trace_id_128 & ((1u128 << 64) - 1)) as u64;
+                        let span_id = u64::from_be_bytes(sc.span_id().to_bytes());
+                        *tc.lock() = (trace_id_64.to_string(), span_id.to_string());
+                    }
+                }
 
                 if let Some(tid) = turn_id {
                     let parent_cx =
@@ -507,7 +610,7 @@ impl Observer for OtelObserver {
                 model,
                 duration,
                 success,
-                error_message: _,
+                error_message,
                 input_tokens,
                 output_tokens,
                 channel,
@@ -546,6 +649,42 @@ impl Observer for OtelObserver {
                 if let Some(output) = output_tokens {
                     span_attrs.push(KeyValue::new("gen_ai.usage.output_tokens", *output as i64));
                 }
+                let total = input_tokens.unwrap_or(0) + output_tokens.unwrap_or(0);
+                if total > 0 {
+                    span_attrs.push(KeyValue::new("gen_ai.usage.total_tokens", total as i64));
+                }
+                if let Some(err) = error_message {
+                    span_attrs.push(KeyValue::new("error.message", err.clone()));
+                }
+
+                // LangSmith compat: mirror tokens/model under the names the
+                // LangSmith OTLP ingester reads, plus a usage_metadata blob that
+                // bypasses its nil-output guard so tokens always show even when
+                // the span carries no completion text.
+                if langsmith_compat_enabled() {
+                    span_attrs.push(KeyValue::new("gen_ai.system", model_provider.clone()));
+                    span_attrs.push(KeyValue::new("langsmith.span.kind", "llm"));
+                    // ls_model_name + ls_provider drive LangSmith pricing lookup.
+                    span_attrs.push(KeyValue::new("ls_model_name", model.clone()));
+                    span_attrs.push(KeyValue::new("ls_provider", model_provider.clone()));
+                    if let Some(input) = input_tokens {
+                        span_attrs.push(KeyValue::new("gen_ai.usage.prompt_tokens", *input as i64));
+                    }
+                    if let Some(output) = output_tokens {
+                        span_attrs.push(KeyValue::new(
+                            "gen_ai.usage.completion_tokens",
+                            *output as i64,
+                        ));
+                    }
+                    let usage_json = format!(
+                        r#"{{"input_tokens":{},"output_tokens":{},"total_tokens":{}}}"#,
+                        input_tokens.unwrap_or_default(),
+                        output_tokens.unwrap_or_default(),
+                        total
+                    );
+                    span_attrs.push(KeyValue::new("langsmith.usage_metadata", usage_json));
+                }
+
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
                 let mut span = tracer.build_with_context(
                     opentelemetry::trace::SpanBuilder::from_name("llm.response")
@@ -556,7 +695,7 @@ impl Observer for OtelObserver {
                 if *success {
                     span.set_status(Status::Ok);
                 } else {
-                    span.set_status(Status::error(""));
+                    span.set_status(Status::error(error_message.clone().unwrap_or_default()));
                 }
                 span.end();
             }
@@ -627,10 +766,18 @@ impl Observer for OtelObserver {
             } => {
                 let secs = duration.as_secs_f64();
 
+                // On failure, surface the scrubbed tool output as the span error
+                // message (and an `error.message` attribute) so trace viewers show
+                // *why* the tool failed instead of an empty error status.
+                let error_detail = if *success {
+                    String::new()
+                } else {
+                    result.clone().unwrap_or_default()
+                };
                 let status = if *success {
                     Status::Ok
                 } else {
-                    Status::error("")
+                    Status::error(error_detail.clone())
                 };
 
                 let mut span_attrs = vec![
@@ -652,6 +799,12 @@ impl Observer for OtelObserver {
                 if let Some(res) = result {
                     span_attrs.push(KeyValue::new("gen_ai.tool.result", res.clone()));
                     span_attrs.push(KeyValue::new("output.value", res.clone()));
+                }
+                if !*success && !error_detail.is_empty() {
+                    span_attrs.push(KeyValue::new("error.message", error_detail.clone()));
+                }
+                if langsmith_compat_enabled() {
+                    span_attrs.push(KeyValue::new("langsmith.span.kind", "tool"));
                 }
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
                 let mut span = tracer.build_with_context(
@@ -733,7 +886,7 @@ impl Observer for OtelObserver {
 
     fn flush(&self) {
         // Flush orphan live spans (turns that ended without AgentEnd)
-        let orphans: Vec<(global::BoxedSpan, Context)> = self
+        let orphans: Vec<(opentelemetry_sdk::trace::Span, Context)> = self
             .active_agent_spans
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -749,7 +902,10 @@ impl Observer for OtelObserver {
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    .with_attrs(::serde_json::json!({
+                        "instance": self.instance_name,
+                        "error": format!("{}", e),
+                    })),
                 "OTel trace flush failed"
             );
         }
@@ -758,7 +914,10 @@ impl Observer for OtelObserver {
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    .with_attrs(::serde_json::json!({
+                        "instance": self.instance_name,
+                        "error": format!("{}", e),
+                    })),
                 "OTel metric flush failed"
             );
         }
@@ -795,6 +954,83 @@ mod tests {
     fn otel_observer_name() {
         let obs = test_observer();
         assert_eq!(obs.name(), "otel");
+    }
+
+    #[test]
+    fn agent_start_publishes_trace_context_for_datadog_correlation() {
+        let ctx: SharedTraceContext =
+            std::sync::Arc::new(parking_lot::Mutex::new(("0".into(), "0".into())));
+        let obs = OtelObserver::with_options(
+            Some("http://127.0.0.1:19999"),
+            Some("zeroclaw-test"),
+            None,
+            Some("otel-0"),
+            Some(ctx.clone()),
+        )
+        .expect("observer creation should not fail");
+
+        obs.record_event(&ObserverEvent::AgentStart {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            channel: Some("wss".into()),
+            agent_alias: Some("cx".into()),
+            turn_id: Some("turn-corr".into()),
+            user_id: Some("user-1".into()),
+        });
+
+        // The agent span's 64-bit trace id + span id must be published so the
+        // DatadogLogObserver can stamp dd.trace_id/dd.span_id onto logs.
+        let (trace_id, span_id) = ctx.lock().clone();
+        assert_ne!(trace_id, "0", "trace_id must be populated on AgentStart");
+        assert_ne!(span_id, "0", "span_id must be populated on AgentStart");
+    }
+
+    #[test]
+    fn langsmith_compat_mode_records_without_panic() {
+        // SAFETY: single-threaded test; we set and unset the env var locally.
+        unsafe {
+            std::env::set_var("ZEROCLAW_OTEL_LANGSMITH_COMPAT", "true");
+            std::env::set_var(
+                "ZEROCLAW_OTEL_METADATA",
+                "enterprise_code=af9b,agent_type=cx",
+            );
+        }
+        let obs = test_observer();
+        obs.record_event(&ObserverEvent::AgentStart {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            channel: Some("wss".into()),
+            agent_alias: Some("cx".into()),
+            turn_id: Some("turn-ls".into()),
+            user_id: Some("user-1".into()),
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(120),
+            success: true,
+            error_message: None,
+            input_tokens: Some(1000),
+            output_tokens: Some(200),
+            channel: Some("wss".into()),
+            agent_alias: Some("cx".into()),
+            turn_id: Some("turn-ls".into()),
+        });
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "lead_lookup".into(),
+            tool_call_id: Some("call_1".into()),
+            duration: Duration::from_millis(40),
+            success: false,
+            arguments: Some(r#"{"id":"x"}"#.into()),
+            result: Some("not found".into()),
+            channel: Some("wss".into()),
+            agent_alias: Some("cx".into()),
+            turn_id: Some("turn-ls".into()),
+        });
+        unsafe {
+            std::env::remove_var("ZEROCLAW_OTEL_LANGSMITH_COMPAT");
+            std::env::remove_var("ZEROCLAW_OTEL_METADATA");
+        }
     }
 
     #[test]

@@ -1,3 +1,4 @@
+pub mod datadog_log;
 pub mod dora;
 pub mod log;
 pub mod multi;
@@ -10,6 +11,7 @@ pub mod runtime_trace;
 pub mod traits;
 pub mod verbose;
 
+pub use self::datadog_log::DatadogLogObserver;
 #[allow(unused_imports)]
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
@@ -29,6 +31,16 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::RwLock;
 use traits::ObserverMetric;
 use zeroclaw_config::schema::{ObservabilityBackend, ObservabilityConfig};
+
+/// Shared trace context for log↔trace correlation.
+///
+/// Holds `(trace_id_64bit, span_id)` as decimal strings. Written by
+/// [`otel::OtelObserver`] on `AgentStart` and read by
+/// [`datadog_log::DatadogLogObserver`] so structured logs carry the correct
+/// `dd.trace_id`/`dd.span_id` without relying on the global OpenTelemetry
+/// context (which the instance-scoped `OtelObserver` never registers spans
+/// into). Initialized to `("0", "0")`.
+pub type SharedTraceContext = Arc<parking_lot::Mutex<(String, String)>>;
 
 /// Process-wide broadcast hook installed by long-running subsystems (today: the
 /// gateway) so that events emitted by observers built in *other* subsystems —
@@ -160,6 +172,7 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     match config.backend {
         ObservabilityBackend::Log => Box::new(LogObserver::new()),
         ObservabilityBackend::Verbose => Box::new(VerboseObserver::new()),
+        ObservabilityBackend::DatadogLog => Box::new(DatadogLogObserver::new()),
         ObservabilityBackend::Prometheus => {
             #[cfg(feature = "observability-prometheus")]
             {
@@ -178,33 +191,8 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
         }
         ObservabilityBackend::Otel => {
             #[cfg(feature = "observability-otel")]
-            match OtelObserver::new(
-                config.otel_endpoint.as_deref(),
-                config.otel_service_name.as_deref(),
-                config.otel_headers.clone(),
-            ) {
-                Ok(obs) => {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"endpoint": config
-                            .otel_endpoint
-                            .as_deref()
-                            .unwrap_or("http://localhost:4318")})),
-                        "OpenTelemetry observer initialized"
-                    );
-                    Box::new(obs)
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "Failed to create OTel observer. Falling back to noop."
-                    );
-                    Box::new(NoopObserver)
-                }
+            {
+                create_otel_observer(config)
             }
             #[cfg(not(feature = "observability-otel"))]
             {
@@ -218,6 +206,90 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
             }
         }
         ObservabilityBackend::None => Box::new(NoopObserver),
+    }
+}
+
+/// Build the OTel observer stack: one instance-scoped [`otel::OtelObserver`]
+/// per configured endpoint (legacy `otel_endpoint` plus every
+/// `otel_endpoints` entry), fanning out via [`MultiObserver`], always paired
+/// with a [`DatadogLogObserver`] for structured stdout logs correlated to the
+/// traces. Only the first OTel instance (the Datadog endpoint by convention)
+/// owns the [`SharedTraceContext`]: secondary endpoints (e.g. LangSmith)
+/// generate their own trace IDs that must not overwrite the one the
+/// `DatadogLogObserver` stamps onto `dd.trace_id`.
+#[cfg(feature = "observability-otel")]
+fn create_otel_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
+    let shared_ctx: SharedTraceContext =
+        Arc::new(parking_lot::Mutex::new(("0".into(), "0".into())));
+
+    // Consolidated endpoint list: legacy single endpoint first (backwards
+    // compatible), then each multi-endpoint entry, de-duplicated by URL.
+    let mut endpoints: Vec<(String, Option<std::collections::HashMap<String, String>>)> =
+        Vec::new();
+    if let Some(ref ep) = config.otel_endpoint {
+        endpoints.push((ep.clone(), config.otel_headers.clone()));
+    }
+    for ep_cfg in &config.otel_endpoints {
+        if !endpoints.iter().any(|(e, _)| e == &ep_cfg.endpoint) {
+            endpoints.push((ep_cfg.endpoint.clone(), ep_cfg.headers.clone()));
+        }
+    }
+    if endpoints.is_empty() {
+        endpoints.push(("http://localhost:4318".into(), None));
+    }
+
+    let mut observers: Vec<Box<dyn Observer>> = Vec::new();
+    for (i, (endpoint, headers)) in endpoints.iter().enumerate() {
+        let instance_name = format!("otel-{i}");
+        let ctx_for_observer = if i == 0 {
+            Some(shared_ctx.clone())
+        } else {
+            None
+        };
+        match OtelObserver::with_options(
+            Some(endpoint.as_str()),
+            config.otel_service_name.as_deref(),
+            headers.clone(),
+            Some(&instance_name),
+            ctx_for_observer,
+        ) {
+            Ok(obs) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "endpoint": endpoint,
+                            "instance": instance_name,
+                        })),
+                    "OpenTelemetry observer initialized"
+                );
+                observers.push(Box::new(obs));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "endpoint": endpoint,
+                            "error": format!("{}", e),
+                        })),
+                    "Failed to create OTel observer for endpoint"
+                );
+            }
+        }
+    }
+
+    // Always pair the trace pipeline with structured Datadog logs that read the
+    // shared trace context for log↔trace correlation.
+    observers.push(Box::new(
+        DatadogLogObserver::new().with_trace_context(shared_ctx.clone()),
+    ));
+
+    match observers.len() {
+        0 => Box::new(NoopObserver),
+        1 => observers.pop().expect("len checked == 1"),
+        _ => Box::new(MultiObserver::new(observers)),
     }
 }
 
@@ -262,6 +334,15 @@ mod tests {
     }
 
     #[test]
+    fn factory_datadog_log_returns_datadog_log() {
+        let cfg = ObservabilityConfig {
+            backend: ObservabilityBackend::DatadogLog,
+            ..ObservabilityConfig::default()
+        };
+        assert_eq!(create_observer(&cfg).name(), "datadog-log");
+    }
+
+    #[test]
     fn factory_prometheus_returns_prometheus() {
         let cfg = ObservabilityConfig {
             backend: ObservabilityBackend::Prometheus,
@@ -283,8 +364,11 @@ mod tests {
             otel_service_name: Some("test".into()),
             ..ObservabilityConfig::default()
         };
+        // With the otel feature the factory fans out into a MultiObserver
+        // (one OtelObserver per endpoint + a DatadogLogObserver), so the
+        // delegated name is "multi"; without it, falls back to noop.
         let expected = if cfg!(feature = "observability-otel") {
-            "otel"
+            "multi"
         } else {
             "noop"
         };
@@ -299,8 +383,11 @@ mod tests {
             otel_service_name: Some("test".into()),
             ..ObservabilityConfig::default()
         };
+        // With the otel feature the factory fans out into a MultiObserver
+        // (one OtelObserver per endpoint + a DatadogLogObserver), so the
+        // delegated name is "multi"; without it, falls back to noop.
         let expected = if cfg!(feature = "observability-otel") {
-            "otel"
+            "multi"
         } else {
             "noop"
         };
@@ -315,8 +402,11 @@ mod tests {
             otel_service_name: Some("test".into()),
             ..ObservabilityConfig::default()
         };
+        // With the otel feature the factory fans out into a MultiObserver
+        // (one OtelObserver per endpoint + a DatadogLogObserver), so the
+        // delegated name is "multi"; without it, falls back to noop.
         let expected = if cfg!(feature = "observability-otel") {
-            "otel"
+            "multi"
         } else {
             "noop"
         };

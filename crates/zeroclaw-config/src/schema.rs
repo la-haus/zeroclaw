@@ -10140,6 +10140,10 @@ pub enum ObservabilityBackend {
     Prometheus,
     #[serde(alias = "opentelemetry", alias = "otlp")]
     Otel,
+    /// Structured JSON logs to stdout for Datadog Log Management, correlated
+    /// with APM traces via `dd.trace_id`/`dd.span_id`.
+    #[serde(alias = "datadog-log", alias = "datadog")]
+    DatadogLog,
 }
 
 impl ObservabilityBackend {
@@ -10151,8 +10155,26 @@ impl ObservabilityBackend {
             Self::Verbose => "verbose",
             Self::Prometheus => "prometheus",
             Self::Otel => "otel",
+            Self::DatadogLog => "datadog_log",
         }
     }
+}
+
+/// Configuration for a single OTLP export endpoint.
+///
+/// Used by [`ObservabilityConfig::otel_endpoints`] to fan-out trace/metric
+/// export to multiple OTLP backends simultaneously (e.g. a Datadog agent and
+/// LangSmith). Each entry produces an independent, instance-scoped
+/// `OtelObserver`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct OtelEndpointConfig {
+    /// OTLP endpoint URL (e.g. `"https://api.smith.langchain.com/otel"`).
+    pub endpoint: String,
+    /// Optional HTTP headers (e.g. authorization tokens).
+    #[serde(default)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub headers: Option<std::collections::HashMap<String, String>>,
 }
 
 /// JSONL log persistence mode.
@@ -10257,6 +10279,22 @@ pub struct ObservabilityConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub otel_headers: Option<std::collections::HashMap<String, String>>,
 
+    /// Multiple OTLP endpoints for fan-out export (e.g. Datadog + LangSmith).
+    /// Each entry creates a separate instance-scoped `OtelObserver`, all wrapped
+    /// in a `MultiObserver`. When non-empty, `otel_endpoint`/`otel_headers` are
+    /// still included as the first endpoint (backwards compatible).
+    /// ```toml
+    /// [[observability.otel_endpoints]]
+    /// endpoint = "http://datadog-agent:4318"
+    ///
+    /// [[observability.otel_endpoints]]
+    /// endpoint = "https://api.smith.langchain.com/otel"
+    /// [observability.otel_endpoints.headers]
+    /// x-api-key = "lsv2_..."
+    /// ```
+    #[serde(default)]
+    pub otel_endpoints: Vec<OtelEndpointConfig>,
+
     /// Log persistence mode: "none" | "rolling" | "full".
     /// Controls whether every event passing through `zeroclaw_log::record!`
     /// is appended to the on-disk JSONL log.
@@ -10327,6 +10365,7 @@ impl Default for ObservabilityConfig {
             otel_endpoint: None,
             otel_service_name: None,
             otel_headers: None,
+            otel_endpoints: Vec::new(),
             log_persistence: default_log_persistence(),
             log_persistence_path: default_log_persistence_path(),
             log_persistence_max_entries: default_log_persistence_max_entries(),
