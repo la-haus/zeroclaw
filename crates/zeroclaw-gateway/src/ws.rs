@@ -186,6 +186,51 @@ fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) ->
     None
 }
 
+/// Maximum accepted length of an `agent` alias from the WebSocket query.
+///
+/// Aliases configured under `[agents.<alias>]` are already capped at 63 chars
+/// by `validate_alias_key`; this bound only guards the on-demand path where the
+/// alias arrives untrusted from `?agent=<alias>`. 128 leaves head-room for
+/// callers that namespace tenants into the alias while staying well below any
+/// filesystem `NAME_MAX`.
+const MAX_AGENT_ALIAS_LEN: usize = 128;
+
+/// Reject an `agent` alias that is not a filesystem-safe identifier.
+///
+/// The alias arrives untrusted from the `?agent=<alias>` WebSocket query param
+/// and flows directly into filesystem paths — the per-agent workspace dir
+/// (`Config::agent_workspace_dir` joins the raw alias), the SQLite/markdown
+/// memory store, and on-demand template instantiation. An alias carrying path
+/// separators or `..` would escape the intended `<install>/agents/<alias>/`
+/// subtree (e.g. `?agent=../../etc/cron.d`), so it must be validated *before*
+/// any path is built or any on-demand agent is materialised.
+///
+/// "Safe" here is deliberately a strict superset of `validate_alias_key`
+/// (lowercase, single underscore, no hyphen): every legitimately-configured
+/// alias passes this gate, while the on-demand path additionally tolerates
+/// mixed case, hyphens, and dots (`empresa-123`, `cx_acme`). The rules:
+///
+/// - non-empty, at most [`MAX_AGENT_ALIAS_LEN`] bytes;
+/// - every char in `[A-Za-z0-9._-]` — bans `/`, `\`, NUL, whitespace, etc.;
+/// - no `..` anywhere — bans the parent-directory traversal component;
+/// - must not start with `.` or `-` — bans hidden/dotfile names and aliases
+///   that could be mistaken for CLI flags.
+fn is_safe_agent_alias(alias: &str) -> bool {
+    if alias.is_empty() || alias.len() > MAX_AGENT_ALIAS_LEN {
+        return false;
+    }
+    if alias.contains("..") {
+        return false;
+    }
+    let first = alias.as_bytes()[0];
+    if first == b'.' || first == b'-' {
+        return false;
+    }
+    alias
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// GET /ws/chat — WebSocket upgrade for agent chat
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
@@ -225,6 +270,19 @@ pub async fn handle_ws_chat(
         )
             .into_response();
     };
+    // Reject path-traversal / unsafe aliases up-front. The alias flows into
+    // filesystem paths (workspace dir, SQLite/markdown memory) and on-demand
+    // instantiation; an alias with `..`, `/`, or `\` could escape the agent's
+    // intended subtree. Applied to BOTH explicit and on-demand aliases — every
+    // configured alias already satisfies the stricter `validate_alias_key`, so
+    // this never rejects a legitimately-configured agent.
+    if !is_safe_agent_alias(&agent_alias) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "Invalid `agent` alias — must be a filesystem-safe identifier (letters, digits, `.`, `_`, `-`; no `/`, `\\`, or `..`; not starting with `.`/`-`; ≤128 chars).",
+        )
+            .into_response();
+    }
     {
         // Accept the upgrade when the alias is either explicitly configured
         // OR can be instantiated on-demand from the gateway template agent
@@ -1729,6 +1787,50 @@ fn append_attachment_markers(content: &mut String, parsed: &serde_json::Value) {
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn safe_agent_alias_accepts_normal_aliases() {
+        assert!(is_safe_agent_alias("empresa-123"));
+        assert!(is_safe_agent_alias("cx_acme"));
+        assert!(is_safe_agent_alias("default"));
+        assert!(is_safe_agent_alias("prod_v2"));
+        assert!(is_safe_agent_alias("Tenant.Acme_01"));
+        assert!(is_safe_agent_alias("a"));
+    }
+
+    #[test]
+    fn safe_agent_alias_rejects_parent_traversal() {
+        assert!(!is_safe_agent_alias(".."));
+        assert!(!is_safe_agent_alias("../../etc/cron.d"));
+        assert!(!is_safe_agent_alias("foo/../bar"));
+        assert!(!is_safe_agent_alias("a..b"));
+    }
+
+    #[test]
+    fn safe_agent_alias_rejects_path_separators() {
+        assert!(!is_safe_agent_alias("foo/bar"));
+        assert!(!is_safe_agent_alias("/etc/passwd"));
+        assert!(!is_safe_agent_alias("foo\\bar"));
+        assert!(!is_safe_agent_alias("C:\\Windows"));
+    }
+
+    #[test]
+    fn safe_agent_alias_rejects_leading_dot_or_dash() {
+        assert!(!is_safe_agent_alias(".hidden"));
+        assert!(!is_safe_agent_alias("-rf"));
+        assert!(!is_safe_agent_alias(".ssh"));
+    }
+
+    #[test]
+    fn safe_agent_alias_rejects_empty_oversized_and_funky_chars() {
+        assert!(!is_safe_agent_alias(""));
+        assert!(!is_safe_agent_alias(&"a".repeat(MAX_AGENT_ALIAS_LEN + 1)));
+        assert!(is_safe_agent_alias(&"a".repeat(MAX_AGENT_ALIAS_LEN)));
+        assert!(!is_safe_agent_alias("space here"));
+        assert!(!is_safe_agent_alias("tab\there"));
+        assert!(!is_safe_agent_alias("nul\0byte"));
+        assert!(!is_safe_agent_alias("emoji😀"));
+    }
 
     #[test]
     fn extract_ws_token_from_authorization_header() {
