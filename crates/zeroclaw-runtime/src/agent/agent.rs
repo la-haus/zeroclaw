@@ -206,6 +206,11 @@ pub struct Agent {
     /// Channel name stamped onto observer events to identify the calling surface
     /// (e.g. "agent", "wss", "gateway"). Defaults to "agent" for direct Agent callers.
     channel_name: String,
+    /// Optional JSON schema for structured output forcing. When set, the agent
+    /// makes one extra LLM call with a forced `structured_output` tool to format
+    /// the final response according to this schema. Consumed (taken) after use —
+    /// single-message sessions only. Configure via `set_output_schema()`.
+    output_schema: Option<serde_json::Value>,
 }
 
 impl Drop for Agent {
@@ -699,6 +704,7 @@ impl AgentBuilder {
             channel_handles: AgentChannelHandles::default(),
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
+            output_schema: None,
         })
     }
 }
@@ -881,6 +887,14 @@ impl Agent {
 
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
         self.memory_session_id = session_id;
+    }
+
+    /// Set the output schema for structured output forcing. When set, the final
+    /// response of the next turn is reformatted as JSON matching this schema via
+    /// one extra forced-tool LLM call. Consumed after the turn (single-message
+    /// sessions only).
+    pub fn set_output_schema(&mut self, schema: Option<serde_json::Value>) {
+        self.output_schema = schema;
     }
 
     pub fn set_temperature(&mut self, temperature: Option<f64>) {
@@ -1714,6 +1728,186 @@ impl Agent {
                 }
             }
             None => response,
+        }
+    }
+
+    /// Number of tool-call iterations recorded in `messages` this turn. Used to
+    /// decide whether `output_schema_auto` cleanup should run.
+    fn count_tool_iterations(messages: &[ConversationMessage]) -> usize {
+        messages
+            .iter()
+            .filter(|m| matches!(m, ConversationMessage::AssistantToolCalls { .. }))
+            .count()
+    }
+
+    /// Default cleanup prompt for `output_schema_auto`. Domain-specific
+    /// overrides come from `output_schema_auto_prompt`.
+    const AUTO_CLEANUP_DEFAULT_PROMPT: &'static str = "Extract the final user-facing message from this response. \
+         Remove any reasoning, planning, internal commentary, and \
+         duplicated content. If the message appears repeated, include \
+         it only once. Keep all formatting, emojis, and data intact.";
+
+    /// Make one extra forced-tool LLM call to strip reasoning/planning from
+    /// `final_text`, returning the cleaned text and the call's `(input,
+    /// output)` token usage. Returns `None` when the call fails or yields no
+    /// usable text, in which case the caller keeps the original response.
+    ///
+    /// Backs `output_schema_auto`: the result stays a plain string.
+    async fn forced_auto_cleanup(
+        &self,
+        final_text: &str,
+        model: &str,
+    ) -> Option<(String, Option<(u64, u64)>)> {
+        let prompt = self
+            .config
+            .resolved
+            .output_schema_auto_prompt
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(Self::AUTO_CLEANUP_DEFAULT_PROMPT);
+
+        let auto_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "response": { "type": "string", "description": prompt }
+            },
+            "required": ["response"]
+        });
+        let tool_specs = [zeroclaw_api::tool::ToolSpec {
+            name: "structured_output".to_string(),
+            description: "Extract the final user-facing message.".to_string(),
+            parameters: auto_schema,
+        }];
+        let cleanup_messages = [
+            ChatMessage::system(prompt.to_string()),
+            ChatMessage::user(final_text.to_string()),
+        ];
+
+        let result = zeroclaw_api::TOOL_CHOICE_OVERRIDE
+            .scope(Some("tool:structured_output".to_string()), async {
+                self.model_provider
+                    .chat(
+                        zeroclaw_providers::ChatRequest {
+                            messages: &cleanup_messages,
+                            tools: Some(&tool_specs),
+                            thinking: None,
+                        },
+                        model,
+                        self.temperature,
+                    )
+                    .await
+            })
+            .await;
+
+        match result {
+            Ok(resp) => {
+                let clean = resp
+                    .tool_calls
+                    .first()
+                    .and_then(|tc| serde_json::from_str::<serde_json::Value>(&tc.arguments).ok())
+                    .and_then(|v| {
+                        v.get("response")
+                            .and_then(|r| r.as_str())
+                            .map(|s| s.trim().to_string())
+                    })
+                    .filter(|s| !s.is_empty())?;
+                let tokens = resp
+                    .usage
+                    .as_ref()
+                    .and_then(|u| u.input_tokens.zip(u.output_tokens));
+                Some((clean, tokens))
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({ "error": format!("{e}") })),
+                    "Auto output cleanup failed; using original response"
+                );
+                None
+            }
+        }
+    }
+
+    /// Make one extra forced-tool LLM call that reformats `final_text` into JSON
+    /// matching `schema`, returning the JSON string and the call's `(input,
+    /// output)` token usage. Returns `None` when the call fails or returns no
+    /// tool call, in which case the caller falls back to the raw text.
+    ///
+    /// Backs `output_schema`: uses a minimal context (system + the response
+    /// text) so it never depends on history compaction settings.
+    async fn forced_structured_output(
+        &self,
+        final_text: &str,
+        schema: serde_json::Value,
+        model: &str,
+    ) -> Option<(String, Option<(u64, u64)>)> {
+        let tool_specs = [zeroclaw_api::tool::ToolSpec {
+            name: "structured_output".to_string(),
+            description: "Format the final response according to the required schema.".to_string(),
+            parameters: schema,
+        }];
+        let messages = [
+            ChatMessage::system(
+                "You are a formatting assistant. Use the structured_output tool \
+                 to extract the requested fields from the provided text. \
+                 Do not add commentary."
+                    .to_string(),
+            ),
+            ChatMessage::user(final_text.to_string()),
+        ];
+
+        let result = zeroclaw_api::TOOL_CHOICE_OVERRIDE
+            .scope(Some("tool:structured_output".to_string()), async {
+                self.model_provider
+                    .chat(
+                        zeroclaw_providers::ChatRequest {
+                            messages: &messages,
+                            tools: Some(&tool_specs),
+                            thinking: None,
+                        },
+                        model,
+                        self.temperature,
+                    )
+                    .await
+            })
+            .await;
+
+        match result {
+            Ok(resp) => {
+                let json_str = resp.tool_calls.first().map(|tc| tc.arguments.clone())?;
+                let tokens = resp
+                    .usage
+                    .as_ref()
+                    .and_then(|u| u.input_tokens.zip(u.output_tokens));
+                Some((json_str, tokens))
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({ "error": format!("{e}") })),
+                    "Structured output forcing failed; falling back to raw text"
+                );
+                None
+            }
+        }
+    }
+
+    /// Replace the content of the last `assistant` chat message in `messages`
+    /// with `content`. No-op when there is no such message. Keeps the persisted
+    /// transcript consistent with the user-visible response after auto cleanup.
+    fn replace_last_assistant_chat(messages: &mut [ConversationMessage], content: &str) {
+        if let Some(ConversationMessage::Chat(msg)) = messages
+            .iter_mut()
+            .rev()
+            .find(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "assistant"))
+        {
+            msg.content = content.to_string();
         }
     }
 
@@ -2571,6 +2765,76 @@ impl Agent {
                     if has_more_steering {
                         continue;
                     }
+
+                    // === AUTO OUTPUT CLEANUP (output_schema_auto) ===
+                    // When enabled and this turn used at least
+                    // `keep_tool_context_turns` tool iterations, make one extra
+                    // forced-tool LLM call to strip reasoning/planning from the
+                    // response. Result stays a plain string — transparent to
+                    // consumers. Skipped when `output_schema` is set (structured
+                    // output below takes priority).
+                    let tool_iterations = Self::count_tool_iterations(&new_msgs);
+                    if self.config.resolved.output_schema_auto
+                        && tool_iterations + 1 >= self.config.resolved.keep_tool_context_turns
+                        && self.output_schema.is_none()
+                        && let Some((clean, tokens)) = self
+                            .forced_auto_cleanup(&committed_response, &effective_model)
+                            .await
+                    {
+                        if let Some((input, output)) = tokens {
+                            guard.total_input_tokens += input;
+                            guard.total_output_tokens += output;
+                            guard.saw_usage = true;
+                        }
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_attrs(::serde_json::json!({
+                                "original_len": committed_response.len(),
+                                "clean_len": clean.len(),
+                                "tool_iterations": tool_iterations,
+                            })),
+                            "Auto output cleanup applied"
+                        );
+                        Self::replace_last_assistant_chat(&mut new_msgs, &clean);
+                        Self::replace_last_assistant_chat(&mut self.history, &clean);
+                        committed_response = clean;
+                    }
+                    // === END AUTO OUTPUT CLEANUP ===
+
+                    // === STRUCTURED OUTPUT FORCING (output_schema) ===
+                    // When `output_schema` is set, make one extra forced-tool
+                    // LLM call that reformats the final response into JSON
+                    // matching the schema. The JSON becomes the returned
+                    // response and is appended to history. Bypasses the response
+                    // cache (schema is per-message) and the receipts block
+                    // (which would corrupt the JSON).
+                    if let Some(schema) = self.output_schema.take()
+                        && let Some((json_str, tokens)) = self
+                            .forced_structured_output(&committed_response, schema, &effective_model)
+                            .await
+                    {
+                        if let Some((input, output)) = tokens {
+                            guard.total_input_tokens += input;
+                            guard.total_output_tokens += output;
+                            guard.saw_usage = true;
+                        }
+                        let json_msg =
+                            ConversationMessage::Chat(ChatMessage::assistant(json_str.clone()));
+                        new_msgs.push(json_msg.clone());
+                        self.history.push(json_msg);
+                        self.trim_history();
+                        self.observer.record_event(&ObserverEvent::TurnComplete);
+                        return Ok(StreamedTurnSuccess {
+                            response: json_str,
+                            new_messages: new_msgs,
+                        });
+                    }
+                    // === END STRUCTURED OUTPUT ===
 
                     // Cache put only when the turn was a single tool-free
                     // exchange, mirroring the old "no tool calls" condition.

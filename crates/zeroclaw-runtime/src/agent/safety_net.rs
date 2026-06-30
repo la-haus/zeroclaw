@@ -2084,3 +2084,150 @@ async fn safety_net_loop_cron_add_does_not_trust_model_supplied_approved_arg() {
         "model-supplied approved=true must be stripped even with no approval gate"
     );
 }
+
+// ── structured output + auto reasoning cleanup (ported fork features) ────
+// Ported from fork commits fdd47eda (output_schema), 890ee4e6 +
+// 89efef4b (output_schema_auto + configurable prompt). The forced
+// extraction calls reuse the shared `chat` path, so the ScriptedProvider
+// queue feeds both the tool loop and the trailing forced call.
+
+fn structured_tool_response(arguments: &str) -> ChatResponse {
+    ChatResponse {
+        text: None,
+        tool_calls: vec![ToolCall {
+            id: "tc_forced".into(),
+            name: "structured_output".into(),
+            arguments: arguments.into(),
+            extra_content: None,
+        }],
+        usage: Some(token_usage(100, 20)),
+        reasoning_content: None,
+    }
+}
+
+fn output_object_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "message": {"type": "string"},
+            "action": {"type": "string", "enum": ["SEND", "NO_REPLY"]}
+        },
+        "required": ["message", "action"]
+    })
+}
+
+#[tokio::test]
+async fn output_schema_forces_structured_json_response() {
+    // Final turn text, then a forced structured_output tool call whose
+    // arguments become the returned response.
+    let provider = ScriptedProvider::new(vec![
+        text_response("\u{2615} \u{a1}Buen d\u{ed}a! Hoy tienes 3 citas."),
+        structured_tool_response(
+            r#"{"message":"☕ ¡Buen día! Hoy tienes 3 citas.","action":"SEND"}"#,
+        ),
+    ]);
+    let mut agent = build_agent(Box::new(provider), vec![]);
+    agent.set_output_schema(Some(output_object_schema()));
+
+    let (tx, _rx) = mpsc::channel(256);
+    let outcome = agent
+        .turn_streamed_with_steering_state("daily briefing", tx, None, None)
+        .await
+        .expect("streamed turn should succeed");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&outcome.response).expect("response must be valid JSON");
+    assert_eq!(parsed["action"], "SEND");
+    assert!(parsed["message"].as_str().unwrap().contains("3 citas"));
+}
+
+#[tokio::test]
+async fn output_schema_auto_strips_reasoning_above_threshold() {
+    // 5 native tool iterations, then a final response contaminated with
+    // reasoning, then a cleanup forced call returning only the user message.
+    // keep_tool_context_turns = 2 → 5 + 1 >= 2 triggers cleanup.
+    let mut script: Vec<ChatResponse> = (0..5)
+        .map(|i| tool_response(vec![tool_call(&format!("tc{i}"), "echo")]))
+        .collect();
+    script.push(text_response(
+        "Let me analyze the data. I found 69 visits.\n\n\u{2615} \u{a1}Buen d\u{ed}a! Hoy tienes *69 citas*.",
+    ));
+    script.push(structured_tool_response(
+        r#"{"response":"☕ ¡Buen día! Hoy tienes *69 citas*."}"#,
+    ));
+
+    let resolved = zeroclaw_config::schema::ResolvedRuntime {
+        output_schema_auto: true,
+        keep_tool_context_turns: 2,
+        max_tool_iterations: 25,
+        ..zeroclaw_config::schema::ResolvedRuntime::default()
+    };
+    let mut agent = build_agent_with_runtime(
+        Box::new(ScriptedProvider::new(script)),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::new(AtomicUsize::new(0)),
+        })],
+        resolved,
+    );
+
+    let (tx, _rx) = mpsc::channel(256);
+    let outcome = agent
+        .turn_streamed_with_steering_state("briefing del d\u{ed}a", tx, None, None)
+        .await
+        .expect("streamed turn should succeed");
+
+    assert!(
+        !outcome.response.contains("Let me analyze"),
+        "reasoning must be stripped: {}",
+        outcome.response
+    );
+    assert!(
+        outcome.response.contains("69 citas"),
+        "cleaned briefing content must survive: {}",
+        outcome.response
+    );
+}
+
+#[tokio::test]
+async fn output_schema_takes_priority_over_auto_cleanup() {
+    // Both output_schema and output_schema_auto are active and iterations
+    // exceed the threshold, but output_schema wins: auto cleanup is skipped
+    // and the structured JSON is returned. If auto wrongly ran first it would
+    // consume the structured response and fall back to raw text.
+    let mut script: Vec<ChatResponse> = (0..3)
+        .map(|i| tool_response(vec![tool_call(&format!("tc{i}"), "echo")]))
+        .collect();
+    script.push(text_response(
+        "Reasoning here. \u{2615} \u{a1}Buen d\u{ed}a!",
+    ));
+    script.push(structured_tool_response(
+        r#"{"message":"☕ ¡Buen día!","action":"SEND"}"#,
+    ));
+
+    let resolved = zeroclaw_config::schema::ResolvedRuntime {
+        output_schema_auto: true,
+        keep_tool_context_turns: 2,
+        max_tool_iterations: 25,
+        ..zeroclaw_config::schema::ResolvedRuntime::default()
+    };
+    let mut agent = build_agent_with_runtime(
+        Box::new(ScriptedProvider::new(script)),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::new(AtomicUsize::new(0)),
+        })],
+        resolved,
+    );
+    agent.set_output_schema(Some(output_object_schema()));
+
+    let (tx, _rx) = mpsc::channel(256);
+    let outcome = agent
+        .turn_streamed_with_steering_state("report", tx, None, None)
+        .await
+        .expect("streamed turn should succeed");
+
+    let parsed: serde_json::Value = serde_json::from_str(&outcome.response)
+        .expect("structured output (not auto cleanup) must win and return JSON");
+    assert_eq!(parsed["action"], "SEND");
+}

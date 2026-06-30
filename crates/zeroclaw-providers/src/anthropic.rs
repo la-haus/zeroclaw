@@ -789,6 +789,16 @@ impl AnthropicModelProvider {
     /// temperature (forced to 1.0 when thinking is active), the thinking
     /// config for the request body, and the effective max_tokens (raised to
     /// meet budget_tokens minimum when needed).
+    /// True when the resolved `tool_choice` forces a specific tool, i.e. it is
+    /// `{"type":"tool","name":...}`. Anthropic rejects this combined with
+    /// extended thinking, so callers drop thinking when it returns true.
+    fn tool_choice_forces_specific_tool(tool_choice: Option<&serde_json::Value>) -> bool {
+        tool_choice
+            .and_then(|tc| tc.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("tool")
+    }
+
     fn resolve_thinking(
         &self,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
@@ -1257,7 +1267,15 @@ impl ModelProvider for AnthropicModelProvider {
         let native_tools = Self::convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
-            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
+            tool_choice_override.map(|tc| {
+                // `tool:<name>` forces a specific tool (structured output
+                // forcing); plain strings ("any"/"auto") select a mode.
+                if let Some(tool_name) = tc.strip_prefix("tool:") {
+                    serde_json::json!({ "type": "tool", "name": tool_name })
+                } else {
+                    serde_json::json!({ "type": tc })
+                }
+            })
         } else {
             None
         };
@@ -1271,6 +1289,15 @@ impl ModelProvider for AnthropicModelProvider {
 
         let (effective_temperature, thinking_config, effective_max_tokens) =
             self.resolve_thinking(request.thinking, temperature, model);
+        // Anthropic rejects extended thinking combined with a forced
+        // `tool_choice: {"type":"tool"}` (HTTP 400). Disable thinking when a
+        // specific tool is forced (structured output forcing).
+        let (effective_temperature, thinking_config, effective_max_tokens) =
+            if Self::tool_choice_forces_specific_tool(tool_choice.as_ref()) {
+                (temperature, None, self.max_tokens)
+            } else {
+                (effective_temperature, thinking_config, effective_max_tokens)
+            };
 
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
@@ -1452,7 +1479,15 @@ impl ModelProvider for AnthropicModelProvider {
         let native_tools = Self::convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
-            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
+            tool_choice_override.map(|tc| {
+                // `tool:<name>` forces a specific tool (structured output
+                // forcing); plain strings ("any"/"auto") select a mode.
+                if let Some(tool_name) = tc.strip_prefix("tool:") {
+                    serde_json::json!({ "type": "tool", "name": tool_name })
+                } else {
+                    serde_json::json!({ "type": tc })
+                }
+            })
         } else {
             None
         };
@@ -1465,6 +1500,15 @@ impl ModelProvider for AnthropicModelProvider {
 
         let (effective_temperature, thinking_config, effective_max_tokens) =
             self.resolve_thinking(request.thinking, temperature, model);
+        // Anthropic rejects extended thinking combined with a forced
+        // `tool_choice: {"type":"tool"}` (HTTP 400) — see `chat()`. Disable
+        // thinking when a specific tool is forced (structured output forcing).
+        let (effective_temperature, thinking_config, effective_max_tokens) =
+            if Self::tool_choice_forces_specific_tool(tool_choice.as_ref()) {
+                (temperature, None, self.max_tokens)
+            } else {
+                (effective_temperature, thinking_config, effective_max_tokens)
+            };
 
         // When native thinking is enabled, streamed `thinking_delta` /
         // `signature_delta` SSE events are not yet parsed into
@@ -2171,6 +2215,64 @@ data: {\"type\":\"message_stop\"}\n\n";
             let json = serde_json::to_string(&req).unwrap();
             assert!(json.contains(&format!("{temp}")));
         }
+    }
+
+    #[test]
+    fn tool_choice_override_with_tool_prefix_produces_named_choice() {
+        // The `tool:name` format should produce {"type":"tool","name":"name"}
+        let tc = "tool:structured_output".to_string();
+        let result = if let Some(tool_name) = tc.strip_prefix("tool:") {
+            serde_json::json!({ "type": "tool", "name": tool_name })
+        } else {
+            serde_json::json!({ "type": tc })
+        };
+        assert_eq!(result["type"], "tool");
+        assert_eq!(result["name"], "structured_output");
+        assert!(AnthropicModelProvider::tool_choice_forces_specific_tool(
+            Some(&result)
+        ));
+    }
+
+    #[test]
+    fn tool_choice_override_without_prefix_produces_type_only() {
+        // Plain strings like "any" or "auto" should produce {"type":"any"}
+        let tc = "any".to_string();
+        let result = if let Some(tool_name) = tc.strip_prefix("tool:") {
+            serde_json::json!({ "type": "tool", "name": tool_name })
+        } else {
+            serde_json::json!({ "type": tc })
+        };
+        assert_eq!(result["type"], "any");
+        assert!(result.get("name").is_none());
+        assert!(!AnthropicModelProvider::tool_choice_forces_specific_tool(
+            Some(&result)
+        ));
+    }
+
+    #[test]
+    fn forced_tool_choice_disables_native_thinking() {
+        // Anthropic rejects extended thinking + forced tool_choice. The guard
+        // in chat()/stream_chat() drops thinking when a specific tool is forced.
+        let provider = AnthropicModelProvider::new("test", Some("test-key"));
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+        };
+        // Sanity: without a forced tool, native thinking is enabled.
+        let (_, config, _) =
+            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-opus-4-6");
+        assert!(config.is_some(), "native thinking should resolve normally");
+
+        let forced = serde_json::json!({ "type": "tool", "name": "structured_output" });
+        assert!(AnthropicModelProvider::tool_choice_forces_specific_tool(
+            Some(&forced)
+        ));
+        let any = serde_json::json!({ "type": "any" });
+        assert!(!AnthropicModelProvider::tool_choice_forces_specific_tool(
+            Some(&any)
+        ));
+        assert!(!AnthropicModelProvider::tool_choice_forces_specific_tool(
+            None
+        ));
     }
 
     #[test]

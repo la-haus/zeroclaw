@@ -508,6 +508,11 @@ async fn handle_socket(
             if parsed["type"].as_str() == Some("message") {
                 let content = parsed["content"].as_str().unwrap_or("").to_string();
                 if !content.is_empty() {
+                    // Per-message `output_schema` forces structured JSON output
+                    // for this turn (single-message sessions).
+                    if let Some(schema) = parsed.get("output_schema") {
+                        agent.set_output_schema(Some(schema.clone()));
+                    }
                     let _session_guard = match state.session_queue.acquire(&session_key).await {
                         Ok(guard) => guard,
                         Err(e) => {
@@ -646,6 +651,12 @@ async fn handle_socket(
                     });
                     let _ = sender.send(Message::Text(err.to_string().into())).await;
                     continue;
+                }
+
+                // Per-message `output_schema` forces structured JSON output for
+                // this turn (single-message sessions). Consumed by the agent.
+                if let Some(schema) = parsed.get("output_schema") {
+                    agent.set_output_schema(Some(schema.clone()));
                 }
 
                 // Acquire session lock to serialize concurrent turns

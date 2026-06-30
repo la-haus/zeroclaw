@@ -3285,6 +3285,14 @@ pub struct ResolvedRuntime {
     pub max_tool_result_chars: usize,
     pub keep_tool_context_turns: usize,
     pub tool_receipts: ToolReceiptsConfig,
+    /// When true, automatically clean up reasoning from responses when the
+    /// turn's tool iterations exceed `keep_tool_context_turns`. The final
+    /// response remains a plain string (not JSON). Default: false.
+    pub output_schema_auto: bool,
+    /// Custom system prompt for the auto output cleanup call. When set,
+    /// overrides the default cleanup prompt (e.g. WhatsApp formatting).
+    /// `None`/empty uses the built-in default prompt.
+    pub output_schema_auto_prompt: Option<String>,
 }
 
 impl ResolvedRuntime {
@@ -3322,6 +3330,8 @@ impl Default for ResolvedRuntime {
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
             tool_receipts: ToolReceiptsConfig::default(),
+            output_schema_auto: false,
+            output_schema_auto_prompt: None,
         }
     }
 }
@@ -3799,6 +3809,18 @@ impl Config {
             .unwrap_or_else(default_keep_tool_context_turns)
     }
 
+    #[must_use]
+    pub fn effective_output_schema_auto(&self, agent_alias: &str) -> bool {
+        self.runtime_profile_for_agent(agent_alias)
+            .is_some_and(|p| p.output_schema_auto)
+    }
+
+    #[must_use]
+    pub fn effective_output_schema_auto_prompt(&self, agent_alias: &str) -> Option<String> {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.output_schema_auto_prompt.clone())
+    }
+
     /// Return a clone of the named agent's `AliasedAgentConfig` with all
     /// runtime-profile overrides baked in. Use this when an `Agent` (or
     /// any other struct) needs to own a self-contained, already-resolved
@@ -3837,6 +3859,8 @@ impl Config {
             resolved.context_compression = profile.context_compression.clone();
             resolved.tool_receipts = profile.tool_receipts.clone();
             resolved.tool_filter_groups = profile.tool_filter_groups.clone();
+            resolved.output_schema_auto = profile.output_schema_auto;
+            resolved.output_schema_auto_prompt = profile.output_schema_auto_prompt.clone();
         }
         out.resolved = resolved;
         Some(out)
@@ -10679,6 +10703,12 @@ pub struct RuntimeProfileConfig {
     #[nested]
     pub tool_receipts: ToolReceiptsConfig,
     pub tool_filter_groups: Vec<ToolFilterGroup>,
+    /// Automatically strip reasoning from the final response when the turn's
+    /// tool iterations exceed `keep_tool_context_turns`. Default: false.
+    pub output_schema_auto: bool,
+    /// Custom system prompt for the auto output cleanup call. `None` uses the
+    /// built-in default prompt.
+    pub output_schema_auto_prompt: Option<String>,
 }
 
 impl Default for RuntimeProfileConfig {
@@ -10710,6 +10740,8 @@ impl Default for RuntimeProfileConfig {
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             tool_receipts: ToolReceiptsConfig::default(),
             tool_filter_groups: Vec::new(),
+            output_schema_auto: false,
+            output_schema_auto_prompt: None,
         }
     }
 }
