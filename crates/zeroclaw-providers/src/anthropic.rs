@@ -1,6 +1,6 @@
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
+    ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
     StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
@@ -10,15 +10,27 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::tool::ToolSpec;
 
-pub struct AnthropicProvider {
+/// Anthropic's API documentation lists 1.0 as the default sampling temperature.
+const TEMPERATURE_DEFAULT: f64 = 1.0;
+/// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
+pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
+/// Max wait for the next SSE line before the stream is treated as stalled.
+/// reqwest's overall `.timeout()` does not reliably fire once a streaming body
+/// is being drained chunk-by-chunk, so a connection that goes silent after
+/// `message_start` (proxy/load-balancer hiccup) parks `next_line().await`
+/// forever — the detached parser task leaks and the turn hangs on "working".
+/// A per-line idle bound converts that into a retryable `StreamError`.
+const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+use crate::stream_guard::AbortOnDrop;
+
+pub struct AnthropicModelProvider {
+    /// `[providers.models.anthropic.<alias>]` config-key alias.
+    alias: String,
     credential: Option<String>,
     base_url: String,
     max_tokens: u32,
-    /// When set, enables Anthropic extended thinking with the given budget.
-    extended_thinking_budget: Option<u32>,
 }
-
-const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 4096;
 
 #[cfg(test)]
 #[derive(Debug, Serialize)]
@@ -28,7 +40,8 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
     messages: Vec<Message>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
 }
 
 #[cfg(test)]
@@ -53,14 +66,6 @@ struct ContentBlock {
     text: Option<String>,
 }
 
-/// Extended thinking configuration for native Anthropic API requests.
-#[derive(Debug, Serialize)]
-struct NativeThinkingConfig {
-    #[serde(rename = "type")]
-    kind: String,
-    budget_tokens: u32,
-}
-
 #[derive(Debug, Serialize)]
 struct NativeChatRequest<'a> {
     model: String,
@@ -68,7 +73,8 @@ struct NativeChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<SystemPrompt>,
     messages: Vec<NativeMessage>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,6 +83,23 @@ struct NativeChatRequest<'a> {
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<NativeThinkingConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeThinkingConfig {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    budget_tokens: u32,
+}
+
+/// Whether a model accepts the fixed-budget native-thinking request shape
+/// (`{"thinking": {"type": "enabled", "budget_tokens": N}}`). Opus 4.7 supports
+/// only adaptive thinking and rejects fixed budgets with a 400; until adaptive
+/// thinking is implemented, those models stay on prompt-based reasoning.
+/// Anthropic's extended-thinking docs:
+/// <https://platform.claude.com/docs/en/build-with-claude/extended-thinking>
+fn anthropic_model_supports_native_thinking(model: &str) -> bool {
+    !model.contains("claude-opus-4-7")
 }
 
 #[derive(Debug, Serialize)]
@@ -129,6 +152,15 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    /// Thinking block for round-tripping extended thinking in conversation
+    /// history. Required when thinking is enabled and assistant messages
+    /// contain tool_use blocks.
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -180,15 +212,20 @@ struct NativeChatResponse {
 
 #[derive(Debug, Deserialize)]
 struct AnthropicUsage {
+    /// Tokens *after* the last cache breakpoint — NOT the total prompt.
+    /// Per Anthropic prompt-caching docs:
+    /// total_input = cache_read + cache_creation + input_tokens.
     #[serde(default)]
     input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens: Option<u64>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    cache_creation_input_tokens: Option<u64>,
+    /// Tokens served from the prompt cache this request.
     #[serde(default)]
     cache_read_input_tokens: Option<u64>,
+    /// Tokens written to the prompt cache this request (cache miss path).
+    /// Disjoint from `cache_read_input_tokens` and `input_tokens`.
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,6 +235,11 @@ struct NativeContentIn {
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
+    thinking: Option<String>,
+    /// Signature for integrity verification of thinking blocks.
+    #[serde(default)]
+    signature: Option<String>,
+    #[serde(default)]
     id: Option<String>,
     #[serde(default)]
     name: Option<String>,
@@ -205,24 +247,24 @@ struct NativeContentIn {
     input: Option<serde_json::Value>,
 }
 
-impl AnthropicProvider {
-    pub fn new(credential: Option<&str>) -> Self {
-        Self::with_base_url(credential, None)
+impl AnthropicModelProvider {
+    pub fn new(alias: &str, credential: Option<&str>) -> Self {
+        Self::with_base_url(alias, credential, None)
     }
 
-    pub fn with_base_url(credential: Option<&str>, base_url: Option<&str>) -> Self {
+    pub fn with_base_url(alias: &str, credential: Option<&str>, base_url: Option<&str>) -> Self {
         let base_url = base_url
             .map(|u| u.trim_end_matches('/'))
-            .unwrap_or("https://api.anthropic.com")
+            .unwrap_or(BASE_URL)
             .to_string();
         Self {
+            alias: alias.to_string(),
             credential: credential
                 .map(str::trim)
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
             base_url,
-            max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
-            extended_thinking_budget: None,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
         }
     }
 
@@ -230,37 +272,6 @@ impl AnthropicProvider {
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
         self
-    }
-
-    /// Enable extended thinking with the given budget token count.
-    /// When enabled, the model's reasoning goes into separate `thinking` blocks
-    /// and `max_tokens` is automatically adjusted to be at least `budget + 1024`.
-    /// Enable extended thinking with the given budget token count.
-    /// When enabled, the model's reasoning goes into separate `thinking` blocks
-    /// and `max_tokens` is automatically adjusted to be at least `budget + 1024`.
-    pub fn with_extended_thinking_budget(mut self, budget: Option<u32>) -> Self {
-        self.extended_thinking_budget = budget;
-        self
-    }
-
-    /// Returns `(effective_max_tokens, Option<NativeThinkingConfig>)` based on
-    /// whether extended thinking is enabled.
-    /// Returns (effective_max_tokens, thinking_config, effective_temperature).
-    /// Anthropic requires `temperature = 1` when extended thinking is enabled.
-    fn thinking_params(&self, temperature: f64) -> (u32, Option<NativeThinkingConfig>, f64) {
-        match self.extended_thinking_budget {
-            Some(budget) if budget > 0 => {
-                // Anthropic requires max_tokens > budget_tokens
-                let effective_max = self.max_tokens.max(budget + 1024);
-                let config = NativeThinkingConfig {
-                    kind: "enabled".to_string(),
-                    budget_tokens: budget,
-                };
-                // Anthropic requires temperature = 1 when thinking is enabled
-                (effective_max, Some(config), 1.0)
-            }
-            _ => (self.max_tokens, None, temperature),
-        }
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -272,7 +283,25 @@ impl AnthropicProvider {
         request: reqwest::RequestBuilder,
         credential: &str,
     ) -> reqwest::RequestBuilder {
-        if Self::is_setup_token(credential) {
+        let is_setup = Self::is_setup_token(credential);
+        // Diagnostic for "401 invalid x-api-key" mysteries: when a provider
+        // is sending a credential the upstream rejects, this is the only
+        // line that nails what bytes actually went out. Logs header kind,
+        // length, first 8 chars (enough to identify api03 vs oat01 vs an
+        // accidental enc2: blob) and last 4 (smudge for tail integrity).
+        // No full credential — that stays out of logs.
+        let len = credential.len();
+        let head: String = credential.chars().take(8).collect();
+        let tail: String = credential
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"header": if is_setup { "Authorization" } else { "x-api-key" }, "credential_len": len, "credential_head": head, "credential_tail": tail})), "Anthropic auth header applied");
+        if is_setup {
             request
                 .header("Authorization", format!("Bearer {credential}"))
                 .header(
@@ -281,14 +310,7 @@ impl AnthropicProvider {
                 )
                 .header("anthropic-dangerous-direct-browser-access", "true")
         } else {
-            let req = request.header("x-api-key", credential);
-            // Add the interleaved-thinking beta header for API-key auth when
-            // extended thinking is enabled.
-            if self.extended_thinking_budget.is_some() {
-                req.header("anthropic-beta", "interleaved-thinking-2025-05-14")
-            } else {
-                req
-            }
+            request.header("x-api-key", credential)
         }
     }
 
@@ -317,12 +339,6 @@ impl AnthropicProvider {
         }
     }
 
-    /// Cache system prompts larger than ~1024 tokens (3KB of text)
-    #[allow(dead_code)]
-    fn should_cache_system(text: &str) -> bool {
-        text.len() > 3072
-    }
-
     /// Cache conversations with more than 1 non-system message (i.e. after first exchange)
     fn should_cache_conversation(messages: &[ChatMessage]) -> bool {
         messages.iter().filter(|m| m.role != "system").count() > 1
@@ -340,7 +356,8 @@ impl AnthropicProvider {
                 }
                 NativeContentOut::ToolUse { .. }
                 | NativeContentOut::Image { .. }
-                | NativeContentOut::Document { .. } => {}
+                | NativeContentOut::Document { .. }
+                | NativeContentOut::Thinking { .. } => {}
             }
         }
     }
@@ -375,6 +392,36 @@ impl AnthropicProvider {
             .and_then(|v| serde_json::from_value::<Vec<ProviderToolCall>>(v.clone()).ok())?;
 
         let mut blocks = Vec::new();
+
+        // When extended thinking is enabled, assistant messages must start
+        // with thinking blocks (including signatures) before any tool_use
+        // blocks. The reasoning_content field stores JSON-encoded thinking
+        // blocks from the original response.
+        if let Some(reasoning) = value
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .filter(|r| !r.is_empty())
+        {
+            for part in reasoning.split('\n') {
+                if let Ok(block) = serde_json::from_str::<serde_json::Value>(part) {
+                    let thinking = block
+                        .get("thinking")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let signature = block
+                        .get("signature")
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+                    blocks.push(NativeContentOut::Thinking {
+                        thinking,
+                        signature,
+                    });
+                }
+            }
+        }
+
         if let Some(text) = value
             .get("content")
             .and_then(serde_json::Value::as_str)
@@ -424,7 +471,10 @@ impl AnthropicProvider {
         let mut system_text = None;
         let mut native_messages = Vec::new();
 
-        for msg in messages {
+        for (index, msg) in messages.iter().enumerate() {
+            if ChatMessage::should_skip_internal_pruning_marker(messages, index) {
+                continue;
+            }
             match msg.role.as_str() {
                 "system" => {
                     if system_text.is_none() {
@@ -530,7 +580,11 @@ impl AnthropicProvider {
                         });
                     }
 
-                    // Parse document markers from text (after image markers removed)
+                    // Parse document markers from the text (after image markers
+                    // were removed). Base64 `data:` document references become
+                    // native `document` content blocks (Anthropic accepts
+                    // application/pdf via base64); CSV/plain text are already
+                    // inlined upstream by the multimodal pipeline.
                     let (text, doc_refs) =
                         crate::multimodal::parse_document_markers(&text_after_images);
 
@@ -594,6 +648,8 @@ impl AnthropicProvider {
             }
         }
 
+        Self::backfill_orphaned_tool_uses(&mut native_messages);
+
         // Always use Blocks format with cache_control for system prompts
         let system_prompt = system_text.map(|text| {
             SystemPrompt::Blocks(vec![SystemBlock {
@@ -606,31 +662,138 @@ impl AnthropicProvider {
         (system_prompt, native_messages)
     }
 
+    /// Pair any orphaned `tool_use` with a stub `tool_result` so interrupted
+    /// turns can't wedge the session with a hard 400 on replay. Defensive
+    /// backstop for the canonical-history guard in the runtime.
+    fn backfill_orphaned_tool_uses(messages: &mut Vec<NativeMessage>) {
+        let mut idx = 0;
+        while idx < messages.len() {
+            let pending: Vec<String> = messages[idx]
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    NativeContentOut::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            if pending.is_empty() {
+                idx += 1;
+                continue;
+            }
+
+            let answered: std::collections::HashSet<String> = messages
+                .get(idx + 1)
+                .map(|next| {
+                    next.content
+                        .iter()
+                        .filter_map(|block| match block {
+                            NativeContentOut::ToolResult { tool_use_id, .. } => {
+                                Some(tool_use_id.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let stubs: Vec<NativeContentOut> = pending
+                .into_iter()
+                .filter(|id| !answered.contains(id))
+                .map(|tool_use_id| NativeContentOut::ToolResult {
+                    tool_use_id,
+                    content: "[tool result missing from history — the turn was \
+                              interrupted before this tool finished]"
+                        .to_string(),
+                    cache_control: None,
+                })
+                .collect();
+
+            if !stubs.is_empty() {
+                if messages
+                    .get(idx + 1)
+                    .is_some_and(|next| next.role == "user")
+                {
+                    let next = &mut messages[idx + 1];
+                    let mut merged = stubs;
+                    merged.append(&mut next.content);
+                    next.content = merged;
+                } else {
+                    messages.insert(
+                        idx + 1,
+                        NativeMessage {
+                            role: "user".to_string(),
+                            content: stubs,
+                        },
+                    );
+                }
+            }
+
+            idx += 1;
+        }
+    }
+
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
         let mut text_parts = Vec::new();
-        let mut tool_calls = Vec::new();
         let mut thinking_parts = Vec::new();
+        let mut tool_calls = Vec::new();
 
-        let usage = response.usage.map(|u| TokenUsage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-            cached_input_tokens: u.cache_read_input_tokens,
+        let usage = response.usage.map(|u| {
+            // Anthropic's three input buckets are DISJOINT per
+            // https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+            //
+            //   total_input_tokens = cache_read_input_tokens
+            //                      + cache_creation_input_tokens
+            //                      + input_tokens
+            //
+            // Anthropic's `input_tokens` is the tokens AFTER the last cache
+            // breakpoint, not the total prompt. The other two are tokens
+            // before the breakpoint (read from cache vs. being written now).
+            //
+            // Our internal TokenUsage contract is that `input_tokens` is the
+            // *total* prompt sent to the model. Sum all three to normalize.
+            // `cached_input_tokens` is reported as the cache-read portion
+            // (the discounted-billing subset of the total) — this matches
+            // what billable_uncached_input = input - cached expects.
+            let uncached = u.input_tokens.unwrap_or(0);
+            let cache_read = u.cache_read_input_tokens.unwrap_or(0);
+            let cache_create = u.cache_creation_input_tokens.unwrap_or(0);
+            let total = uncached
+                .saturating_add(cache_read)
+                .saturating_add(cache_create);
+            let any_reported = u.input_tokens.is_some()
+                || u.cache_read_input_tokens.is_some()
+                || u.cache_creation_input_tokens.is_some();
+            TokenUsage {
+                input_tokens: if any_reported { Some(total) } else { None },
+                output_tokens: u.output_tokens,
+                cached_input_tokens: u.cache_read_input_tokens,
+            }
         });
 
         for block in response.content {
             match block.kind.as_str() {
-                "thinking" => {
-                    if let Some(text) = block.text.map(|t| t.trim().to_string())
-                        && !text.is_empty()
-                    {
-                        thinking_parts.push(text);
-                    }
-                }
                 "text" => {
                     if let Some(text) = block.text.map(|t| t.trim().to_string())
                         && !text.is_empty()
                     {
                         text_parts.push(text);
+                    }
+                }
+                "thinking" => {
+                    // Store thinking text byte-for-byte: the signature is
+                    // computed over the exact bytes the model returned, so
+                    // any mutation (including trim()) invalidates it on
+                    // replay. Only skip when the provider returns genuinely
+                    // empty content.
+                    if let Some(thinking) = block.thinking.as_deref().or(block.text.as_deref())
+                        && !thinking.is_empty()
+                    {
+                        let json_block = serde_json::json!({
+                            "thinking": thinking,
+                            "signature": block.signature.as_deref().unwrap_or(""),
+                        });
+                        thinking_parts.push(json_block.to_string());
                     }
                 }
                 "tool_use" => {
@@ -645,11 +808,18 @@ impl AnthropicProvider {
                         id: block.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                         name,
                         arguments: arguments.to_string(),
+                        extra_content: None,
                     });
                 }
                 _ => {}
             }
         }
+
+        let reasoning_content = if thinking_parts.is_empty() {
+            None
+        } else {
+            Some(thinking_parts.join("\n"))
+        };
 
         ProviderChatResponse {
             text: if text_parts.is_empty() {
@@ -659,17 +829,70 @@ impl AnthropicProvider {
             },
             tool_calls,
             usage,
-            reasoning_content: if thinking_parts.is_empty() {
-                None
-            } else {
-                Some(thinking_parts.join("\n"))
-            },
+            reasoning_content,
+        }
+    }
+
+    /// Resolve thinking parameters for an API request. Returns the effective
+    /// temperature (forced to 1.0 when thinking is active), the thinking
+    /// config for the request body, and the effective max_tokens (raised to
+    /// meet budget_tokens minimum when needed).
+    /// True when the resolved `tool_choice` forces a specific tool, i.e. it is
+    /// `{"type":"tool","name":...}`. Anthropic rejects this combined with
+    /// extended thinking, so callers drop thinking when it returns true.
+    fn tool_choice_forces_specific_tool(tool_choice: Option<&serde_json::Value>) -> bool {
+        tool_choice
+            .and_then(|tc| tc.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("tool")
+    }
+
+    fn resolve_thinking(
+        &self,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+        temperature: Option<f64>,
+        model: &str,
+    ) -> (Option<f64>, Option<NativeThinkingConfig>, u32) {
+        match thinking {
+            Some(params) if anthropic_model_supports_native_thinking(model) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"budget_tokens": params.budget_tokens})),
+                    "Native extended thinking enabled; forcing temperature=1.0"
+                );
+                // API requires max_tokens > budget_tokens (strictly greater).
+                let min_required = params.budget_tokens + 1;
+                let max_tokens = self.max_tokens.max(min_required);
+                (
+                    Some(1.0),
+                    Some(NativeThinkingConfig {
+                        kind: "enabled",
+                        budget_tokens: params.budget_tokens,
+                    }),
+                    max_tokens,
+                )
+            }
+            Some(_) => {
+                // Caller asked for native thinking but the model rejects the
+                // fixed-budget request shape. Drop to prompt-based reasoning
+                // (the agent loop's prefix already injected) and keep the
+                // caller-supplied temperature so per-model guards still apply.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"model": model})),
+                    "Native extended thinking requested but model only supports adaptive thinking; falling back to prompt-based reasoning"
+                );
+                (temperature, None, self.max_tokens)
+            }
+            None => (temperature, None, self.max_tokens),
         }
     }
 
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "provider.anthropic",
+            "model_provider.anthropic",
             120,
             10,
         )
@@ -688,24 +911,66 @@ impl AnthropicProvider {
         response: reqwest::Response,
         tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
     ) {
-        use tokio::io::AsyncBufReadExt;
         use tokio_util::io::StreamReader;
 
         let byte_stream = response
             .bytes_stream()
             .map(|result| result.map_err(std::io::Error::other));
         let reader = StreamReader::new(byte_stream);
+        Self::parse_anthropic_sse_from_reader(reader, tx).await;
+    }
+
+    /// Inner loop split out of `parse_anthropic_sse` so unit tests can feed a
+    /// `Cursor<&[u8]>` directly without spinning up a mock HTTP server.
+    async fn parse_anthropic_sse_from_reader<R>(
+        reader: R,
+        tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+    ) where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        use tokio::io::AsyncBufReadExt;
+
         let mut lines = reader.lines();
 
         let mut tool_id: Option<String> = None;
         let mut tool_name: Option<String> = None;
         let mut tool_input_json = String::new();
-        let mut stream_input_tokens: u64 = 0;
-        let mut stream_output_tokens: u64 = 0;
-        let mut stream_cached_tokens: u64 = 0;
-        let mut in_thinking_block = false;
 
-        while let Ok(Some(line)) = lines.next_line().await {
+        // Anthropic emits usage in two places: `message_start` carries the
+        // input-token count + prompt-cache reads; `message_delta` carries
+        // running output-token totals (each delta supersedes the prior). We
+        // capture both, then emit one `StreamEvent::Usage` at `message_stop`
+        // so the gateway accumulator and `record_turn_cost()` see the same
+        // signal Anthropic sends — closes the original #6001 live repro,
+        // which was Anthropic-shaped streaming.
+        let mut input_tokens: Option<u64> = None;
+        let mut output_tokens: Option<u64> = None;
+        let mut cached_input_tokens: Option<u64> = None;
+        let mut cache_creation_input_tokens: Option<u64> = None;
+
+        while let Ok(Some(line)) =
+            match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
+                Ok(read) => read,
+                Err(_) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "idle_secs": SSE_IDLE_TIMEOUT.as_secs(),
+                            })),
+                        "stream: SSE idle timeout — connection stalled, aborting stream"
+                    );
+                    let _ = tx
+                        .send(Err(StreamError::Http(format!(
+                            "SSE stream stalled: no data for {}s",
+                            SSE_IDLE_TIMEOUT.as_secs()
+                        ))))
+                        .await;
+                    return;
+                }
+            }
+        {
             let line = line.trim().to_string();
             if !line.starts_with("data: ") {
                 continue;
@@ -730,26 +995,25 @@ impl AnthropicProvider {
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown");
                     let usage = event.get("message").and_then(|m| m.get("usage"));
-                    let input_tokens = usage
+                    let observed_input = usage
                         .and_then(|u| u.get("input_tokens"))
-                        .and_then(|t| t.as_u64())
-                        .unwrap_or(0);
-                    let cache_read = usage
+                        .and_then(|t| t.as_u64());
+                    let observed_cached = usage
                         .and_then(|u| u.get("cache_read_input_tokens"))
-                        .and_then(|t| t.as_u64())
-                        .unwrap_or(0);
-                    let cache_creation = usage
+                        .and_then(|t| t.as_u64());
+                    let observed_cache_create = usage
                         .and_then(|u| u.get("cache_creation_input_tokens"))
-                        .and_then(|t| t.as_u64())
-                        .unwrap_or(0);
-                    stream_input_tokens = input_tokens + cache_read + cache_creation;
-                    stream_cached_tokens = cache_read;
-                    tracing::debug!(
-                        model = %model,
-                        input_tokens = stream_input_tokens,
-                        cached = stream_cached_tokens,
-                        "Anthropic stream: message_start"
-                    );
+                        .and_then(|t| t.as_u64());
+                    if let Some(v) = observed_input {
+                        input_tokens = Some(v);
+                    }
+                    if let Some(v) = observed_cached {
+                        cached_input_tokens = Some(v);
+                    }
+                    if let Some(v) = observed_cache_create {
+                        cache_creation_input_tokens = Some(v);
+                    }
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model": model, "input_tokens": observed_input, "cached_input_tokens": observed_cached, "cache_creation_input_tokens": observed_cache_create})), "stream: message_start");
                 }
                 "content_block_start" => {
                     if let Some(block) = event.get("content_block") {
@@ -757,39 +1021,28 @@ impl AnthropicProvider {
                             .get("type")
                             .and_then(|t| t.as_str())
                             .unwrap_or_default();
-                        match block_type {
-                            "thinking" => {
-                                in_thinking_block = true;
+                        if block_type == "tool_use" {
+                            if let Some(id) = tool_id.take() {
+                                let name = tool_name.take().unwrap_or_default();
+                                let input = std::mem::take(&mut tool_input_json);
+                                let _ = tx
+                                    .send(Ok(StreamEvent::ToolCall(ProviderToolCall {
+                                        id,
+                                        name,
+                                        arguments: input,
+                                        extra_content: None,
+                                    })))
+                                    .await;
                             }
-                            "text" => {
-                                in_thinking_block = false;
-                            }
-                            "tool_use" => {
-                                in_thinking_block = false;
-                                if let Some(id) = tool_id.take() {
-                                    let name = tool_name.take().unwrap_or_default();
-                                    let input = std::mem::take(&mut tool_input_json);
-                                    let _ = tx
-                                        .send(Ok(StreamEvent::ToolCall(ProviderToolCall {
-                                            id,
-                                            name,
-                                            arguments: input,
-                                        })))
-                                        .await;
-                                }
-                                tool_id = block
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .map(ToString::to_string);
-                                tool_name = block
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .map(ToString::to_string);
-                                tool_input_json.clear();
-                            }
-                            _ => {
-                                in_thinking_block = false;
-                            }
+                            tool_id = block
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .map(ToString::to_string);
+                            tool_name = block
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .map(ToString::to_string);
+                            tool_input_json.clear();
                         }
                     }
                 }
@@ -800,33 +1053,17 @@ impl AnthropicProvider {
                             .and_then(|t| t.as_str())
                             .unwrap_or_default();
                         match delta_type {
-                            "thinking_delta" => {
-                                if let Some(text) = delta.get("thinking").and_then(|t| t.as_str())
+                            "text_delta" => {
+                                if let Some(text) = delta.get("text").and_then(|t| t.as_str())
                                     && !text.is_empty()
                                     && tx
-                                        .send(Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
+                                        .send(Ok(StreamEvent::TextDelta(StreamChunk::delta(
                                             text.to_string(),
                                         ))))
                                         .await
                                         .is_err()
                                 {
                                     return;
-                                }
-                            }
-                            "text_delta" => {
-                                if let Some(text) = delta.get("text").and_then(|t| t.as_str())
-                                    && !text.is_empty()
-                                {
-                                    // When inside a thinking block (interleaved thinking),
-                                    // text deltas are actually thinking content.
-                                    let chunk = if in_thinking_block {
-                                        StreamChunk::reasoning(text.to_string())
-                                    } else {
-                                        StreamChunk::delta(text.to_string())
-                                    };
-                                    if tx.send(Ok(StreamEvent::TextDelta(chunk))).await.is_err() {
-                                        return;
-                                    }
                                 }
                             }
                             "input_json_delta" => {
@@ -836,6 +1073,9 @@ impl AnthropicProvider {
                                     tool_input_json.push_str(json);
                                 }
                             }
+                            // TODO: handle "thinking_delta" events for streaming
+                            // extended thinking content. Currently thinking blocks
+                            // are only captured in non-streaming parse_native_response().
                             _ => {}
                         }
                     }
@@ -849,6 +1089,7 @@ impl AnthropicProvider {
                                 id,
                                 name,
                                 arguments: input,
+                                extra_content: None,
                             })))
                             .await;
                     }
@@ -859,41 +1100,65 @@ impl AnthropicProvider {
                         .and_then(|d| d.get("stop_reason"))
                         .and_then(|s| s.as_str())
                         .unwrap_or("none");
-                    let output_tokens = event
+                    // Anthropic's running-total: each `message_delta`
+                    // supersedes the previous one, so we always overwrite.
+                    let observed_output = event
                         .get("usage")
                         .and_then(|u| u.get("output_tokens"))
-                        .and_then(|t| t.as_u64())
-                        .unwrap_or(0);
-                    stream_output_tokens = output_tokens;
+                        .and_then(|t| t.as_u64());
+                    if let Some(v) = observed_output {
+                        output_tokens = Some(v);
+                    }
                     if stop_reason == "max_tokens" {
-                        tracing::warn!(
-                            output_tokens = output_tokens,
-                            "Anthropic response truncated: hit max_tokens limit. Increase provider_max_tokens in config."
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"output_tokens": observed_output})),
+                            "response truncated: hit max_tokens limit. Increase provider_max_tokens in config."
                         );
                     } else {
-                        tracing::debug!(
-                            stop_reason = %stop_reason,
-                            output_tokens = output_tokens,
-                            "Anthropic stream: message_delta"
-                        );
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"stop_reason": stop_reason, "output_tokens": observed_output})), "stream: message_delta");
                     }
                 }
                 "message_stop" => {
-                    tracing::debug!(
-                        input = stream_input_tokens,
-                        output = stream_output_tokens,
-                        cached = stream_cached_tokens,
-                        "Anthropic stream: message_stop"
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "stream: message_stop"
                     );
-                    let _ = tx
-                        .send(Ok(StreamEvent::Final {
-                            usage: Some(TokenUsage {
-                                input_tokens: Some(stream_input_tokens),
-                                output_tokens: Some(stream_output_tokens),
-                                cached_input_tokens: Some(stream_cached_tokens),
-                            }),
-                        }))
-                        .await;
+                    if input_tokens.is_some()
+                        || output_tokens.is_some()
+                        || cached_input_tokens.is_some()
+                        || cache_creation_input_tokens.is_some()
+                    {
+                        // Normalize to TokenUsage contract: `input_tokens` is
+                        // the *total* prompt size. Anthropic reports three
+                        // DISJOINT buckets per
+                        // https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching:
+                        //   total = cache_read + cache_creation + input_tokens
+                        // where `input_tokens` from the API is "tokens after
+                        // the last cache breakpoint", not the total.
+                        let uncached = input_tokens.unwrap_or(0);
+                        let cache_read = cached_input_tokens.unwrap_or(0);
+                        let cache_create = cache_creation_input_tokens.unwrap_or(0);
+                        let normalized_input = Some(
+                            uncached
+                                .saturating_add(cache_read)
+                                .saturating_add(cache_create),
+                        );
+                        let _ = tx
+                            .send(Ok(StreamEvent::Usage(TokenUsage {
+                                input_tokens: normalized_input,
+                                output_tokens,
+                                cached_input_tokens,
+                            })))
+                            .await;
+                    }
+                    let _ = tx.send(Ok(StreamEvent::Final)).await;
                     return;
                 }
                 "error" => {
@@ -902,29 +1167,57 @@ impl AnthropicProvider {
                         .and_then(|e| e.get("message"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown streaming error");
-                    let _ = tx.send(Err(StreamError::Provider(msg.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(msg.to_string())))
+                        .await;
                     return;
                 }
                 _ => {}
             }
         }
 
-        let _ = tx.send(Ok(StreamEvent::Final { usage: None })).await;
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                })),
+            "stream: SSE parser reached end of stream, emitting Final"
+        );
+        let _ = tx.send(Ok(StreamEvent::Final)).await;
     }
 }
 
 #[async_trait]
-impl Provider for AnthropicProvider {
+impl ModelProvider for AnthropicModelProvider {
+    fn default_temperature(&self) -> f64 {
+        TEMPERATURE_DEFAULT
+    }
+
+    fn default_base_url(&self) -> Option<&str> {
+        Some(BASE_URL)
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "anthropic: no credentials configured"
+            );
+            anyhow::Error::msg(
+                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token).",
             )
         })?;
 
@@ -935,12 +1228,15 @@ impl Provider for AnthropicProvider {
             system
         };
 
-        let (effective_max_tokens, thinking_config, temperature) =
-            self.thinking_params(temperature);
-        tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic API request");
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"max_tokens": self.max_tokens, "model": model})),
+            "API request"
+        );
         let request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: effective_max_tokens,
+            max_tokens: self.max_tokens,
             system,
             messages: vec![NativeMessage {
                 role: "user".to_string(),
@@ -953,7 +1249,7 @@ impl Provider for AnthropicProvider {
             tools: None,
             tool_choice: None,
             stream: None,
-            thinking: thinking_config,
+            thinking: None,
         };
 
         let mut request = self
@@ -973,20 +1269,33 @@ impl Provider for AnthropicProvider {
 
         let chat_response: NativeChatResponse = response.json().await?;
         let parsed = Self::parse_native_response(chat_response);
-        parsed
-            .text
-            .ok_or_else(|| anyhow::anyhow!("No response from Anthropic"))
+        parsed.text.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "anthropic: empty text in response"
+            );
+            anyhow::Error::msg("No response from Anthropic")
+        })
     }
 
     async fn chat(
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "anthropic: no credentials configured"
+            );
+            anyhow::Error::msg(
+                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token).",
             )
         })?;
 
@@ -1004,8 +1313,11 @@ impl Provider for AnthropicProvider {
             .ok()
             .flatten();
         let native_tools = Self::convert_tools(request.tools);
+        let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
             tool_choice_override.map(|tc| {
+                // `tool:<name>` forces a specific tool (structured output
+                // forcing); plain strings ("any"/"auto") select a mode.
                 if let Some(tool_name) = tc.strip_prefix("tool:") {
                     serde_json::json!({ "type": "tool", "name": tool_name })
                 } else {
@@ -1022,30 +1334,43 @@ impl Provider for AnthropicProvider {
         } else {
             system_prompt
         };
-        // Anthropic rejects thinking + forced tool_choice. Disable thinking
-        // when tool_choice forces a specific tool (structured output forcing).
-        let is_forced_tool = tool_choice
-            .as_ref()
-            .and_then(|tc| tc.get("type"))
-            .and_then(|t| t.as_str())
-            == Some("tool");
-        let (effective_max_tokens, thinking_config, temperature) = if is_forced_tool {
-            tracing::debug!(
-                model = %model,
-                max_tokens = self.max_tokens,
-                "Thinking disabled for forced tool_choice — Anthropic rejects thinking + tool forcing"
+
+        let (effective_temperature, thinking_config, effective_max_tokens) =
+            self.resolve_thinking(request.thinking, temperature, model);
+        // Anthropic rejects extended thinking combined with a forced
+        // `tool_choice: {"type":"tool"}` (HTTP 400). Disable thinking when a
+        // specific tool is forced (structured output forcing).
+        let (effective_temperature, thinking_config, effective_max_tokens) =
+            if Self::tool_choice_forces_specific_tool(tool_choice.as_ref()) {
+                (temperature, None, self.max_tokens)
+            } else {
+                (effective_temperature, thinking_config, effective_max_tokens)
+            };
+
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "alias": &self.alias,
+                        "request_api": "messages",
+                        "model": model,
+                        "stream": false,
+                        "max_tokens": effective_max_tokens,
+                        "tools_count": tools_count,
+                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                        "thinking_enabled": thinking_config.is_some(),
+                    })),
+                "anthropic provider request prepared"
             );
-            (self.max_tokens, None, temperature)
-        } else {
-            self.thinking_params(temperature)
-        };
-        tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic chat request");
+        }
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: effective_max_tokens,
             system: system_prompt,
             messages,
-            temperature,
+            temperature: effective_temperature,
             tools: native_tools,
             tool_choice,
             stream: None,
@@ -1073,6 +1398,7 @@ impl Provider for AnthropicProvider {
             native_tool_calling: true,
             vision: true,
             prompt_caching: true,
+            extended_thinking: true,
         }
     }
 
@@ -1085,7 +1411,7 @@ impl Provider for AnthropicProvider {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
         // Convert OpenAI-format tool JSON to ToolSpec so we can reuse the
         // existing `chat()` method which handles full message history,
@@ -1094,11 +1420,21 @@ impl Provider for AnthropicProvider {
             .iter()
             .filter_map(|t| {
                 let func = t.get("function").or_else(|| {
-                    tracing::warn!("Skipping malformed tool definition (missing 'function' key)");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "Skipping malformed tool definition (missing 'function' key)"
+                    );
                     None
                 })?;
                 let name = func.get("name").and_then(|n| n.as_str()).or_else(|| {
-                    tracing::warn!("Skipping tool with missing or non-string 'name'");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "Skipping tool with missing or non-string 'name'"
+                    );
                     None
                 })?;
                 Some(ToolSpec {
@@ -1123,6 +1459,7 @@ impl Provider for AnthropicProvider {
             } else {
                 Some(&tool_specs)
             },
+            thinking: None,
         };
         self.chat(request, model, temperature).await
     }
@@ -1141,6 +1478,12 @@ impl Provider for AnthropicProvider {
         Ok(())
     }
 
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        // Anthropic's /v1/models requires a credential. Onboard pulls the
+        // catalog from models.dev before the user has entered a key.
+        crate::models_dev::list_models_for("anthropic").await
+    }
+
     fn supports_streaming(&self) -> bool {
         true
     }
@@ -1153,18 +1496,18 @@ impl Provider for AnthropicProvider {
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
-            return stream::once(async { Ok(StreamEvent::Final { usage: None }) }).boxed();
+            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
 
         let credential = match self.credential.as_ref() {
             Some(c) => c.clone(),
             None => {
                 return stream::once(async {
-                    Err(StreamError::Provider(
+                    Err(StreamError::ModelProvider(
                         "Anthropic credentials not set".to_string(),
                     ))
                 })
@@ -1182,8 +1525,11 @@ impl Provider for AnthropicProvider {
             .ok()
             .flatten();
         let native_tools = Self::convert_tools(request.tools);
+        let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
             tool_choice_override.map(|tc| {
+                // `tool:<name>` forces a specific tool (structured output
+                // forcing); plain strings ("any"/"auto") select a mode.
                 if let Some(tool_name) = tc.strip_prefix("tool:") {
                     serde_json::json!({ "type": "tool", "name": tool_name })
                 } else {
@@ -1200,29 +1546,164 @@ impl Provider for AnthropicProvider {
             system_prompt
         };
 
-        // Anthropic rejects thinking + forced tool_choice — see chat() for details.
-        let is_forced_tool = tool_choice
-            .as_ref()
-            .and_then(|tc| tc.get("type"))
-            .and_then(|t| t.as_str())
-            == Some("tool");
-        let (effective_max_tokens, thinking_config, temperature) = if is_forced_tool {
-            tracing::debug!(
-                model = %model,
-                max_tokens = self.max_tokens,
-                "Thinking disabled for forced tool_choice — Anthropic rejects thinking + tool forcing"
+        let (effective_temperature, thinking_config, effective_max_tokens) =
+            self.resolve_thinking(request.thinking, temperature, model);
+        // Anthropic rejects extended thinking combined with a forced
+        // `tool_choice: {"type":"tool"}` (HTTP 400) — see `chat()`. Disable
+        // thinking when a specific tool is forced (structured output forcing).
+        let (effective_temperature, thinking_config, effective_max_tokens) =
+            if Self::tool_choice_forces_specific_tool(tool_choice.as_ref()) {
+                (temperature, None, self.max_tokens)
+            } else {
+                (effective_temperature, thinking_config, effective_max_tokens)
+            };
+
+        // When native thinking is enabled, streamed `thinking_delta` /
+        // `signature_delta` SSE events are not yet parsed into
+        // `reasoning_content`, which means a tool-use turn could emit a
+        // tool call without preserving the signed thinking block that
+        // justified it — breaking Anthropic's signature round-trip. Fall
+        // back to a non-streaming request so `parse_native_response` can
+        // preserve the signed blocks, and synthesize a short stream from
+        // the completed response. Full streaming thinking_delta
+        // preservation is tracked as a follow-up.
+        if thinking_config.is_some() {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "alias": &self.alias,
+                        "request_api": "messages",
+                        "model": model,
+                        "stream": false,
+                        "tools_count": tools_count,
+                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                    })),
+                "native thinking enabled; using non-streaming fallback to preserve signed thinking blocks"
             );
-            (self.max_tokens, None, temperature)
-        } else {
-            self.thinking_params(temperature)
-        };
-        tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic stream_chat request");
+            let native_request = NativeChatRequest {
+                model: model.to_string(),
+                max_tokens: effective_max_tokens,
+                system: system_prompt,
+                messages,
+                temperature: effective_temperature,
+                tools: native_tools,
+                tool_choice,
+                stream: None,
+                thinking: thinking_config,
+            };
+            // Serialize eagerly so the request body is owned and `'static`
+            // across the async boundary — `NativeToolSpec<'a>` borrows from
+            // `request.tools`, which prevents moving `native_request` into
+            // the spawned future otherwise.
+            let body = serde_json::to_value(&native_request)
+                .expect("NativeChatRequest should serialize to JSON");
+            let client = self.http_client();
+            let url = format!("{}/v1/messages", self.base_url);
+            let is_oauth = Self::is_setup_token(&credential);
+
+            return stream::once(async move {
+                let mut req = client
+                    .post(&url)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(&body);
+                if is_oauth {
+                    req = req
+                        .header("Authorization", format!("Bearer {credential}"))
+                        .header(
+                            "anthropic-beta",
+                            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
+                        )
+                        .header("anthropic-dangerous-direct-browser-access", "true");
+                } else {
+                    // This branch only runs with native thinking active (the
+                    // `thinking_config.is_some()` fallback). Interleaved
+                    // thinking is auth-agnostic and GA-independent: API-key
+                    // auth (used by all CX agents) needs this beta header to
+                    // reason *between* tool calls, otherwise it only thinks
+                    // before the first tool call. The OAuth-only tokens
+                    // (`claude-code`, `oauth-*`) must NOT be sent on x-api-key.
+                    req = req
+                        .header("x-api-key", &credential)
+                        .header("anthropic-beta", "interleaved-thinking-2025-05-14");
+                }
+                let response = req
+                    .send()
+                    .await
+                    .map_err(|e| StreamError::Http(e.to_string()))?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| format!("HTTP error: {status}"));
+                    return Err(StreamError::ModelProvider(format!("{status}: {body}")));
+                }
+                let parsed: NativeChatResponse = response
+                    .json()
+                    .await
+                    .map_err(|e| StreamError::ModelProvider(format!("response decode: {e}")))?;
+                Ok(Self::parse_native_response(parsed))
+            })
+            .flat_map(|result| match result {
+                Ok(resp) => {
+                    let mut events: Vec<StreamResult<StreamEvent>> = Vec::new();
+                    // Emit signed thinking blocks first via `StreamChunk.reasoning`
+                    // so the agent loop can accumulate them into
+                    // `ChatResponse.reasoning_content` for multi-turn replay.
+                    // Anthropic requires signed thinking blocks to precede
+                    // tool-use blocks in conversation history.
+                    if let Some(rc) = resp.reasoning_content {
+                        events.push(Ok(StreamEvent::TextDelta(StreamChunk {
+                            delta: String::new(),
+                            reasoning: Some(rc),
+                            is_final: false,
+                            token_count: 0,
+                        })));
+                    }
+                    if let Some(text) = resp.text.filter(|t| !t.is_empty()) {
+                        events.push(Ok(StreamEvent::TextDelta(StreamChunk::delta(text))));
+                    }
+                    for tc in resp.tool_calls {
+                        events.push(Ok(StreamEvent::ToolCall(tc)));
+                    }
+                    if let Some(usage) = resp.usage {
+                        events.push(Ok(StreamEvent::Usage(usage)));
+                    }
+                    events.push(Ok(StreamEvent::Final));
+                    stream::iter(events)
+                }
+                Err(e) => stream::iter(vec![Err(e)]),
+            })
+            .boxed();
+        }
+
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "alias": &self.alias,
+                        "request_api": "messages",
+                        "model": model,
+                        "stream": true,
+                        "max_tokens": effective_max_tokens,
+                        "tools_count": tools_count,
+                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                        "thinking_enabled": false,
+                    })),
+                "anthropic streaming provider request prepared"
+            );
+        }
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: effective_max_tokens,
             system: system_prompt,
             messages,
-            temperature,
+            temperature: effective_temperature,
             tools: native_tools,
             tool_choice,
             stream: Some(true),
@@ -1233,11 +1714,21 @@ impl Provider for AnthropicProvider {
         let client = self.http_client();
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
-        let has_thinking = self.extended_thinking_budget.is_some();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
-        tokio::spawn(async move {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Spawn)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
+                .with_attrs(::serde_json::json!({
+                    "idle_timeout_secs": SSE_IDLE_TIMEOUT.as_secs(),
+                    "channel_capacity": 64,
+                })),
+            "stream: spawning detached Anthropic SSE parser task"
+        );
+
+        let parser_handle = ::zeroclaw_spawn::spawn!(async move {
             let mut req = client
                 .post(&url)
                 .header("anthropic-version", "2023-06-01")
@@ -1254,17 +1745,14 @@ impl Provider for AnthropicProvider {
                     .header("anthropic-dangerous-direct-browser-access", "true");
             } else {
                 req = req.header("x-api-key", &credential);
-                // Add the interleaved-thinking beta header for API-key auth
-                // when extended thinking is enabled (mirrors apply_auth logic).
-                if has_thinking {
-                    req = req.header("anthropic-beta", "interleaved-thinking-2025-05-14");
-                }
             }
 
             let response = match req.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             };
@@ -1276,7 +1764,9 @@ impl Provider for AnthropicProvider {
                     .await
                     .unwrap_or_else(|_| format!("HTTP error: {status}"));
                 let _ = tx
-                    .send(Err(StreamError::Provider(format!("{status}: {error}"))))
+                    .send(Err(StreamError::ModelProvider(format!(
+                        "{status}: {error}"
+                    ))))
                     .await;
                 return;
             }
@@ -1284,10 +1774,28 @@ impl Provider for AnthropicProvider {
             Self::parse_anthropic_sse(response, &tx).await;
         });
 
-        stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|event| (event, rx))
+        // The guard travels inside the unfold state so it is dropped at the
+        // exact moment the consumer drops the stream — turning a turn cancel
+        // (or normal completion) into an immediate parser-task abort instead
+        // of a leaked socket that lingers until SSE_IDLE_TIMEOUT.
+        let guard = AbortOnDrop::new(parser_handle.abort_handle());
+        stream::unfold((rx, guard), |(mut rx, guard)| async move {
+            rx.recv().await.map(|event| (event, (rx, guard)))
         })
         .boxed()
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for AnthropicModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Anthropic,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -1296,9 +1804,252 @@ mod tests {
     use super::*;
     use crate::auth::anthropic_token::{AnthropicAuthKind, detect_auth_kind};
 
+    /// Fake Anthropic SSE stream covering the message_start → content → delta
+    /// → stop sequence with usage in both the start frame and the stop delta.
+    /// Each `data:` line is one Anthropic event per the streaming spec.
+    ///
+    /// The usage frame includes all three disjoint input buckets
+    /// (input_tokens=314 after-breakpoint, cache_read=42, cache_creation=100)
+    /// so the test exercises the documented Anthropic formula:
+    ///   total = cache_read + cache_creation + input_tokens
+    fn fake_anthropic_sse() -> &'static [u8] {
+        b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":314,\"cache_read_input_tokens\":42,\"cache_creation_input_tokens\":100}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":27}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n"
+    }
+
+    #[tokio::test]
+    async fn streaming_usage_emitted_before_final() {
+        // The original #6001 live repro was Anthropic streaming; before this
+        // PR the message_start / message_delta usage frames were only logged
+        // at DEBUG and never surfaced as `StreamEvent::Usage`. Now they are.
+        use std::io::Cursor;
+
+        let bytes = fake_anthropic_sse();
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            events.push(ev);
+        }
+
+        let states: Vec<&str> = events
+            .iter()
+            .map(|e| match e.as_ref() {
+                Ok(StreamEvent::TextDelta(_)) => "text",
+                Ok(StreamEvent::ToolCall(_)) => "tool_call",
+                Ok(StreamEvent::PreExecutedToolCall { .. }) => "pre_tool_call",
+                Ok(StreamEvent::PreExecutedToolResult { .. }) => "pre_tool_result",
+                Ok(StreamEvent::Usage(_)) => "usage",
+                Ok(StreamEvent::Final) => "final",
+                Err(_) => "err",
+            })
+            .collect();
+
+        // Required ordering: usage event must appear before Final so the
+        // gateway accumulator can capture it within the same turn boundary.
+        let usage_pos = states
+            .iter()
+            .position(|s| *s == "usage")
+            .unwrap_or_else(|| panic!("expected Usage event in stream, got {states:?}"));
+        let final_pos = states
+            .iter()
+            .position(|s| *s == "final")
+            .unwrap_or_else(|| panic!("expected Final event in stream, got {states:?}"));
+        assert!(
+            usage_pos < final_pos,
+            "Usage must come before Final, got {states:?}"
+        );
+
+        // The Usage payload must carry both input + output token counts plus
+        // the cached-input prompt-cache reads from message_start.
+        let usage = events
+            .iter()
+            .find_map(|e| match e.as_ref() {
+                Ok(StreamEvent::Usage(u)) => Some(u.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            usage.input_tokens,
+            Some(456),
+            "input_tokens must be the total of all three Anthropic buckets \
+             (after-breakpoint 314 + cache_read 42 + cache_creation 100) \
+             per the documented prompt-caching formula"
+        );
+        assert_eq!(
+            usage.output_tokens,
+            Some(27),
+            "output_tokens from message_delta usage frame"
+        );
+        assert_eq!(
+            usage.cached_input_tokens,
+            Some(42),
+            "cache_read_input_tokens from message_start"
+        );
+    }
+
+    /// A reader that yields one buffer of bytes, then parks forever — models
+    /// an SSE connection that delivers `message_start` and then goes silent
+    /// with the socket still open. Without the idle timeout this hangs the
+    /// parser indefinitely.
+    struct StallAfterReader {
+        data: std::io::Cursor<Vec<u8>>,
+        drained: bool,
+    }
+
+    impl tokio::io::AsyncRead for StallAfterReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.drained {
+                // Park without self-waking; the surrounding timeout's timer
+                // provides the wake. Self-waking here would busy-spin under
+                // paused time and starve the timer.
+                return std::task::Poll::Pending;
+            }
+            let before = buf.filled().len();
+            let inner = std::pin::Pin::new(&mut self.data);
+            let res = inner.poll_read(cx, buf);
+            // Once the seed buffer is exhausted, stall on the *next* read
+            // rather than reporting EOF (0 bytes) — EOF would end the stream
+            // cleanly and never exercise the idle timeout.
+            if buf.filled().len() == before {
+                self.drained = true;
+                return std::task::Poll::Pending;
+            }
+            res
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_stream_times_out_instead_of_hanging() {
+        // Repro: connection delivers message_start then goes silent. The
+        // parser must surface a retryable StreamError rather than parking on
+        // next_line() forever (the "stuck on working" hang).
+        let start = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude\",\"usage\":{\"input_tokens\":1}}}\n\n"
+            .to_vec();
+        let reader = tokio::io::BufReader::new(StallAfterReader {
+            data: std::io::Cursor::new(start),
+            drained: false,
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+
+        let parser = ::zeroclaw_spawn::spawn!(async move {
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+        });
+
+        // Let the parser run until it parks on the stalled read before we
+        // jump virtual time forward.
+        tokio::task::yield_now().await;
+        // Advance virtual time past the idle bound; the parser should wake,
+        // emit an error, and return — closing the channel.
+        tokio::time::advance(SSE_IDLE_TIMEOUT + std::time::Duration::from_secs(1)).await;
+
+        let mut last_err = None;
+        while let Some(ev) = rx.recv().await {
+            if let Err(e) = ev {
+                last_err = Some(e);
+            }
+        }
+        parser.await.expect("parser task must finish, not hang");
+
+        let err = last_err.expect("a StreamError must be emitted on stall");
+        assert!(
+            matches!(err, StreamError::Http(ref m) if m.contains("stalled")),
+            "expected stalled-stream Http error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_guard_aborts_parser_without_idle_wait() {
+        // The full-measure fix: dropping the consumer stream must abort the
+        // detached parser immediately (turn cancel), not leak the socket until
+        // SSE_IDLE_TIMEOUT. We model the stream's lifetime with AbortOnDrop and
+        // assert the task is aborted the instant the guard drops.
+        let start = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude\",\"usage\":{\"input_tokens\":1}}}\n\n"
+            .to_vec();
+        let reader = tokio::io::BufReader::new(StallAfterReader {
+            data: std::io::Cursor::new(start),
+            drained: false,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+
+        let handle = ::zeroclaw_spawn::spawn!(async move {
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+        });
+        let probe = handle.abort_handle();
+        let guard = AbortOnDrop::new(handle.abort_handle());
+
+        // Let the parser park on the stalled read.
+        tokio::task::yield_now().await;
+        assert!(
+            !probe.is_finished(),
+            "parser must still be running (parked on the stalled read) before drop"
+        );
+
+        // Dropping the guard must abort the parser — no SSE_IDLE_TIMEOUT wait.
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert!(
+            probe.is_finished(),
+            "guard drop must abort the parser task immediately, not wait out the idle timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_usage_omitted_when_provider_does_not_send_usage() {
+        // Backward-compat: a stream that never emits a usage frame must not
+        // synthesize a zero-valued Usage event. Consumers should treat
+        // absence as "usage unavailable" rather than "usage was zero."
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut saw_usage = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if matches!(ev, Ok(StreamEvent::Usage(_))) {
+                saw_usage = true;
+            }
+        }
+        assert!(
+            !saw_usage,
+            "must not emit Usage when provider sent no usage frames"
+        );
+    }
+
     #[test]
     fn creates_with_key() {
-        let p = AnthropicProvider::new(Some("anthropic-test-credential"));
+        let p = AnthropicModelProvider::new("test", Some("anthropic-test-credential"));
         assert!(p.credential.is_some());
         assert_eq!(p.credential.as_deref(), Some("anthropic-test-credential"));
         assert_eq!(p.base_url, "https://api.anthropic.com");
@@ -1306,27 +2057,28 @@ mod tests {
 
     #[test]
     fn creates_without_key() {
-        let p = AnthropicProvider::new(None);
+        let p = AnthropicModelProvider::new("test", None);
         assert!(p.credential.is_none());
         assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[test]
     fn creates_with_empty_key() {
-        let p = AnthropicProvider::new(Some(""));
+        let p = AnthropicModelProvider::new("test", Some(""));
         assert!(p.credential.is_none());
     }
 
     #[test]
     fn creates_with_whitespace_key() {
-        let p = AnthropicProvider::new(Some("  anthropic-test-credential  "));
+        let p = AnthropicModelProvider::new("test", Some("  anthropic-test-credential  "));
         assert!(p.credential.is_some());
         assert_eq!(p.credential.as_deref(), Some("anthropic-test-credential"));
     }
 
     #[test]
     fn creates_with_custom_base_url() {
-        let p = AnthropicProvider::with_base_url(
+        let p = AnthropicModelProvider::with_base_url(
+            "test",
             Some("anthropic-credential"),
             Some("https://api.example.com"),
         );
@@ -1336,21 +2088,22 @@ mod tests {
 
     #[test]
     fn custom_base_url_trims_trailing_slash() {
-        let p = AnthropicProvider::with_base_url(None, Some("https://api.example.com/"));
+        let p =
+            AnthropicModelProvider::with_base_url("test", None, Some("https://api.example.com/"));
         assert_eq!(p.base_url, "https://api.example.com");
     }
 
     #[test]
-    fn default_base_url_when_none_provided() {
-        let p = AnthropicProvider::with_base_url(None, None);
+    fn no_base_url_uses_published_endpoint() {
+        let p = AnthropicModelProvider::with_base_url("test", None, None);
         assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[tokio::test]
     async fn chat_fails_without_key() {
-        let p = AnthropicProvider::new(None);
+        let p = AnthropicModelProvider::new("test", None);
         let result = p
-            .chat_with_system(None, "hello", "claude-3-opus", 0.7)
+            .chat_with_system(None, "hello", "claude-3-opus", Some(0.7))
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1362,16 +2115,18 @@ mod tests {
 
     #[test]
     fn setup_token_detection_works() {
-        assert!(AnthropicProvider::is_setup_token("sk-ant-oat01-abcdef"));
-        assert!(!AnthropicProvider::is_setup_token("sk-ant-api-key"));
+        assert!(AnthropicModelProvider::is_setup_token(
+            "sk-ant-oat01-abcdef"
+        ));
+        assert!(!AnthropicModelProvider::is_setup_token("sk-ant-api-key"));
     }
 
     #[test]
     fn apply_auth_uses_bearer_and_beta_for_setup_tokens() {
-        let provider = AnthropicProvider::new(None);
-        let request = provider
+        let model_provider = AnthropicModelProvider::new("test", None);
+        let request = model_provider
             .apply_auth(
-                provider
+                model_provider
                     .http_client()
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-oat01-test-token",
@@ -1405,10 +2160,10 @@ mod tests {
 
     #[test]
     fn apply_auth_uses_x_api_key_for_regular_tokens() {
-        let provider = AnthropicProvider::new(None);
-        let request = provider
+        let model_provider = AnthropicModelProvider::new("test", None);
+        let request = model_provider
             .apply_auth(
-                provider
+                model_provider
                     .http_client()
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-api-key",
@@ -1429,9 +2184,14 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_system_fails_without_key() {
-        let p = AnthropicProvider::new(None);
+        let p = AnthropicModelProvider::new("test", None);
         let result = p
-            .chat_with_system(Some("You are ZeroClaw"), "hello", "claude-3-opus", 0.7)
+            .chat_with_system(
+                Some("You are ZeroClaw"),
+                "hello",
+                "claude-3-opus",
+                Some(0.7),
+            )
             .await;
         assert!(result.is_err());
     }
@@ -1446,7 +2206,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
-            temperature: 0.7,
+            temperature: Some(0.7),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -1467,7 +2227,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
-            temperature: 0.7,
+            temperature: Some(0.7),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"system\":\"You are ZeroClaw\""));
@@ -1507,11 +2267,162 @@ mod tests {
                 max_tokens: 4096,
                 system: None,
                 messages: vec![],
-                temperature: temp,
+                temperature: Some(temp),
             };
             let json = serde_json::to_string(&req).unwrap();
             assert!(json.contains(&format!("{temp}")));
         }
+    }
+
+    #[test]
+    fn tool_choice_override_with_tool_prefix_produces_named_choice() {
+        // The `tool:name` format should produce {"type":"tool","name":"name"}
+        let tc = "tool:structured_output".to_string();
+        let result = if let Some(tool_name) = tc.strip_prefix("tool:") {
+            serde_json::json!({ "type": "tool", "name": tool_name })
+        } else {
+            serde_json::json!({ "type": tc })
+        };
+        assert_eq!(result["type"], "tool");
+        assert_eq!(result["name"], "structured_output");
+        assert!(AnthropicModelProvider::tool_choice_forces_specific_tool(
+            Some(&result)
+        ));
+    }
+
+    #[test]
+    fn tool_choice_override_without_prefix_produces_type_only() {
+        // Plain strings like "any" or "auto" should produce {"type":"any"}
+        let tc = "any".to_string();
+        let result = if let Some(tool_name) = tc.strip_prefix("tool:") {
+            serde_json::json!({ "type": "tool", "name": tool_name })
+        } else {
+            serde_json::json!({ "type": tc })
+        };
+        assert_eq!(result["type"], "any");
+        assert!(result.get("name").is_none());
+        assert!(!AnthropicModelProvider::tool_choice_forces_specific_tool(
+            Some(&result)
+        ));
+    }
+
+    #[test]
+    fn forced_tool_choice_disables_native_thinking() {
+        // Anthropic rejects extended thinking + forced tool_choice. The guard
+        // in chat()/stream_chat() drops thinking when a specific tool is forced.
+        let provider = AnthropicModelProvider::new("test", Some("test-key"));
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+        };
+        // Sanity: without a forced tool, native thinking is enabled.
+        let (_, config, _) =
+            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-opus-4-6");
+        assert!(config.is_some(), "native thinking should resolve normally");
+
+        let forced = serde_json::json!({ "type": "tool", "name": "structured_output" });
+        assert!(AnthropicModelProvider::tool_choice_forces_specific_tool(
+            Some(&forced)
+        ));
+        let any = serde_json::json!({ "type": "any" });
+        assert!(!AnthropicModelProvider::tool_choice_forces_specific_tool(
+            Some(&any)
+        ));
+        assert!(!AnthropicModelProvider::tool_choice_forces_specific_tool(
+            None
+        ));
+    }
+
+    #[test]
+    fn anthropic_model_supports_native_thinking_excludes_opus_4_7() {
+        // Opus 4.7 only supports adaptive thinking; fixed-budget returns 400.
+        assert!(!anthropic_model_supports_native_thinking("claude-opus-4-7"));
+        assert!(!anthropic_model_supports_native_thinking(
+            "claude-opus-4-7-20260101"
+        ));
+    }
+
+    #[test]
+    fn anthropic_model_supports_native_thinking_allows_other_models() {
+        assert!(anthropic_model_supports_native_thinking("claude-opus-4-6"));
+        assert!(anthropic_model_supports_native_thinking(
+            "claude-sonnet-4-6"
+        ));
+        assert!(anthropic_model_supports_native_thinking("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn resolve_thinking_drops_native_for_opus_4_7() {
+        let provider = AnthropicModelProvider::new("test", Some("test-key"));
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+        };
+        let (temp, config, max_tokens) =
+            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-opus-4-7");
+        assert!(
+            config.is_none(),
+            "native thinking should be gated off for opus-4-7"
+        );
+        // Caller-supplied temperature is preserved (so per-model omit guard
+        // can still take effect downstream).
+        assert!((temp.unwrap() - 0.7_f64).abs() < f64::EPSILON);
+        assert_eq!(max_tokens, provider.max_tokens);
+    }
+
+    #[test]
+    fn resolve_thinking_keeps_native_for_supported_models() {
+        let provider = AnthropicModelProvider::new("test", Some("test-key"));
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+        };
+        let (temp, config, _) =
+            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-6");
+        assert!(
+            config.is_some(),
+            "native thinking should activate on supported models"
+        );
+        // Forced to 1.0 per Anthropic native-thinking contract.
+        assert!((temp.unwrap() - 1.0_f64).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn native_chat_request_serializes_without_temperature_when_none() {
+        let req = NativeChatRequest {
+            model: "claude-opus-4-7".to_string(),
+            max_tokens: 4096,
+            system: None,
+            messages: vec![],
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            thinking: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("max_tokens"));
+        assert!(
+            !json.contains("temperature"),
+            "expected temperature to be omitted, got: {json}"
+        );
+    }
+
+    #[test]
+    fn native_chat_request_serializes_with_temperature_when_some() {
+        let req = NativeChatRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 4096,
+            system: None,
+            messages: vec![],
+            temperature: Some(0.7),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            thinking: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("\"temperature\":0.7"),
+            "expected temperature to be present, got: {json}"
+        );
     }
 
     #[test]
@@ -1641,27 +2552,6 @@ mod tests {
     }
 
     #[test]
-    fn should_cache_system_small_prompt() {
-        let small_prompt = "You are a helpful assistant.";
-        assert!(!AnthropicProvider::should_cache_system(small_prompt));
-    }
-
-    #[test]
-    fn should_cache_system_large_prompt() {
-        let large_prompt = "a".repeat(3073); // Just over 3072 bytes
-        assert!(AnthropicProvider::should_cache_system(&large_prompt));
-    }
-
-    #[test]
-    fn should_cache_system_boundary() {
-        let boundary_prompt = "a".repeat(3072); // Exactly 3072 bytes
-        assert!(!AnthropicProvider::should_cache_system(&boundary_prompt));
-
-        let over_boundary = "a".repeat(3073);
-        assert!(AnthropicProvider::should_cache_system(&over_boundary));
-    }
-
-    #[test]
     fn should_cache_conversation_short() {
         let messages = vec![
             ChatMessage {
@@ -1674,7 +2564,9 @@ mod tests {
             },
         ];
         // Only 1 non-system message — should not cache
-        assert!(!AnthropicProvider::should_cache_conversation(&messages));
+        assert!(!AnthropicModelProvider::should_cache_conversation(
+            &messages
+        ));
     }
 
     #[test]
@@ -1690,7 +2582,7 @@ mod tests {
                 content: format!("Message {i}"),
             });
         }
-        assert!(AnthropicProvider::should_cache_conversation(&messages));
+        assert!(AnthropicModelProvider::should_cache_conversation(&messages));
     }
 
     #[test]
@@ -1700,7 +2592,9 @@ mod tests {
             content: "Hello".to_string(),
         }];
         // Exactly 1 non-system message — should not cache
-        assert!(!AnthropicProvider::should_cache_conversation(&messages));
+        assert!(!AnthropicModelProvider::should_cache_conversation(
+            &messages
+        ));
 
         // Add one more to cross boundary (>1)
         let messages = vec![
@@ -1713,7 +2607,7 @@ mod tests {
                 content: "Hi".to_string(),
             },
         ];
-        assert!(AnthropicProvider::should_cache_conversation(&messages));
+        assert!(AnthropicModelProvider::should_cache_conversation(&messages));
     }
 
     #[test]
@@ -1726,7 +2620,7 @@ mod tests {
             }],
         }];
 
-        AnthropicProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
 
         match &messages[0].content[0] {
             NativeContentOut::Text { cache_control, .. } => {
@@ -1747,7 +2641,7 @@ mod tests {
             }],
         }];
 
-        AnthropicProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
 
         match &messages[0].content[0] {
             NativeContentOut::ToolResult { cache_control, .. } => {
@@ -1769,7 +2663,7 @@ mod tests {
             }],
         }];
 
-        AnthropicProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
 
         // ToolUse should not be affected
         match &messages[0].content[0] {
@@ -1783,7 +2677,7 @@ mod tests {
     #[test]
     fn apply_cache_empty_messages() {
         let mut messages = vec![];
-        AnthropicProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
         // Should not panic
         assert!(messages.is_empty());
     }
@@ -1803,7 +2697,7 @@ mod tests {
             },
         ];
 
-        let native_tools = AnthropicProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
 
         assert_eq!(native_tools.len(), 2);
         assert!(native_tools[0].cache_control.is_none());
@@ -1818,7 +2712,7 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
         }];
 
-        let native_tools = AnthropicProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
 
         assert_eq!(native_tools.len(), 1);
         assert!(native_tools[0].cache_control.is_some());
@@ -1831,7 +2725,7 @@ mod tests {
             content: "Short system prompt".to_string(),
         }];
 
-        let (system_prompt, _) = AnthropicProvider::convert_messages(&messages);
+        let (system_prompt, _) = AnthropicModelProvider::convert_messages(&messages);
 
         match system_prompt.unwrap() {
             SystemPrompt::Blocks(blocks) => {
@@ -1856,7 +2750,7 @@ mod tests {
             content: large_content.clone(),
         }];
 
-        let (system_prompt, _) = AnthropicProvider::convert_messages(&messages);
+        let (system_prompt, _) = AnthropicModelProvider::convert_messages(&messages);
 
         match system_prompt.unwrap() {
             SystemPrompt::Blocks(blocks) => {
@@ -1886,7 +2780,7 @@ mod tests {
                     cache_control: None,
                 }],
             }],
-            temperature: 0.7,
+            temperature: Some(0.7),
             tools: None,
             tool_choice: None,
             stream: None,
@@ -1901,10 +2795,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_chat_request_omits_temperature_when_none() {
+        let req = NativeChatRequest {
+            model: "claude-opus-4-7".to_string(),
+            max_tokens: 4096,
+            system: None,
+            messages: vec![NativeMessage {
+                role: "user".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            thinking: None,
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("temperature"),
+            "temperature should be omitted when None; got: {json}"
+        );
+    }
+
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let provider = AnthropicProvider::new(None);
-        let result = provider.warmup().await;
+        let model_provider = AnthropicModelProvider::new("test", None);
+        let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
 
@@ -1929,7 +2850,7 @@ mod tests {
             },
         ];
 
-        let (system, native_msgs) = AnthropicProvider::convert_messages(&messages);
+        let (system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
 
         // System prompt extracted
         assert!(system.is_some());
@@ -1975,16 +2896,16 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server_handle = tokio::spawn(async move {
+        let server_handle = zeroclaw_spawn::spawn!(async move {
             axum::serve(listener, app).await.unwrap();
         });
 
-        // Create provider pointing at mock server
-        let provider = AnthropicProvider {
+        // Create model_provider pointing at mock server
+        let model_provider = AnthropicModelProvider {
+            alias: "test".to_string(),
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
-            max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
-            extended_thinking_budget: None,
+            max_tokens: 4096,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
@@ -2012,8 +2933,8 @@ mod tests {
             }
         })];
 
-        let result = provider
-            .chat_with_tools(&messages, &tools, "claude-opus-4-6", 0.7)
+        let result = model_provider
+            .chat_with_tools(&messages, &tools, "claude-opus-4-6", Some(0.7))
             .await;
         assert!(result.is_ok(), "chat_with_tools failed: {:?}", result.err());
 
@@ -2082,24 +3003,102 @@ mod tests {
             "usage": {"input_tokens": 300, "output_tokens": 75}
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicProvider::parse_native_response(resp);
+        let result = AnthropicModelProvider::parse_native_response(resp);
         let usage = result.usage.unwrap();
         assert_eq!(usage.input_tokens, Some(300));
         assert_eq!(usage.output_tokens, Some(75));
     }
 
     #[test]
+    fn native_response_sums_all_three_anthropic_input_buckets() {
+        // Per https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching:
+        //   total_input = cache_read + cache_creation + input_tokens
+        // where Anthropic's `input_tokens` is *only* the tokens after the
+        // last cache breakpoint. The three buckets are disjoint.
+        //
+        // This is the most common live shape on a long Anthropic session:
+        // huge cache_read, tiny input_tokens, occasional cache_creation as
+        // the conversation grows past the previous breakpoint.
+        let json = r#"{
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {
+                "input_tokens": 1,
+                "cache_read_input_tokens": 148539,
+                "cache_creation_input_tokens": 4200,
+                "output_tokens": 27
+            }
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicModelProvider::parse_native_response(resp);
+        let usage = result.usage.expect("usage should be Some");
+        assert_eq!(
+            usage.input_tokens,
+            Some(152_740),
+            "total = 1 (after-breakpoint) + 148539 (cache_read) + 4200 (cache_creation)"
+        );
+        assert_eq!(
+            usage.cached_input_tokens,
+            Some(148_539),
+            "cached_input_tokens is the cache-read portion only \
+             (the discount-billed subset of the total)"
+        );
+        assert_eq!(usage.output_tokens, Some(27));
+    }
+
+    #[test]
     fn native_response_parses_without_usage() {
         let json = r#"{"content": [{"type": "text", "text": "Hello"}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicProvider::parse_native_response(resp);
+        let result = AnthropicModelProvider::parse_native_response(resp);
         assert!(result.usage.is_none());
     }
 
     #[test]
+    fn native_response_preserves_thinking_text_byte_for_byte() {
+        // Signatures on extended-thinking blocks are computed over the exact
+        // bytes the model returned. Any mutation — including trim() — breaks
+        // signature validation on replay in a multi-turn tool-use conversation.
+        let json = r#"{
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "  \nStep 1: consider the request.\nStep 2: respond.\n  ",
+                    "signature": "sig_abc123"
+                },
+                {"type": "text", "text": "ok"}
+            ]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicModelProvider::parse_native_response(resp);
+        let reasoning = result.reasoning_content.expect("thinking preserved");
+        let parsed: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(
+            parsed.get("thinking").and_then(|v| v.as_str()),
+            Some("  \nStep 1: consider the request.\nStep 2: respond.\n  ")
+        );
+        assert_eq!(
+            parsed.get("signature").and_then(|v| v.as_str()),
+            Some("sig_abc123")
+        );
+    }
+
+    #[test]
+    fn native_response_drops_empty_thinking_blocks() {
+        let json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "sig_xyz"},
+                {"type": "text", "text": "hello"}
+            ]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicModelProvider::parse_native_response(resp);
+        assert!(result.reasoning_content.is_none());
+    }
+
+    #[test]
     fn capabilities_returns_vision_and_native_tools() {
-        let provider = AnthropicProvider::new(Some("test-key"));
-        let caps = provider.capabilities();
+        let model_provider = AnthropicModelProvider::new("test", Some("test-key"));
+        let caps = model_provider.capabilities();
         assert!(
             caps.native_tool_calling,
             "Anthropic should support native tool calling"
@@ -2115,7 +3114,7 @@ mod tests {
                 .to_string(),
         }];
 
-        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
 
         assert_eq!(native_msgs.len(), 1);
         assert_eq!(native_msgs[0].role, "user");
@@ -2153,7 +3152,7 @@ mod tests {
             content: "[IMAGE:data:image/png;base64,iVBORw0KGgo]".to_string(),
         }];
 
-        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
 
         assert_eq!(native_msgs.len(), 1);
         assert_eq!(native_msgs[0].content.len(), 2);
@@ -2182,7 +3181,7 @@ mod tests {
             content: "Hello, how are you?".to_string(),
         }];
 
-        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
 
         assert_eq!(native_msgs.len(), 1);
         assert_eq!(native_msgs[0].content.len(), 1);
@@ -2258,7 +3257,7 @@ mod tests {
             },
         ];
 
-        let (system, native_msgs) = AnthropicProvider::convert_messages(&messages);
+        let (system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
 
         assert!(system.is_some());
         // Should be: user, assistant, user (merged tool results)
@@ -2282,29 +3281,95 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_override_with_tool_prefix_produces_named_choice() {
-        // The `tool:name` format should produce {"type":"tool","name":"name"}
-        let tc = "tool:structured_output".to_string();
-        let result = if let Some(tool_name) = tc.strip_prefix("tool:") {
-            serde_json::json!({ "type": "tool", "name": tool_name })
-        } else {
-            serde_json::json!({ "type": tc })
-        };
-        assert_eq!(result["type"], "tool");
-        assert_eq!(result["name"], "structured_output");
+    fn convert_messages_backfills_orphaned_tool_use() {
+        // A turn interrupted mid-flight: assistant emitted a tool_use but the
+        // matching tool_result was never persisted, and a new user message
+        // follows. Sending this raw is a hard 400. The converter must
+        // synthesize a stub tool_result so the history stays well-formed.
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Do a thing.".to_string(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "orphan_1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}
+                    ]
+                })
+                .to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Actually, never mind.".to_string(),
+            },
+        ];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+
+        let assistant_idx = native_msgs
+            .iter()
+            .position(|m| m.role == "assistant")
+            .expect("assistant message present");
+        let next = native_msgs
+            .get(assistant_idx + 1)
+            .expect("a message must follow the tool_use");
+
+        let has_stub = next.content.iter().any(|block| {
+            matches!(
+                block,
+                NativeContentOut::ToolResult { tool_use_id, .. } if tool_use_id == "orphan_1"
+            )
+        });
+        assert!(
+            has_stub,
+            "orphaned tool_use should be answered by a synthesized tool_result"
+        );
+
+        // The tool_result must lead its message (before sibling text).
+        assert!(
+            matches!(
+                next.content.first(),
+                Some(NativeContentOut::ToolResult { .. })
+            ),
+            "tool_result must precede any text in the user message"
+        );
     }
 
     #[test]
-    fn tool_choice_override_without_prefix_produces_type_only() {
-        // Plain strings like "any" or "auto" should produce {"type":"any"}
-        let tc = "any".to_string();
-        let result = if let Some(tool_name) = tc.strip_prefix("tool:") {
-            serde_json::json!({ "type": "tool", "name": tool_name })
-        } else {
-            serde_json::json!({ "type": tc })
-        };
-        assert_eq!(result["type"], "any");
-        assert!(result.get("name").is_none());
+    fn convert_messages_backfills_trailing_orphaned_tool_use() {
+        // The interrupted tool_use is the very last thing in history with no
+        // following message at all. A tool_result message must be appended.
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Do a thing.".to_string(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "trailing_1", "name": "shell", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            },
+        ];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+
+        let last = native_msgs.last().expect("messages present");
+        assert_eq!(last.role, "user");
+        assert!(
+            last.content.iter().any(|block| matches!(
+                block,
+                NativeContentOut::ToolResult { tool_use_id, .. } if tool_use_id == "trailing_1"
+            )),
+            "trailing orphaned tool_use should get an appended tool_result message"
+        );
     }
 
     #[test]
@@ -2340,7 +3405,7 @@ mod tests {
             },
         ];
 
-        let (_system, native_msgs) = AnthropicProvider::convert_messages(&messages);
+        let (_system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
 
         for window in native_msgs.windows(2) {
             assert_ne!(

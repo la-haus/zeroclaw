@@ -1,26 +1,27 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use regex::Regex;
 use reqwest::Client;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
-use zeroclaw_api::provider::ChatMessage;
-use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
+use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_config::schema::{MultimodalConfig, build_remote_fetch_client, validate_remote_host};
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
+// MIME types we will inline for vision providers. Deliberately excludes
+// `image/bmp`: no major vision provider (Anthropic, OpenAI) accepts BMP, so
+// inlining it would make the *entire* provider request fail rather than just
+// dropping the one image. Rejecting it here instead surfaces a clean
+// "could not be loaded" note while the request (and any accompanying text or
+// metadata) still goes through. BMP is still detected by `detect_mime` so the
+// skip is logged as an explicit unsupported-MIME event rather than "unknown".
+const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
+
 const DOCUMENT_MARKER_PREFIX: &str = "[DOCUMENT:";
 
-struct SkippedAttachment {
-    url: String,
-    kind: &'static str,
-    reason: String,
-}
-const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &[
-    "image/png",
-    "image/jpeg",
-    "image/webp",
-    "image/gif",
-    "image/bmp",
-];
+/// MIME types Anthropic accepts directly as base64 `document` content blocks.
+/// Only `application/pdf` is accepted via base64 — `text/plain` is rejected,
+/// so text-based documents are inlined as text instead (see TEXT_DOCUMENT_MIME_TYPES).
 const ALLOWED_DOCUMENT_MIME_TYPES: &[&str] = &["application/pdf"];
 
 /// MIME types that should be inlined as text in the message (not as document blocks).
@@ -73,11 +74,81 @@ static URL_WITH_EXTENSION_RE: LazyLock<Regex> = LazyLock::new(|| {
         .chain(UNSUPPORTED_IMAGE_EXTENSIONS.iter())
         .copied()
         .collect();
-    // Build alternation: png|jpg|jpeg|webp|... (jpeg gets special handling via jpe?g)
     let alt = all_exts.join("|");
     let pattern = format!(r"(?i)(https?://[^\s\]\)>]+\.(?:{alt}))(?:\?[^\s\]\)>]*)?");
     Regex::new(&pattern).expect("URL_WITH_EXTENSION_RE must compile")
 });
+
+/// An attachment (image or document) that could not be processed; reported back
+/// to the model as text so it can tell the user what failed and why.
+struct SkippedAttachment {
+    url: String,
+    kind: &'static str,
+    reason: String,
+}
+
+/// Per-path cache for resolved local image data URIs. Keyed by absolute
+/// path; stores `(len, mtime)` for freshness checks (`(0, 0)` sentinel
+/// = immutable upload). LRU evicts by both entry count and total bytes.
+#[derive(Debug, Default)]
+pub struct LocalImageCache {
+    entries: HashMap<String, (u64, i64, String)>,
+    order: std::collections::VecDeque<String>,
+    bytes: usize,
+}
+
+const LOCAL_IMAGE_CACHE_MAX_ENTRIES: usize = 32;
+const LOCAL_IMAGE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+impl LocalImageCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&mut self, path: &str, len: u64, mtime: i64) -> Option<&str> {
+        let (cached_len, cached_mtime, _) = self.entries.get(path)?;
+        let immutable = *cached_len == 0 && *cached_mtime == 0;
+        let fresh = *cached_len == len && *cached_mtime == mtime;
+        if !immutable && !fresh {
+            return None;
+        }
+        if let Some(pos) = self.order.iter().position(|p| p == path) {
+            let key = self.order.remove(pos).expect("position valid");
+            self.order.push_back(key);
+        }
+        self.entries.get(path).map(|(_, _, uri)| uri.as_str())
+    }
+
+    fn insert(&mut self, path: String, len: u64, mtime: i64, data_uri: String) {
+        if let Some((_, _, old)) = self.entries.remove(&path) {
+            self.bytes = self.bytes.saturating_sub(old.len());
+            if let Some(pos) = self.order.iter().position(|p| p == &path) {
+                self.order.remove(pos);
+            }
+        }
+        self.bytes += data_uri.len();
+        self.entries.insert(path.clone(), (len, mtime, data_uri));
+        self.order.push_back(path);
+        while self.entries.len() > LOCAL_IMAGE_CACHE_MAX_ENTRIES
+            || self.bytes > LOCAL_IMAGE_CACHE_MAX_BYTES
+        {
+            let Some(victim) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((_, _, uri)) = self.entries.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(uri.len());
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PreparedMessages {
@@ -110,6 +181,9 @@ pub enum MultimodalError {
     #[error("multimodal remote image fetch is disabled for '{input}'")]
     RemoteFetchDisabled { input: String },
 
+    #[error("multimodal remote fetch blocked for '{input}': {reason}")]
+    RemoteFetchBlocked { input: String, reason: String },
+
     #[error("multimodal image source not found or unreadable: '{input}'")]
     ImageSourceNotFound { input: String },
 
@@ -123,79 +197,87 @@ pub enum MultimodalError {
     LocalReadFailed { input: String, reason: String },
 }
 
-/// Scan user message text for URLs with recognized file extensions and inject
-/// `[IMAGE:url]` or `[DOCUMENT:url]` markers so the multimodal pipeline can
-/// process them. URLs that already appear inside existing markers are skipped.
-/// Unsupported formats (HEIC/HEIF) are flagged with a descriptive placeholder.
-pub fn inject_url_markers(content: &str) -> String {
-    // Collect (end_offset, marker_to_insert) pairs using actual regex match positions.
-    let mut insertions: Vec<(usize, String)> = Vec::new();
+/// Returns true for payloads that are plausibly loadable image references:
+/// absolute filesystem paths, `http(s)://` URLs, or base64 `data:` URIs.
+/// Placeholder-style payloads like `...`, `<path>`, or `example.png` fail
+/// this check and are left as literal text by [`parse_image_markers`], so
+/// illustrative markdown in a conversation does not trigger loader errors.
+fn is_loadable_image_reference(candidate: &str) -> bool {
+    candidate.starts_with('/')
+        || candidate.starts_with("http://")
+        || candidate.starts_with("https://")
+        || candidate.starts_with("data:")
+        || is_windows_path(candidate)
+        || is_windows_unc_path(candidate)
+}
 
-    for m in URL_WITH_EXTENSION_RE.find_iter(content) {
-        let url = m.as_str();
-        let pos = m.start();
+/// Returns true for Windows-style absolute paths like `C:\…` or `D:/…`.
+fn is_windows_path(candidate: &str) -> bool {
+    let mut chars = candidate.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    let Some(second) = chars.next() else {
+        return false;
+    };
+    if second != ':' {
+        return false;
+    }
+    matches!(chars.next(), Some('\\') | Some('/'))
+}
 
-        // Use the actual match position (not content.find) to check context
-        let before = &content[..pos];
-        let last_open_image = before.rfind(IMAGE_MARKER_PREFIX);
-        let last_open_doc = before.rfind(DOCUMENT_MARKER_PREFIX);
-        let last_close = before.rfind(']');
+/// Returns true for Windows UNC share paths like `\\server\share\…`.
+///
+/// `image_info` emits these after unwrapping the verbatim-UNC prefix
+/// (`\\?\UNC\…`) that `canonicalize` produces on Windows. Without recognizing
+/// the unwrapped form here, [`is_loadable_image_reference`] would reject the
+/// marker (it is neither a `/`-rooted POSIX path nor a `C:\` drive path), so
+/// [`parse_image_markers`] would leave it as literal text and the image would
+/// never be inlined for vision models. Requires a non-empty server component
+/// and at least one further path segment; the verbatim/device prefixes
+/// (`\\?\…`, `\\.\…`) are rejected because they are not plain shares.
+fn is_windows_unc_path(candidate: &str) -> bool {
+    let Some(rest) = candidate.strip_prefix(r"\\") else {
+        return false;
+    };
+    if rest.starts_with('?') || rest.starts_with('.') {
+        return false;
+    }
+    let mut parts = rest.splitn(2, ['\\', '/']);
+    let server = parts.next().unwrap_or("");
+    let share = parts.next().unwrap_or("");
+    !server.is_empty() && !share.is_empty()
+}
 
-        let inside_marker = match (last_open_image.or(last_open_doc), last_close) {
-            (Some(open), Some(close)) => open > close,
-            (Some(_), None) => true,
-            _ => false,
-        };
-        if inside_marker {
+/// Normalize a marker payload that may have been line-wrapped when pasted
+/// from a terminal (e.g. a log line where a long path was broken across
+/// rows with leading indentation). Interior newlines — and any whitespace
+/// immediately following them — are dropped; leading/trailing whitespace
+/// is trimmed. Legitimate paths may contain spaces but never newlines, so
+/// this only recovers corrupted markers and does not mangle real paths.
+fn collapse_wrapped_marker(raw: &str) -> String {
+    if !raw.contains('\n') && !raw.contains('\r') {
+        return raw.trim().to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut skip_ws = false;
+    for ch in raw.chars() {
+        if ch == '\n' || ch == '\r' {
+            skip_ws = true;
             continue;
         }
-
-        // Check if a marker already follows this URL
-        let after = &content[m.end()..];
-        if after.starts_with(" [IMAGE:") || after.starts_with(" [DOCUMENT:") {
-            continue;
+        if skip_ws {
+            if ch.is_whitespace() {
+                continue;
+            }
+            skip_ws = false;
         }
-
-        // Extract extension from the URL path (before query string)
-        let url_path = url.split('?').next().unwrap_or(url);
-        let ext = url_path
-            .rsplit('.')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-
-        let marker = if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
-            format!(" [IMAGE:{url}]")
-        } else if DOCUMENT_EXTENSIONS.contains(&ext.as_str()) {
-            format!(" [DOCUMENT:{url}]")
-        } else if UNSUPPORTED_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
-            format!(
-                " [Unsupported file: {url} — HEIC/HEIF format is not supported by the AI provider. Ask the user to resend as JPEG or PNG.]"
-            )
-        } else {
-            continue;
-        };
-
-        tracing::debug!(
-            url,
-            marker_kind = ext.as_str(),
-            "Injecting URL marker from plain text"
-        );
-        insertions.push((m.end(), marker));
+        out.push(ch);
     }
-
-    if insertions.is_empty() {
-        return content.to_string();
-    }
-
-    // Build result by inserting markers at correct positions (process right-to-left
-    // to preserve offsets when inserting into the string).
-    let mut result = content.to_string();
-    for (end_pos, marker) in insertions.into_iter().rev() {
-        result.insert_str(end_pos, &marker);
-    }
-
-    result
+    out.trim().to_string()
 }
 
 pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
@@ -215,12 +297,15 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
         };
 
         let end = marker_start + rel_end;
-        let candidate = content[marker_start..end].trim();
+        let candidate = collapse_wrapped_marker(&content[marker_start..end]);
 
-        if candidate.is_empty() {
+        if candidate.is_empty() || !is_loadable_image_reference(&candidate) {
+            // Preserve the original marker text (placeholders like
+            // `[IMAGE:...]` or `[IMAGE:<path>]` should survive as prose
+            // rather than triggering a loader error).
             cleaned.push_str(&content[start..=end]);
         } else {
-            refs.push(candidate.to_string());
+            refs.push(candidate);
         }
 
         cursor = end + 1;
@@ -234,10 +319,21 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
 }
 
 pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
+    let latest_tool_indices = latest_tool_result_indices(messages);
+    count_image_markers_with_latest_tool_results(messages, &latest_tool_indices)
+}
+
+fn count_image_markers_with_latest_tool_results(
+    messages: &[ChatMessage],
+    latest_tool_result_indices: &HashSet<usize>,
+) -> usize {
     messages
         .iter()
-        .filter(|m| m.role == "user")
-        .map(|m| parse_image_markers(&m.content).1.len())
+        .enumerate()
+        .filter(|(index, message)| {
+            should_normalize_message_images(*index, message, latest_tool_result_indices)
+        })
+        .map(|(_, message)| parse_image_markers(&message.content).1.len())
         .sum()
 }
 
@@ -245,6 +341,78 @@ pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
 }
 
+/// Scan user message text for URLs with recognized file extensions and inject
+/// `[IMAGE:url]` or `[DOCUMENT:url]` markers so the multimodal pipeline can
+/// process them. URLs that already appear inside existing markers are skipped.
+/// Unsupported formats (HEIC/HEIF) are flagged with a descriptive placeholder.
+pub fn inject_url_markers(content: &str) -> String {
+    // Collect (end_offset, marker_to_insert) pairs using actual regex match positions.
+    let mut insertions: Vec<(usize, String)> = Vec::new();
+
+    for m in URL_WITH_EXTENSION_RE.find_iter(content) {
+        let url = m.as_str();
+        let pos = m.start();
+
+        // Use the actual match position (not content.find) to check context.
+        let before = &content[..pos];
+        let last_open_image = before.rfind(IMAGE_MARKER_PREFIX);
+        let last_open_doc = before.rfind(DOCUMENT_MARKER_PREFIX);
+        let last_close = before.rfind(']');
+
+        let inside_marker = match (last_open_image.or(last_open_doc), last_close) {
+            (Some(open), Some(close)) => open > close,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if inside_marker {
+            continue;
+        }
+
+        // Check if a marker already follows this URL.
+        let after = &content[m.end()..];
+        if after.starts_with(" [IMAGE:") || after.starts_with(" [DOCUMENT:") {
+            continue;
+        }
+
+        // Extract extension from the URL path (before query string).
+        let url_path = url.split('?').next().unwrap_or(url);
+        let ext = url_path
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        let marker = if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+            format!(" [IMAGE:{url}]")
+        } else if DOCUMENT_EXTENSIONS.contains(&ext.as_str()) {
+            format!(" [DOCUMENT:{url}]")
+        } else if UNSUPPORTED_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+            format!(
+                " [Unsupported file: {url} — HEIC/HEIF format is not supported by the AI provider. Ask the user to resend as JPEG or PNG.]"
+            )
+        } else {
+            continue;
+        };
+
+        insertions.push((m.end(), marker));
+    }
+
+    if insertions.is_empty() {
+        return content.to_string();
+    }
+
+    // Insert markers at the captured positions, right-to-left to preserve offsets.
+    let mut result = content.to_string();
+    for (end_pos, marker) in insertions.into_iter().rev() {
+        result.insert_str(end_pos, &marker);
+    }
+
+    result
+}
+
+/// Parse `[DOCUMENT:ref]` markers out of `content`, returning the cleaned text
+/// (markers removed) and the list of document references. Empty markers
+/// (`[DOCUMENT:]`) are preserved as literal text.
 pub fn parse_document_markers(content: &str) -> (String, Vec<String>) {
     let mut refs = Vec::new();
     let mut cleaned = String::with_capacity(content.len());
@@ -292,6 +460,68 @@ pub fn contains_document_markers(messages: &[ChatMessage]) -> bool {
     count_document_markers(messages) > 0
 }
 
+/// Count image markers that originate from genuine **user** messages (i.e.
+/// inbound attachments), excluding tool-result carriers (`role == "tool"` and
+/// `[Tool results]` user messages).
+///
+/// Callers use this to distinguish "the user sent an image we cannot see"
+/// (which should surface a user-facing capability error so the attachment is
+/// not silently ignored) from "an image marker arrived only via a tool result"
+/// (e.g. `image_info`/`screenshot`/`image_gen`), which can degrade to text-only
+/// on a non-vision provider without misleading the user.
+pub fn count_user_image_markers(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|message| message.role == "user" && !is_prompt_tool_result_message(message))
+        .map(|message| parse_image_markers(&message.content).1.len())
+        .sum()
+}
+
+/// Count image markers in the **most recent** genuine user message (the newest
+/// inbound user turn), ignoring tool-result carriers and any earlier user
+/// messages still present in history.
+///
+/// This is the turn-scoped counterpart to [`count_user_image_markers`]. It lets
+/// the vision router distinguish "the user *just* sent an image we cannot see"
+/// (surface a capability error so the attachment is not silently ignored) from
+/// "an earlier user image is merely carried over in history" (degrade to
+/// text-only). Erroring on a carried-over marker would poison every later turn,
+/// since the marker lives in the long-lived session history permanently. That
+/// was the reported bug: a single image to a non-vision provider made every
+/// subsequent text turn fail.
+pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
+        .map(|message| parse_image_markers(&message.content).1.len())
+        .unwrap_or(0)
+}
+
+/// Replace media markers (`[IMAGE:...]`, `[PHOTO:...]`, `[DOCUMENT:...]`,
+/// `[FILE:...]`, `[VIDEO:...]`, `[VOICE:...]`, `[AUDIO:...]`) with
+/// `[media attachment]`. Match is case-insensitive to align with the channel
+/// attachment parsers, which all uppercase the kind before comparing
+/// (`crates/zeroclaw-channels/src/util.rs::ATTACHMENT_KINDS`,
+/// `telegram.rs`, `discord.rs`, `qq.rs`, `whatsapp_web.rs`).
+///
+/// Use before passing user-facing text to auxiliary `chat_with_system` calls
+/// (intent classification, summarization, delegation) so that local file
+/// paths from inbound channels do not leak to the upstream provider — the
+/// upstream API would otherwise receive a filesystem path as `image_url.url`
+/// and reject the request.
+///
+/// Auxiliary calls do not need to *see* the media content; they only route
+/// or summarize, so the placeholder is sufficient. The main agent loop
+/// continues to call `prepare_messages_for_provider` for full normalization.
+pub fn strip_media_markers(text: &str) -> String {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\[(?:IMAGE|PHOTO|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]")
+            .unwrap()
+    });
+    RE.replace_all(text, "[media attachment]").into_owned()
+}
+
 pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     if image_ref.starts_with("data:") {
         let comma_idx = image_ref.find(',')?;
@@ -307,27 +537,188 @@ pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     }
 }
 
+fn is_prompt_tool_result_message(message: &ChatMessage) -> bool {
+    message.role == "user" && message.content.trim_start().starts_with("[Tool results]")
+}
+
+fn is_tool_result_carrier(message: &ChatMessage) -> bool {
+    message.role == "tool" || is_prompt_tool_result_message(message)
+}
+
+fn latest_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
+    let mut indices = HashSet::new();
+    let Some((last_index, last_message)) = messages.iter().enumerate().next_back() else {
+        return indices;
+    };
+
+    if is_prompt_tool_result_message(last_message) {
+        indices.insert(last_index);
+        return indices;
+    }
+
+    if last_message.role == "tool" {
+        for (index, message) in messages.iter().enumerate().rev() {
+            if message.role != "tool" {
+                break;
+            }
+            indices.insert(index);
+        }
+    }
+
+    indices
+}
+
+fn should_normalize_message_images(
+    index: usize,
+    message: &ChatMessage,
+    latest_tool_result_indices: &HashSet<usize>,
+) -> bool {
+    if is_tool_result_carrier(message) {
+        return latest_tool_result_indices.contains(&index);
+    }
+
+    message.role == "user"
+}
+
+fn stripped_image_marker_text(content: &str) -> String {
+    let (cleaned, refs) = parse_image_markers(content);
+    if refs.is_empty() {
+        return content.to_string();
+    }
+
+    if cleaned.trim().is_empty() {
+        "[image removed from history]".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
+    if !message.content.contains(IMAGE_MARKER_PREFIX) {
+        return message.clone();
+    }
+
+    if message.role == "tool"
+        && let Ok(serde_json::Value::Object(mut obj)) =
+            serde_json::from_str::<serde_json::Value>(&message.content)
+        && let Some(serde_json::Value::String(inner)) = obj.get("content").cloned()
+    {
+        let stripped = stripped_image_marker_text(&inner);
+        if stripped == inner {
+            return message.clone();
+        }
+
+        obj.insert("content".to_string(), serde_json::Value::String(stripped));
+        return ChatMessage {
+            role: message.role.clone(),
+            content: serde_json::Value::Object(obj).to_string(),
+        };
+    }
+
+    ChatMessage {
+        role: message.role.clone(),
+        content: stripped_image_marker_text(&message.content),
+    }
+}
+
+fn replay_message_without_stale_tool_images(
+    index: usize,
+    message: &ChatMessage,
+    latest_tool_result_indices: &HashSet<usize>,
+) -> ChatMessage {
+    if is_tool_result_carrier(message) && !latest_tool_result_indices.contains(&index) {
+        strip_tool_result_image_markers(message)
+    } else {
+        message.clone()
+    }
+}
+
+/// Attempt to normalize image markers inside a native tool-result JSON
+/// payload produced by `NativeToolDispatcher::to_provider_messages`. On
+/// success, returns the reserialized JSON string with the inner `content`
+/// field rewritten to inline `[IMAGE:data:…]` markers (data URIs). Returns
+/// `Ok(None)` when the payload is not a JSON object with a string `content`
+/// field, when the inner content has no normalizable markers, or when no
+/// rewriting is needed — letting the caller fall through to the existing
+/// plain-text path. The returned JSON preserves `tool_call_id` and any
+/// other top-level fields so downstream native adapters
+/// (e.g. `OpenAiCompatibleProvider::convert_messages_for_native`) can keep
+/// recovering the tool-call linkage via `serde_json::from_str`.
+async fn normalize_native_tool_result_json(
+    content: &str,
+    config: &MultimodalConfig,
+    max_bytes: usize,
+    remote_client: &Client,
+    ctx: &ImageNormalizeCtx<'_>,
+    cache: Option<&mut LocalImageCache>,
+) -> Option<(String, bool)> {
+    let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str::<serde_json::Value>(content)
+    else {
+        return None;
+    };
+
+    let Some(serde_json::Value::String(inner)) = obj.get("content").cloned() else {
+        return None;
+    };
+
+    let (cleaned_text, refs) = parse_image_markers(&inner);
+    if refs.is_empty() {
+        return None;
+    }
+
+    let normalized =
+        normalize_image_references(&refs, config, max_bytes, remote_client, ctx, cache).await;
+    let new_inner = compose_multimodal_content(
+        &cleaned_text,
+        &normalized.data_uris,
+        normalized.skipped_count,
+        refs.len(),
+    );
+    obj.insert("content".to_string(), serde_json::Value::String(new_inner));
+
+    Some((
+        serde_json::Value::Object(obj).to_string(),
+        !normalized.data_uris.is_empty(),
+    ))
+}
+
 pub async fn prepare_messages_for_provider(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
 ) -> anyhow::Result<PreparedMessages> {
+    prepare_messages_inner(messages, config, None).await
+}
+
+/// Like [`prepare_messages_for_provider`] but reuses a [`LocalImageCache`]
+/// across calls so each unique local image file is read from disk at most
+/// once per session (or once per modification for mutable files).
+pub async fn prepare_messages_for_provider_cached(
+    messages: &[ChatMessage],
+    config: &MultimodalConfig,
+    cache: &mut LocalImageCache,
+) -> anyhow::Result<PreparedMessages> {
+    prepare_messages_inner(messages, config, Some(cache)).await
+}
+
+async fn prepare_messages_inner(
+    messages: &[ChatMessage],
+    config: &MultimodalConfig,
+    mut cache: Option<&mut LocalImageCache>,
+) -> anyhow::Result<PreparedMessages> {
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
-    // Pre-process: detect URLs with supported file extensions in user messages
-    // and inject [IMAGE:url] or [DOCUMENT:url] markers automatically.
-    let enriched: Vec<ChatMessage> = messages
+    // Pre-process: detect URLs with supported file extensions in plain user text
+    // and inject [IMAGE:url]/[DOCUMENT:url] markers so they flow through the
+    // pipeline. Only touches user messages that contain an http(s) URL; indices
+    // and roles are preserved so stale-tool-result handling stays valid.
+    let enriched_vec: Vec<ChatMessage> = messages
         .iter()
         .map(|m| {
             if m.role == "user" && (m.content.contains("http://") || m.content.contains("https://"))
             {
                 let injected = inject_url_markers(&m.content);
                 if injected != m.content {
-                    tracing::debug!(
-                        original_len = m.content.len(),
-                        enriched_len = injected.len(),
-                        "Injected URL markers from plain text"
-                    );
                     return ChatMessage {
                         role: m.role.clone(),
                         content: injected,
@@ -337,91 +728,235 @@ pub async fn prepare_messages_for_provider(
             m.clone()
         })
         .collect();
+    let messages: &[ChatMessage] = &enriched_vec;
 
-    let total_images = count_image_markers(&enriched);
-    let total_documents = count_document_markers(&enriched);
+    let latest_tool_indices = latest_tool_result_indices(messages);
+    let total_images = count_image_markers_with_latest_tool_results(messages, &latest_tool_indices);
+    let total_documents = count_document_markers(messages);
 
     if total_images == 0 && total_documents == 0 {
         return Ok(PreparedMessages {
-            messages: enriched,
+            messages: messages
+                .iter()
+                .enumerate()
+                .map(|(index, message)| {
+                    replay_message_without_stale_tool_images(index, message, &latest_tool_indices)
+                })
+                .collect(),
             contains_images: false,
             contains_documents: false,
         });
     }
 
-    // When image count exceeds the limit, strip markers from oldest messages
-    // first so that the most recent (most relevant) images survive. This
-    // prevents conversations from becoming permanently stuck once the
-    // cumulative image count crosses the threshold.
-    let trimmed = if total_images > max_images {
-        trim_old_images(&enriched, max_images)
-    } else {
-        enriched
-    };
+    // Normalize every image marker first, then enforce the per-request image
+    // cap further below based only on images that *successfully* normalize.
+    // Trimming the oldest images *before* normalization is unsafe: a newer
+    // image ref that fails to load would evict an older valid one that could
+    // still have been sent (see `skipped_images_do_not_consume_image_budget`).
+    // The post-normalization cap keeps the most recent successful images and
+    // prevents conversations from sticking once the cumulative count crosses
+    // the threshold, so no pre-normalization trim is needed here.
+    let remote_client = build_remote_fetch_client(
+        "model_provider.ollama",
+        30,
+        10,
+        &config.remote_fetch_allowed_hosts,
+    );
+    let latest_tool_indices = latest_tool_result_indices(messages);
 
-    let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
+    let mut normalized_messages = Vec::with_capacity(messages.len());
+    let mut has_successful_images = false;
+    for (index, message) in messages.iter().enumerate() {
+        if !should_normalize_message_images(index, message, &latest_tool_indices) {
+            normalized_messages.push(replay_message_without_stale_tool_images(
+                index,
+                message,
+                &latest_tool_indices,
+            ));
+            continue;
+        }
 
-    let mut normalized_messages = Vec::with_capacity(trimmed.len());
-    let mut has_images = false;
-    let mut has_documents = false;
+        // Native tool dispatchers wrap tool results as a JSON object
+        // (`{"tool_call_id":"…","content":"…"}`) so that provider adapters
+        // can recover `tool_call_id` via `serde_json::from_str` on
+        // `message.content`. Treating that JSON blob as plain text would
+        // strip markers out of the `content` field and append the data URI
+        // outside the JSON object, breaking the native tool-result contract
+        // and dropping `tool_call_id`. When we recognise that shape,
+        // normalize only the inner `content` string and reserialize the
+        // JSON so adapters keep seeing the structure they expect. Falls
+        // through to the plain-text path for non-JSON tool messages.
+        if message.role == "tool"
+            && let Some((prepared, contains_images)) = normalize_native_tool_result_json(
+                &message.content,
+                config,
+                max_bytes,
+                &remote_client,
+                &ImageNormalizeCtx {
+                    message_index: index,
+                    role: &message.role,
+                },
+                cache.as_deref_mut(),
+            )
+            .await
+        {
+            normalized_messages.push(ChatMessage {
+                role: message.role.clone(),
+                content: prepared,
+            });
+            has_successful_images |= contains_images;
+            continue;
+        }
 
-    for message in &trimmed {
-        if message.role != "user" {
+        let (cleaned_text, refs) = parse_image_markers(&message.content);
+        if refs.is_empty() {
             normalized_messages.push(message.clone());
             continue;
         }
 
-        // --- Image processing (non-fatal) ---
-        let (text_after_images, image_refs) = parse_image_markers(&message.content);
+        let normalized = normalize_image_references(
+            &refs,
+            config,
+            max_bytes,
+            &remote_client,
+            &ImageNormalizeCtx {
+                message_index: index,
+                role: &message.role,
+            },
+            cache.as_deref_mut(),
+        )
+        .await;
+        let content = compose_multimodal_content(
+            &cleaned_text,
+            &normalized.data_uris,
+            normalized.skipped_count,
+            refs.len(),
+        );
+        has_successful_images |= !normalized.data_uris.is_empty();
+        normalized_messages.push(ChatMessage {
+            role: message.role.clone(),
+            content,
+        });
+    }
 
-        let mut normalized_image_refs = Vec::with_capacity(image_refs.len());
-        let mut skipped_attachments: Vec<SkippedAttachment> = Vec::new();
-        for reference in &image_refs {
-            match normalize_image_reference(reference, config, max_bytes, &remote_client).await {
-                Ok(data_uri) => normalized_image_refs.push(data_uri),
-                Err(e) => {
-                    tracing::warn!(source = %reference, error = %e, "Skipping invalid image in multimodal pipeline");
-                    skipped_attachments.push(SkippedAttachment {
-                        url: reference.clone(),
-                        kind: "image",
-                        reason: e.to_string(),
-                    });
-                }
-            }
+    // Apply age-based trimming when configured: strip images from user messages
+    // older than `max_image_turns` turns back from the end of history.
+    // `max_image_turns == 0` means disabled — no age trimming.
+    let age_trimmed = if config.max_image_turns > 0 {
+        let before = count_image_markers(&normalized_messages);
+        let trimmed = trim_images_by_age(&normalized_messages, config.max_image_turns);
+        let after = count_image_markers(&trimmed);
+        if after < before {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "max_image_turns": config.max_image_turns,
+                        "images_before": before,
+                        "images_after": after,
+                        "images_dropped": before - after,
+                    })),
+                "multimodal: age-trimmed old images from conversation history"
+            );
+        }
+        trimmed
+    } else {
+        normalized_messages
+    };
+
+    // Apply the per-request image cap after normalization so failed image refs
+    // do not consume budget and evict older images that could still be sent.
+    let capped_messages = if has_successful_images && count_image_markers(&age_trimmed) > max_images
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "images_after_normalization": count_image_markers(&age_trimmed),
+                    "max_images": max_images,
+                })),
+            "multimodal: post-normalization image cap exceeded — trimming oldest images"
+        );
+        trim_old_images(&age_trimmed, max_images)
+    } else {
+        age_trimmed
+    };
+
+    // Document post-pass: [DOCUMENT:] markers survive image normalization
+    // untouched (parse_image_markers ignores them). Process them now on user
+    // messages: download, convert Office→PDF, inline CSV/text, or reclassify
+    // image-typed "documents" (e.g. a .webp sent as type=document) through the
+    // image path. Documents do not affect vision routing (already resolved).
+    let (final_messages, contains_documents) = if total_documents > 0 {
+        apply_document_processing(capped_messages, config, max_bytes).await
+    } else {
+        (capped_messages, false)
+    };
+
+    Ok(PreparedMessages {
+        contains_images: count_image_markers(&final_messages) > 0,
+        contains_documents,
+        messages: final_messages,
+    })
+}
+
+/// Process `[DOCUMENT:]` markers in user messages. Returns the rewritten
+/// messages and whether any document was successfully attached. Image-typed
+/// "documents" are reclassified and routed through the image pipeline.
+async fn apply_document_processing(
+    messages: Vec<ChatMessage>,
+    config: &MultimodalConfig,
+    max_bytes: usize,
+) -> (Vec<ChatMessage>, bool) {
+    let remote_client = build_remote_fetch_client(
+        "model_provider.ollama",
+        30,
+        10,
+        &config.remote_fetch_allowed_hosts,
+    );
+    let mut has_documents = false;
+    let mut out = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        if message.role != "user" {
+            out.push(message);
+            continue;
         }
 
-        // --- Document processing (non-fatal, with image reclassification) ---
-        let (text_after_docs, doc_refs) = parse_document_markers(&text_after_images);
+        let (text_after_docs, doc_refs) = parse_document_markers(&message.content);
+        if doc_refs.is_empty() {
+            out.push(message);
+            continue;
+        }
 
-        // Track URLs reclassified from document → image so compose_multimodal
-        // includes them in the image attachment list, not the document list.
-        let mut reclassified_image_urls: Vec<String> = Vec::new();
-        let mut normalized_doc_refs = Vec::with_capacity(doc_refs.len());
+        let mut normalized_doc_uris = Vec::with_capacity(doc_refs.len());
+        let mut reclassified_image_uris = Vec::new();
+        let mut skipped: Vec<SkippedAttachment> = Vec::new();
+
         for reference in &doc_refs {
             match normalize_remote_document(reference, config, &remote_client).await {
-                Ok(data_uri) => normalized_doc_refs.push(data_uri),
-                Err(e) => {
-                    // Reclassify: if the "document" is actually an image (e.g. a .webp
-                    // sent with type=document by the messaging platform), route it
-                    // through the image pipeline instead of failing.
-                    if is_image_mime_error(&e) {
-                        tracing::info!(source = %reference, "Reclassifying document as image (MIME is image type)");
+                Ok(data_uri) => normalized_doc_uris.push(data_uri),
+                Err(error) => {
+                    // Reclassify: a "document" with an image MIME type (e.g. a
+                    // .webp marked type=document by the messaging platform) is
+                    // routed through the image pipeline instead of failing.
+                    if is_image_mime_error(&error) {
                         match normalize_image_reference(
                             reference,
                             config,
                             max_bytes,
                             &remote_client,
+                            None,
                         )
                         .await
                         {
                             Ok(data_uri) => {
-                                normalized_image_refs.push(data_uri);
-                                reclassified_image_urls.push(reference.clone());
+                                reclassified_image_uris.push(data_uri);
                                 continue;
                             }
                             Err(img_err) => {
-                                tracing::warn!(source = %reference, error = %img_err, "Reclassified image also failed");
-                                skipped_attachments.push(SkippedAttachment {
+                                skipped.push(SkippedAttachment {
                                     url: reference.clone(),
                                     kind: "image (reclassified from document)",
                                     reason: img_err.to_string(),
@@ -430,61 +965,169 @@ pub async fn prepare_messages_for_provider(
                             }
                         }
                     }
-                    tracing::warn!(source = %reference, error = %e, "Skipping invalid document in multimodal pipeline");
-                    skipped_attachments.push(SkippedAttachment {
+                    skipped.push(SkippedAttachment {
                         url: reference.clone(),
                         kind: "document",
-                        reason: e.to_string(),
+                        reason: error.to_string(),
                     });
                 }
             }
         }
 
-        if image_refs.is_empty() && doc_refs.is_empty() {
-            normalized_messages.push(message.clone());
-            continue;
-        }
-
-        if !normalized_image_refs.is_empty() {
-            has_images = true;
-        }
-        if !normalized_doc_refs.is_empty() {
+        if !normalized_doc_uris.is_empty() {
             has_documents = true;
         }
 
-        // Merge reclassified image URLs into the image URL list for compose
-        let mut all_image_urls = image_refs.clone();
-        all_image_urls.extend(reclassified_image_urls);
-
-        let content = compose_multimodal_message_full(
+        let content = compose_with_documents(
             &text_after_docs,
-            &all_image_urls,
-            &normalized_image_refs,
             &doc_refs,
-            &normalized_doc_refs,
-            &skipped_attachments,
+            &reclassified_image_uris,
+            &normalized_doc_uris,
+            &skipped,
         );
-        normalized_messages.push(ChatMessage {
-            role: message.role.clone(),
+        out.push(ChatMessage {
+            role: message.role,
             content,
         });
     }
 
-    Ok(PreparedMessages {
-        messages: normalized_messages,
-        contains_images: has_images,
-        contains_documents: has_documents,
-    })
+    (out, has_documents)
+}
+
+/// Compose the final user-message content for the document post-pass. `base_text`
+/// already contains any normalized inline `[IMAGE:data:…]` markers from the image
+/// pass; this appends original-URL references, skip notes, reclassified images,
+/// and the document blocks (native `[DOCUMENT:data:…]` or inlined text content).
+fn compose_with_documents(
+    base_text: &str,
+    original_doc_urls: &[String],
+    reclassified_image_uris: &[String],
+    document_uris: &[String],
+    skipped: &[SkippedAttachment],
+) -> String {
+    const INLINE_TEXT_PREFIX: &str = "[INLINE_TEXT:";
+
+    let mut content = String::new();
+    let trimmed = base_text.trim();
+    if !trimmed.is_empty() {
+        content.push_str(trimmed);
+        content.push_str("\n\n");
+    }
+
+    // Preserve original document URLs as text so the model can reference them
+    // (e.g. forward a file URL to Slack or another skill).
+    let url_refs: Vec<String> = original_doc_urls
+        .iter()
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+        .map(|url| format!("- Attached document: {url}"))
+        .collect();
+    if !url_refs.is_empty() {
+        content.push_str("Attachments:\n");
+        content.push_str(&url_refs.join("\n"));
+        content.push_str("\n\n");
+    }
+
+    if !skipped.is_empty() {
+        content.push_str("Skipped attachments (could not be processed):\n");
+        for s in skipped {
+            content.push_str(&format!("- {} {}: {}\n", s.kind, s.url, s.reason));
+        }
+        content.push('\n');
+    }
+
+    for (index, data_uri) in reclassified_image_uris.iter().enumerate() {
+        if index > 0 {
+            content.push('\n');
+        }
+        content.push_str(IMAGE_MARKER_PREFIX);
+        content.push_str(data_uri);
+        content.push(']');
+    }
+
+    if !reclassified_image_uris.is_empty() && !document_uris.is_empty() {
+        content.push('\n');
+    }
+
+    for (index, data_uri) in document_uris.iter().enumerate() {
+        if index > 0 {
+            content.push('\n');
+        }
+        if data_uri.starts_with(INLINE_TEXT_PREFIX) && data_uri.ends_with(']') {
+            // Text-based document (CSV, plain text) — inline as text, since
+            // Anthropic rejects text/plain in base64 document blocks.
+            let text_content = &data_uri[INLINE_TEXT_PREFIX.len()..data_uri.len() - 1];
+            content.push_str("File content:\n```\n");
+            content.push_str(text_content);
+            content.push_str("\n```");
+        } else {
+            content.push_str(DOCUMENT_MARKER_PREFIX);
+            content.push_str(data_uri);
+            content.push(']');
+        }
+    }
+
+    content
+}
+/// Strip images from user messages that are more than `max_turns` turns back
+/// from the end of `messages`.  A "turn" here is counted as a user-role
+/// message, so `max_turns = 2` keeps images in the two most recent user
+/// messages and strips them from all earlier ones.  Tool-result images are
+/// handled by the stale-tool-result mechanism and are left untouched.
+fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMessage> {
+    // Count user messages from the end to find the cutoff index.
+    let mut user_turn_count = 0usize;
+    let mut cutoff = 0usize; // messages at index < cutoff are "too old"
+    for (i, m) in messages.iter().enumerate().rev() {
+        if m.role == "user" {
+            user_turn_count += 1;
+            if user_turn_count > max_turns {
+                // Everything up to and including this index is too old.
+                cutoff = i + 1;
+                break;
+            }
+        }
+    }
+
+    if cutoff == 0 {
+        return messages.to_vec();
+    }
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if i < cutoff && m.role == "user" {
+                let (cleaned, refs) = parse_image_markers(&m.content);
+                if refs.is_empty() {
+                    return m.clone();
+                }
+                let text = if cleaned.trim().is_empty() {
+                    "[image removed from history]".to_string()
+                } else {
+                    cleaned
+                };
+                ChatMessage {
+                    role: m.role.clone(),
+                    content: text,
+                }
+            } else {
+                m.clone()
+            }
+        })
+        .collect()
 }
 
 /// Strip image markers from older messages (oldest first) until total image
 /// count is within `max_images`. Keeps the text content of each message.
 fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessage> {
+    let latest_tool_indices = latest_tool_result_indices(messages);
     // Find which messages (by index) contain images, oldest first.
     let image_positions: Vec<(usize, usize)> = messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.role == "user")
+        .filter(|(index, message)| {
+            should_normalize_message_images(*index, message, &latest_tool_indices)
+        })
         .filter_map(|(i, m)| {
             let count = parse_image_markers(&m.content).1.len();
             if count > 0 { Some((i, count)) } else { None }
@@ -521,20 +1164,13 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
                     content: text,
                 }
             } else {
-                m.clone()
+                replay_message_without_stale_tool_images(i, m, &latest_tool_indices)
             }
         })
         .collect()
 }
 
-fn compose_multimodal_message_full(
-    text: &str,
-    original_image_urls: &[String],
-    image_uris: &[String],
-    original_doc_urls: &[String],
-    document_uris: &[String],
-    skipped: &[SkippedAttachment],
-) -> String {
+fn compose_multimodal_message(text: &str, data_uris: &[String]) -> String {
     let mut content = String::new();
     let trimmed = text.trim();
 
@@ -543,35 +1179,7 @@ fn compose_multimodal_message_full(
         content.push_str("\n\n");
     }
 
-    // Preserve original URLs as text so the model can reference them
-    // (e.g., to forward a file URL to Slack or another skill).
-    let mut url_refs: Vec<String> = Vec::new();
-    for url in original_image_urls {
-        if url.starts_with("http://") || url.starts_with("https://") {
-            url_refs.push(format!("- Attached image: {url}"));
-        }
-    }
-    for url in original_doc_urls {
-        if url.starts_with("http://") || url.starts_with("https://") {
-            url_refs.push(format!("- Attached document: {url}"));
-        }
-    }
-    if !url_refs.is_empty() {
-        content.push_str("Attachments:\n");
-        content.push_str(&url_refs.join("\n"));
-        content.push_str("\n\n");
-    }
-
-    // Report skipped attachments with details
-    if !skipped.is_empty() {
-        content.push_str("Skipped attachments (could not be processed):\n");
-        for s in skipped {
-            content.push_str(&format!("- {} {}: {}\n", s.kind, s.url, s.reason));
-        }
-        content.push('\n');
-    }
-
-    for (index, data_uri) in image_uris.iter().enumerate() {
+    for (index, data_uri) in data_uris.iter().enumerate() {
         if index > 0 {
             content.push('\n');
         }
@@ -580,29 +1188,177 @@ fn compose_multimodal_message_full(
         content.push(']');
     }
 
-    if !image_uris.is_empty() && !document_uris.is_empty() {
-        content.push('\n');
-    }
-
-    const INLINE_TEXT_PREFIX: &str = "[INLINE_TEXT:";
-    for (index, data_uri) in document_uris.iter().enumerate() {
-        if index > 0 {
-            content.push('\n');
-        }
-        if data_uri.starts_with(INLINE_TEXT_PREFIX) && data_uri.ends_with(']') {
-            // Text-based document (CSV, plain text) — inline as text, not document block
-            let text_content = &data_uri[INLINE_TEXT_PREFIX.len()..data_uri.len() - 1];
-            content.push_str("File content:\n```\n");
-            content.push_str(text_content);
-            content.push_str("\n```");
-        } else {
-            content.push_str(DOCUMENT_MARKER_PREFIX);
-            content.push_str(data_uri);
-            content.push(']');
-        }
-    }
-
     content
+}
+
+struct NormalizedImageReferences {
+    data_uris: Vec<String>,
+    skipped_count: usize,
+}
+
+/// Context attached to image-skip log events so callers can be identified.
+struct ImageNormalizeCtx<'a> {
+    /// Zero-based index of this message in the conversation history.
+    message_index: usize,
+    /// Role of the message containing the image reference.
+    role: &'a str,
+}
+
+async fn normalize_image_references(
+    refs: &[String],
+    config: &MultimodalConfig,
+    max_bytes: usize,
+    remote_client: &Client,
+    ctx: &ImageNormalizeCtx<'_>,
+    mut cache: Option<&mut LocalImageCache>,
+) -> NormalizedImageReferences {
+    let mut data_uris = Vec::with_capacity(refs.len());
+    let mut skipped_count = 0usize;
+
+    for reference in refs {
+        match normalize_image_reference(
+            reference,
+            config,
+            max_bytes,
+            remote_client,
+            cache.as_deref_mut(),
+        )
+        .await
+        {
+            Ok(data_uri) => data_uris.push(data_uri),
+            Err(error) => {
+                skipped_count += 1;
+                let error_reason = multimodal_error_reason(&error);
+                // Truncate the raw reference so we don't dump a full base64
+                // payload into the log, but keep enough to identify the source.
+                let marker_preview: String = reference.chars().take(120).collect();
+                let error_kind = multimodal_error_kind(&error);
+                let attrs = ::serde_json::json!({
+                    "message_index": ctx.message_index,
+                    "message_role": ctx.role,
+                    "source_kind": image_reference_kind(reference),
+                    "error_kind": error_kind,
+                    "reason": error_reason.as_deref().unwrap_or(""),
+                    "marker_preview": marker_preview,
+                });
+                // Severity rules:
+                //   - For inbound user attachments, any failure is a real
+                //     loss the operator cares about → WARN.
+                //   - For tool-result content, marker-looking strings often
+                //     come from tool output that just happened to contain
+                //     `[IMAGE:...]` patterns (e.g. an agent reading a test
+                //     fixture, a code search hitting an assertion, log
+                //     snippets). Treat best-effort recoverable failures as
+                //     DEBUG so they stop drowning real signal. Keep WARN
+                //     only for configuration/limit problems that the
+                //     operator can actually act on.
+                let is_tool_role = ctx.role == "tool";
+                let is_recoverable_load_failure = matches!(
+                    error_kind,
+                    "image_source_not_found"
+                        | "local_read_failed"
+                        | "remote_fetch_failed"
+                        | "invalid_marker"
+                );
+                if is_tool_role && is_recoverable_load_failure {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(attrs),
+                        "skipping multimodal marker in tool result (likely not a real attachment)"
+                    );
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(attrs),
+                        "skipping multimodal image that could not be loaded"
+                    );
+                }
+            }
+        }
+    }
+
+    NormalizedImageReferences {
+        data_uris,
+        skipped_count,
+    }
+}
+
+fn compose_multimodal_content(
+    text: &str,
+    data_uris: &[String],
+    skipped_count: usize,
+    total_refs: usize,
+) -> String {
+    if skipped_count == 0 {
+        return compose_multimodal_message(text, data_uris);
+    }
+
+    let text_with_note = append_skipped_image_note(text, skipped_count, total_refs);
+    if data_uris.is_empty() {
+        text_with_note.trim().to_string()
+    } else {
+        compose_multimodal_message(&text_with_note, data_uris)
+    }
+}
+
+fn append_skipped_image_note(text: &str, skipped_count: usize, total_refs: usize) -> String {
+    if skipped_count == 0 {
+        return text.to_string();
+    }
+
+    // This note is model-facing provider context, not direct localized UI text.
+    let note = if skipped_count == total_refs {
+        format!("{skipped_count} attached image(s) could not be loaded")
+    } else {
+        format!("{skipped_count} of {total_refs} attached image(s) could not be loaded")
+    };
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        format!("Note: {note}.")
+    } else {
+        format!("{trimmed}\n\nNote: {note}.")
+    }
+}
+
+fn image_reference_kind(reference: &str) -> &'static str {
+    if reference.starts_with("data:") {
+        "data"
+    } else if reference.starts_with("http://") || reference.starts_with("https://") {
+        "remote"
+    } else {
+        "local"
+    }
+}
+
+fn multimodal_error_kind(error: &anyhow::Error) -> &'static str {
+    match error.downcast_ref::<MultimodalError>() {
+        Some(MultimodalError::TooManyImages { .. }) => "too_many_images",
+        Some(MultimodalError::ImageTooLarge { .. }) => "image_too_large",
+        Some(MultimodalError::UnsupportedMime { .. }) => "unsupported_mime",
+        Some(MultimodalError::RemoteFetchDisabled { .. }) => "remote_fetch_disabled",
+        Some(MultimodalError::RemoteFetchBlocked { .. }) => "remote_fetch_blocked",
+        Some(MultimodalError::ImageSourceNotFound { .. }) => "image_source_not_found",
+        Some(MultimodalError::InvalidMarker { .. }) => "invalid_marker",
+        Some(MultimodalError::RemoteFetchFailed { .. }) => "remote_fetch_failed",
+        Some(MultimodalError::LocalReadFailed { .. }) => "local_read_failed",
+        None => "unknown",
+    }
+}
+
+fn multimodal_error_reason(error: &anyhow::Error) -> Option<String> {
+    match error.downcast_ref::<MultimodalError>() {
+        Some(MultimodalError::InvalidMarker { input, reason })
+        | Some(MultimodalError::RemoteFetchFailed { input, reason })
+        | Some(MultimodalError::RemoteFetchBlocked { input, reason })
+        | Some(MultimodalError::LocalReadFailed { input, reason }) => {
+            Some(reason.replace(input, "<source>"))
+        }
+        _ => None,
+    }
 }
 
 async fn normalize_image_reference(
@@ -610,6 +1366,7 @@ async fn normalize_image_reference(
     config: &MultimodalConfig,
     max_bytes: usize,
     remote_client: &Client,
+    cache: Option<&mut LocalImageCache>,
 ) -> anyhow::Result<String> {
     if source.starts_with("data:") {
         return normalize_data_uri(source, max_bytes);
@@ -623,10 +1380,19 @@ async fn normalize_image_reference(
             .into());
         }
 
-        return normalize_remote_image(source, max_bytes, remote_client).await;
+        return normalize_remote_image(
+            source,
+            max_bytes,
+            remote_client,
+            &config.remote_fetch_allowed_hosts,
+        )
+        .await;
     }
 
-    normalize_local_image(source, max_bytes).await
+    match cache {
+        Some(c) => normalize_local_image_cached(source, max_bytes, c).await,
+        None => normalize_local_image(source, max_bytes).await,
+    }
 }
 
 fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> {
@@ -671,11 +1437,37 @@ fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> 
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(decoded)))
 }
 
+/// SSRF pre-fetch guard for a remote multimodal URL.
+///
+/// Resolves the URL's host and rejects it before any request is sent when it
+/// maps to an internal/non-routable address (RFC1918, loopback, link-local incl.
+/// the IMDS endpoint, IPv6 ULA/link-local), unless the host is in `allowed_hosts`.
+/// Redirect hops are validated independently by the client's redirect policy.
+fn guard_remote_fetch_target(source: &str, allowed_hosts: &[String]) -> anyhow::Result<()> {
+    let host = reqwest::Url::parse(source)
+        .ok()
+        .and_then(|url| url.host_str().map(ToString::to_string))
+        .ok_or_else(|| MultimodalError::RemoteFetchBlocked {
+            input: source.to_string(),
+            reason: "could not parse host from remote URL".to_string(),
+        })?;
+    validate_remote_host(&host, allowed_hosts).map_err(|error| {
+        MultimodalError::RemoteFetchBlocked {
+            input: source.to_string(),
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(())
+}
+
 async fn normalize_remote_image(
     source: &str,
     max_bytes: usize,
     remote_client: &Client,
+    allowed_hosts: &[String],
 ) -> anyhow::Result<String> {
+    guard_remote_fetch_target(source, allowed_hosts)?;
+
     let response = remote_client.get(source).send().await.map_err(|error| {
         MultimodalError::RemoteFetchFailed {
             input: source.to_string(),
@@ -770,12 +1562,89 @@ async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
 }
 
+/// Cache-aware local image loader. On a hit (path + metadata unchanged) returns
+/// the stored data URI without touching the filesystem. Files under `/uploads/`
+/// are content-addressed and treated as immutable — checked once, never re-read.
+async fn normalize_local_image_cached(
+    source: &str,
+    max_bytes: usize,
+    cache: &mut LocalImageCache,
+) -> anyhow::Result<String> {
+    let path = Path::new(source);
+    if !path.exists() || !path.is_file() {
+        return Err(MultimodalError::ImageSourceNotFound {
+            input: source.to_string(),
+        }
+        .into());
+    }
+
+    let metadata =
+        tokio::fs::metadata(path)
+            .await
+            .map_err(|error| MultimodalError::LocalReadFailed {
+                input: source.to_string(),
+                reason: error.to_string(),
+            })?;
+
+    let file_len = metadata.len();
+    let is_immutable = source.contains("/uploads/");
+    let mtime: i64 = if is_immutable {
+        0
+    } else {
+        metadata
+            .modified()
+            .ok()
+            .and_then(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs() as i64)
+            })
+            .unwrap_or(0)
+    };
+    let cache_len = if is_immutable { 0 } else { file_len };
+
+    if let Some(cached) = cache.get(source, cache_len, mtime) {
+        return Ok(cached.to_string());
+    }
+
+    validate_size(
+        source,
+        usize::try_from(file_len).unwrap_or(usize::MAX),
+        max_bytes,
+    )?;
+
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|error| MultimodalError::LocalReadFailed {
+            input: source.to_string(),
+            reason: error.to_string(),
+        })?;
+
+    validate_size(source, bytes.len(), max_bytes)?;
+
+    let mime =
+        detect_mime(Some(path), &bytes, None).ok_or_else(|| MultimodalError::UnsupportedMime {
+            input: source.to_string(),
+            mime: "unknown".to_string(),
+            hint: None,
+        })?;
+
+    validate_mime(source, &mime)?;
+
+    let data_uri = format!("data:{mime};base64,{}", STANDARD.encode(&bytes));
+    cache.insert(source.to_string(), cache_len, mtime, data_uri.clone());
+    Ok(data_uri)
+}
+
+/// Download/read a `[DOCUMENT:]` reference and return either a `data:` URI
+/// (PDF, including Office formats converted to PDF) or an `[INLINE_TEXT:…]`
+/// sentinel (CSV/plain text). Data URIs are validated and passed through.
 async fn normalize_remote_document(
     source: &str,
     config: &MultimodalConfig,
     remote_client: &Client,
 ) -> anyhow::Result<String> {
-    // Data URIs are passed through with validation only
+    // Data URIs are passed through with validation only.
     if source.starts_with("data:") {
         let Some(comma_idx) = source.find(',') else {
             return Err(MultimodalError::InvalidMarker {
@@ -803,6 +1672,8 @@ async fn normalize_remote_document(
             }
             .into());
         }
+
+        guard_remote_fetch_target(source, &config.remote_fetch_allowed_hosts)?;
 
         let response = remote_client.get(source).send().await.map_err(|error| {
             MultimodalError::RemoteFetchFailed {
@@ -845,7 +1716,7 @@ async fn normalize_remote_document(
         return finalize_document(source, &mime, &bytes).await;
     }
 
-    // Local file path
+    // Local file path.
     let path = Path::new(source);
     if !path.exists() || !path.is_file() {
         return Err(MultimodalError::ImageSourceNotFound {
@@ -882,7 +1753,7 @@ async fn normalize_remote_document(
 }
 
 fn validate_document_mime(source: &str, mime: &str) -> anyhow::Result<()> {
-    if ALLOWED_DOCUMENT_MIME_TYPES.contains(&mime) {
+    if ALLOWED_DOCUMENT_MIME_TYPES.contains(&mime) || TEXT_DOCUMENT_MIME_TYPES.contains(&mime) {
         return Ok(());
     }
     Err(MultimodalError::UnsupportedMime {
@@ -900,9 +1771,9 @@ fn detect_document_mime(
     bytes: &[u8],
     header_content_type: Option<&str>,
 ) -> anyhow::Result<String> {
-    // Try extension first (most reliable for Office formats — they share ZIP magic bytes)
+    // Try extension first (most reliable for Office formats — they share ZIP magic bytes).
     if let Some(p) = path.or_else(|| {
-        // Extract filename from URL path
+        // Extract filename from the URL path.
         let url_path = source.split('?').next().unwrap_or(source);
         let name = url_path.rsplit('/').next().unwrap_or("");
         if name.contains('.') {
@@ -916,12 +1787,12 @@ fn detect_document_mime(
         return Ok(mime.to_string());
     }
 
-    // Fall back to Content-Type header
+    // Fall back to Content-Type header.
     if let Some(header_mime) = header_content_type.and_then(normalize_content_type) {
         return Ok(header_mime);
     }
 
-    // Fall back to magic bytes
+    // Fall back to magic bytes.
     if let Some(magic_mime) = mime_from_magic(bytes) {
         return Ok(magic_mime.to_string());
     }
@@ -934,10 +1805,12 @@ fn detect_document_mime(
     .into())
 }
 
-/// Finalize document bytes into a data URI. Converts Office formats (DOCX/XLSX/PPTX)
-/// to PDF via office2pdf (on a blocking thread). CSV is treated as text/plain.
+/// Finalize document bytes into a data URI (PDF) or an `[INLINE_TEXT:…]`
+/// sentinel (CSV/plain text). Office formats are converted to PDF via
+/// office2pdf on a blocking thread when the `office-convert` feature is enabled,
+/// or rejected gracefully otherwise.
 async fn finalize_document(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Result<String> {
-    // Direct pass-through for natively supported document types (PDF)
+    // Direct pass-through for natively supported document types (PDF).
     if ALLOWED_DOCUMENT_MIME_TYPES.contains(&mime) {
         return Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)));
     }
@@ -971,7 +1844,7 @@ async fn finalize_document(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Re
                 })
             })
             .await
-            .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
+            .map_err(|e| anyhow::Error::msg(format!("spawn_blocking join error: {e}")))??;
 
             return Ok(format!(
                 "data:application/pdf;base64,{}",
@@ -1000,9 +1873,9 @@ async fn finalize_document(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Re
     .into())
 }
 
-/// Check if an error from document processing is an `UnsupportedMime` where
-/// the MIME type is actually an image format. Used to reclassify documents
-/// that are really images (e.g. a .webp sent as type=document).
+/// Check if an error from document processing is an `UnsupportedMime` where the
+/// MIME type is actually an image format. Used to reclassify documents that are
+/// really images (e.g. a .webp sent as type=document by the messaging platform).
 fn is_image_mime_error(err: &anyhow::Error) -> bool {
     matches!(
         err.downcast_ref::<MultimodalError>(),
@@ -1108,7 +1981,7 @@ fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
         return Some("image/bmp");
     }
 
-    // HEIC/HEIF: ISO BMFF container with ftyp box, brand starts at offset 8
+    // HEIC/HEIF: ISO BMFF container with ftyp box, brand starts at offset 8.
     if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
         let brand = &bytes[8..12];
         if brand == b"heic" || brand == b"heix" || brand == b"mif1" || brand == b"hevc" {
@@ -1124,8 +1997,114 @@ fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
 }
 
 #[cfg(test)]
+mod ssrf_fetch_tests {
+    use super::guard_remote_fetch_target;
+    use zeroclaw_config::schema::build_remote_fetch_client;
+
+    #[test]
+    fn guard_blocks_internal_and_imds_targets() {
+        // No allowlist: internal / IMDS literal hosts are rejected pre-fetch.
+        assert!(
+            guard_remote_fetch_target("http://169.254.169.254/latest/meta-data/", &[]).is_err()
+        );
+        assert!(guard_remote_fetch_target("http://10.0.0.5/secret", &[]).is_err());
+        assert!(guard_remote_fetch_target("http://127.0.0.1:8080/", &[]).is_err());
+    }
+
+    #[test]
+    fn guard_allows_public_and_allowlisted() {
+        // Public literal host passes (no DNS round-trip needed).
+        assert!(guard_remote_fetch_target("https://1.1.1.1/img.png", &[]).is_ok());
+        // Allowlisted internal host passes (operator opted in).
+        let allow = vec!["10.0.0.5".to_string()];
+        assert!(guard_remote_fetch_target("http://10.0.0.5/doc.pdf", &allow).is_ok());
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_blocks_hop_into_internal_space() {
+        use axum::response::Redirect;
+        use axum::routing::get;
+
+        // A public-looking server that 302s into the IMDS link-local range,
+        // mimicking an open redirect used for SSRF.
+        let app = axum::Router::new().route(
+            "/open-redirect",
+            get(|| async { Redirect::temporary("http://169.254.169.254/latest/meta-data/") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let _server = zeroclaw_spawn::spawn!(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = build_remote_fetch_client("test.ssrf", 5, 5, &[]);
+        let result = client
+            .get(format!("http://{addr}/open-redirect"))
+            .send()
+            .await;
+        // The 302 hop to 169.254.169.254 must be refused by the redirect policy,
+        // so the request errors instead of reaching the metadata endpoint.
+        assert!(
+            result.is_err(),
+            "redirect into internal space must be blocked, got {result:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_media_markers_replaces_image_local_path() {
+        let input = "Look at [IMAGE:/zeroclaw-data/workspace/telegram_files/photo_1.jpg]";
+        assert_eq!(strip_media_markers(input), "Look at [media attachment]");
+    }
+
+    #[test]
+    fn strip_media_markers_replaces_image_data_uri() {
+        let input = "Inline [IMAGE:data:image/png;base64,abcd]";
+        assert_eq!(strip_media_markers(input), "Inline [media attachment]");
+    }
+
+    #[test]
+    fn strip_media_markers_replaces_all_supported_kinds() {
+        // Mirrors `ATTACHMENT_KINDS` in
+        // `crates/zeroclaw-channels/src/util.rs`, which is the source of
+        // truth for which marker spellings inbound channels can produce.
+        let input = "[IMAGE:/a.jpg] [PHOTO:/b.jpg] [DOCUMENT:/c.pdf] [FILE:/d.zip] [VIDEO:/e.mp4] [VOICE:/f.ogg] [AUDIO:/g.wav]";
+        let expected = "[media attachment] [media attachment] [media attachment] [media attachment] [media attachment] [media attachment] [media attachment]";
+        assert_eq!(strip_media_markers(input), expected);
+    }
+
+    #[test]
+    fn strip_media_markers_is_case_insensitive() {
+        // Channel parsers uppercase the kind before comparing, so by the time
+        // a marker reaches conversation history it is normally upper-case —
+        // but accept lower/mixed case too so we don't depend on that
+        // invariant downstream.
+        let input = "[image:/a.jpg] [Photo:/b.jpg] [video:/c.mp4]";
+        let expected = "[media attachment] [media attachment] [media attachment]";
+        assert_eq!(strip_media_markers(input), expected);
+    }
+
+    #[test]
+    fn strip_media_markers_leaves_plain_text_untouched() {
+        let input = "No markers here, just text with [brackets] and (parens).";
+        assert_eq!(strip_media_markers(input), input);
+    }
+
+    #[test]
+    fn strip_media_markers_preserves_unrelated_brackets() {
+        // Markers that don't match the media kinds are left alone.
+        let input = "Use [TODO:foo] and [NOTE:bar] but replace [IMAGE:/x.jpg]";
+        assert_eq!(
+            strip_media_markers(input),
+            "Use [TODO:foo] and [NOTE:bar] but replace [media attachment]"
+        );
+    }
 
     #[test]
     fn parse_image_markers_extracts_multiple_markers() {
@@ -1136,6 +2115,88 @@ mod tests {
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0], "/tmp/a.png");
         assert_eq!(refs[1], "https://example.com/b.jpg");
+    }
+
+    #[test]
+    fn is_windows_unc_path_accepts_shares_and_rejects_others() {
+        assert!(is_windows_unc_path(r"\\server\share\pic.png"));
+        assert!(is_windows_unc_path(r"\\server\share\sub\pic.png"));
+        // Verbatim / device prefixes are not plain shares.
+        assert!(!is_windows_unc_path(r"\\?\C:\Users\me\a.png"));
+        assert!(!is_windows_unc_path(r"\\?\UNC\server\share\a.png"));
+        assert!(!is_windows_unc_path(r"\\.\PhysicalDrive0"));
+        // Needs both a server and a further segment.
+        assert!(!is_windows_unc_path(r"\\server"));
+        assert!(!is_windows_unc_path(r"\\"));
+        // Non-UNC inputs.
+        assert!(!is_windows_unc_path("/home/me/a.png"));
+        assert!(!is_windows_unc_path(r"C:\Users\me\a.png"));
+    }
+
+    #[test]
+    fn parse_image_markers_extracts_unc_path() {
+        // Regression for the #7446 Windows follow-up: `image_info` unwraps the
+        // verbatim-UNC prefix (`\\?\UNC\…`) to a plain `\\server\share\…`
+        // path, which must be treated as a loadable image reference (not left
+        // as literal text) so the image reaches vision models.
+        let input = r"File: [IMAGE:\\server\share\pic.png]";
+        let (_, refs) = parse_image_markers(input);
+        assert_eq!(refs.len(), 1, "UNC marker should be extracted as a ref");
+        assert_eq!(refs[0], r"\\server\share\pic.png");
+    }
+
+    #[test]
+    fn validate_mime_rejects_bmp_but_accepts_provider_supported_types() {
+        for mime in ["image/png", "image/jpeg", "image/webp", "image/gif"] {
+            assert!(
+                validate_mime("src", mime).is_ok(),
+                "{mime} should be allowed"
+            );
+        }
+        // BMP is detectable but unsupported by vision providers; it must be
+        // rejected here so it never breaks the whole provider request.
+        let err = validate_mime("src", "image/bmp").unwrap_err();
+        assert_eq!(multimodal_error_kind(&err), "unsupported_mime");
+    }
+
+    #[test]
+    fn parse_image_markers_collapses_line_wrapped_path() {
+        // Terminal-wrapped paste: a long path split across two rows with
+        // leading indentation should be recovered into the original path.
+        let input = "from the logs whether the agent emits\n  [IMAGE:/home/zeroclaw_user/.zeroclaw/workspace/signal_i\n  nbound/attachment.jpg] (which the\n  channel resolves)";
+        let (_, refs) = parse_image_markers(input);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0],
+            "/home/zeroclaw_user/.zeroclaw/workspace/signal_inbound/attachment.jpg"
+        );
+    }
+
+    #[test]
+    fn parse_image_markers_leaves_placeholder_markers_as_literal_text() {
+        // Illustrative markdown like `[IMAGE:...]` or `[IMAGE:<path>]`
+        // (e.g. in agent-authored prose the user quotes back) is not a
+        // loadable reference and must stay as literal text — otherwise the
+        // multimodal loader errors every turn the conversation replays.
+        let input = "example: `[IMAGE:...]` or `[IMAGE:<path>]` or `[IMAGE:example.png]`";
+        let (cleaned, refs) = parse_image_markers(input);
+        assert!(
+            refs.is_empty(),
+            "no placeholder should be treated as a loadable ref, got: {refs:?}"
+        );
+        assert!(cleaned.contains("[IMAGE:...]"));
+        assert!(cleaned.contains("[IMAGE:<path>]"));
+        assert!(cleaned.contains("[IMAGE:example.png]"));
+    }
+
+    #[test]
+    fn parse_image_markers_preserves_spaces_in_path() {
+        // Spaces within a single-line marker are legitimate (paths can
+        // contain spaces) and must survive unchanged.
+        let input = "look at [IMAGE:/tmp/my photos/beetle.png] please";
+        let (_, refs) = parse_image_markers(input);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0], "/tmp/my photos/beetle.png");
     }
 
     #[test]
@@ -1175,6 +2236,391 @@ mod tests {
         assert_eq!(cleaned, "Please inspect this screenshot");
         assert_eq!(refs.len(), 1);
         assert!(refs[0].starts_with("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
+    // Covers the plain-text fallback path for `role == "tool"` messages
+    // whose `content` is not a native-dispatcher JSON payload (e.g.
+    // synthetic XML-shaped input or future non-JSON tool transports). The
+    // JSON-shaped native contract is exercised by
+    // `prepare_messages_preserves_native_tool_result_json_shape` below.
+    async fn prepare_messages_normalizes_tool_message_local_image_to_data_uri() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("tool-sample.png");
+
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let messages = vec![ChatMessage::tool(format!(
+            "<tool_result name=\"image_gen\">\nGenerated image [IMAGE:{}]\n</tool_result>",
+            image_path.display()
+        ))];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert!(prepared.contains_images);
+        assert_eq!(prepared.messages.len(), 1);
+        assert_eq!(prepared.messages[0].role, "tool");
+
+        let (cleaned, refs) = parse_image_markers(&prepared.messages[0].content);
+        assert!(cleaned.contains("<tool_result name=\"image_gen\">"));
+        assert!(cleaned.contains("Generated image"));
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].starts_with("data:image/png;base64,"));
+    }
+
+    // Regression for the JSON-clobber bug surfaced on PR #6183: native tool
+    // dispatchers serialize tool results as `{"tool_call_id":"…","content":"…"}`
+    // and downstream adapters (e.g. `OpenAiCompatibleProvider::convert_messages_for_native`)
+    // recover `tool_call_id` via `serde_json::from_str` on the message
+    // content. The multimodal preprocessor must keep that JSON intact while
+    // still inlining any `[IMAGE:/path]` markers inside the inner `content`
+    // field. Asserts:
+    //   1. Prepared content is still valid JSON.
+    //   2. `tool_call_id` survives unchanged.
+    //   3. The inner `content` field carries `data:image/png;base64,…`
+    //      (marker rewritten) and keeps surrounding text.
+    #[tokio::test]
+    async fn prepare_messages_preserves_native_tool_result_json_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("native-tool-result.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": format!("see attached [IMAGE:{}]", image_path.display().to_string()),
+        })
+        .to_string();
+
+        let messages = vec![ChatMessage::tool(native_tool_content)];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("preparation should succeed for native tool-result JSON");
+
+        assert!(prepared.contains_images);
+        assert_eq!(prepared.messages.len(), 1);
+        assert_eq!(prepared.messages[0].role, "tool");
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("prepared tool message must remain valid JSON");
+
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc1"),
+            "tool_call_id must survive multimodal preprocessing unchanged"
+        );
+
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content must remain a JSON string");
+        assert!(
+            inner.contains("see attached"),
+            "surrounding text in tool content should survive normalization"
+        );
+        assert!(
+            inner.contains("data:image/png;base64,"),
+            "local image path inside tool content should be rewritten to a data URI"
+        );
+        assert!(
+            !inner.contains("native-tool-result.png"),
+            "raw local path must not leak after normalization"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_preserves_native_tool_json_when_image_is_skipped() {
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": "generated screenshot [IMAGE:https://example.com/missing.png]",
+        })
+        .to_string();
+
+        let prepared = prepare_messages_for_provider(
+            &[ChatMessage::tool(native_tool_content)],
+            &MultimodalConfig::default(),
+        )
+        .await
+        .expect("skipped native tool image should not fail message preparation");
+
+        assert!(!prepared.contains_images);
+        assert_eq!(prepared.messages.len(), 1);
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("native tool result must remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc1")
+        );
+
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated screenshot"));
+        assert!(inner.contains("1 attached image(s) could not be loaded"));
+        assert!(!inner.contains("[IMAGE:"));
+        assert!(!inner.contains("https://example.com/missing.png"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_preserves_native_tool_json_with_mixed_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("mixed-native-tool-result.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": format!(
+                "generated [IMAGE:{}] and [IMAGE:https://example.com/missing.png]",
+                image_path.display()
+            ),
+        })
+        .to_string();
+
+        let prepared = prepare_messages_for_provider(
+            &[ChatMessage::tool(native_tool_content)],
+            &MultimodalConfig::default(),
+        )
+        .await
+        .expect("valid native tool image should survive while bad ref is skipped");
+
+        assert!(prepared.contains_images);
+        assert_eq!(prepared.messages.len(), 1);
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("native tool result must remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc1")
+        );
+
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated"));
+        assert!(inner.contains("data:image/png;base64,"));
+        assert!(inner.contains("1 of 2 attached image(s) could not be loaded"));
+        assert!(!inner.contains("mixed-native-tool-result.png"));
+        assert!(!inner.contains("https://example.com/missing.png"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_stale_native_tool_result_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("stale-native-tool-result.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": format!("generated screenshot [IMAGE:{}]", image_path.display().to_string()),
+        })
+        .to_string();
+
+        let messages = vec![
+            ChatMessage::tool(native_tool_content),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "I generated the screenshot.".to_string(),
+            },
+            ChatMessage::user("What happened next?".to_string()),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("preparation should strip stale tool images without loading them");
+
+        assert!(
+            !prepared.contains_images,
+            "stale tool-result images should not keep the request in vision mode"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("stale native tool result should remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc1")
+        );
+
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated screenshot"));
+        assert!(!inner.contains("[IMAGE:"));
+        assert!(!inner.contains("data:image"));
+        assert!(!inner.contains("stale-native-tool-result.png"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_stale_prompt_tool_result_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("stale-prompt-tool-result.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let messages = vec![
+            ChatMessage::user(format!(
+                "[Tool results]\n<tool_result name=\"image_gen\">Generated [IMAGE:{}]</tool_result>",
+                image_path.display()
+            )),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "I generated the screenshot.".to_string(),
+            },
+            ChatMessage::user("Continue.".to_string()),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("preparation should strip stale prompt-mode tool images");
+
+        assert!(!prepared.contains_images);
+        assert!(prepared.messages[0].content.contains("[Tool results]"));
+        assert!(prepared.messages[0].content.contains("Generated"));
+        assert!(!prepared.messages[0].content.contains("[IMAGE:"));
+        assert!(!prepared.messages[0].content.contains("data:image"));
+        assert!(
+            !prepared.messages[0]
+                .content
+                .contains("stale-prompt-tool-result.png")
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_stale_tool_image_while_normalizing_current_user_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale_path = temp.path().join("stale-tool-result.png");
+        let fresh_path = temp.path().join("fresh-user-image.png");
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&stale_path, png).unwrap();
+        std::fs::write(&fresh_path, png).unwrap();
+
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": format!("generated screenshot [IMAGE:{}]", stale_path.display().to_string()),
+        })
+        .to_string();
+
+        let messages = vec![
+            ChatMessage::tool(native_tool_content),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "I generated the screenshot.".to_string(),
+            },
+            ChatMessage::user(format!(
+                "Now inspect this [IMAGE:{}]",
+                fresh_path.display().to_string()
+            )),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("preparation should strip stale tool images and normalize current user image");
+
+        assert!(prepared.contains_images);
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("stale native tool result should remain valid JSON");
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated screenshot"));
+        assert!(!inner.contains("[IMAGE:"));
+        assert!(!inner.contains("data:image"));
+        assert!(!inner.contains("stale-tool-result.png"));
+
+        let (cleaned, refs) = parse_image_markers(&prepared.messages[2].content);
+        assert_eq!(cleaned, "Now inspect this");
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].starts_with("data:image/png;base64,"));
+        assert!(
+            !prepared.messages[2]
+                .content
+                .contains("fresh-user-image.png")
+        );
+    }
+
+    #[test]
+    fn count_image_markers_ignores_stale_tool_results() {
+        let messages = vec![
+            ChatMessage::tool("[IMAGE:/tmp/stale-tool.png]\nGenerated".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Done.".to_string(),
+            },
+            ChatMessage::user("Next question".to_string()),
+        ];
+
+        assert_eq!(count_image_markers(&messages), 0);
+
+        let messages = vec![
+            ChatMessage::user("Create an image".to_string()),
+            ChatMessage::tool("[IMAGE:/tmp/latest-tool.png]\nGenerated".to_string()),
+        ];
+
+        assert_eq!(count_image_markers(&messages), 1);
+    }
+
+    #[test]
+    fn count_latest_user_image_markers_scopes_to_newest_user_message() {
+        // No user messages at all -> zero.
+        assert_eq!(count_latest_user_image_markers(&[]), 0);
+
+        // The newest user message carries the image -> counted (the user just
+        // sent it; the vision router surfaces a capability error).
+        let just_sent = vec![
+            ChatMessage::user("hi".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "hello".to_string(),
+            },
+            ChatMessage::user("look at this [IMAGE:/tmp/a.png]".to_string()),
+        ];
+        assert_eq!(count_latest_user_image_markers(&just_sent), 1);
+
+        // An earlier user message carried an image, but the newest user message
+        // is plain text -> zero. This is the poison-prevention case: the carried
+        // over marker must NOT keep re-triggering the capability error.
+        let carried_over = vec![
+            ChatMessage::user("look at this [IMAGE:/tmp/a.png]".to_string()),
+            ChatMessage::user("what is WAL?".to_string()),
+        ];
+        assert_eq!(count_latest_user_image_markers(&carried_over), 0);
+        // The history-wide count still sees the carried-over marker, which is
+        // why the router must distinguish the two.
+        assert_eq!(count_user_image_markers(&carried_over), 1);
+
+        // A trailing tool-result carrier does not mask the real latest user
+        // message (its markers are not user-sent and must not be counted here).
+        let trailing_tool_result = vec![
+            ChatMessage::user("inspect [IMAGE:/tmp/a.png]".to_string()),
+            ChatMessage::tool("[IMAGE:/tmp/tool.png]\nGenerated".to_string()),
+        ];
+        assert_eq!(count_latest_user_image_markers(&trailing_tool_result), 1);
     }
 
     #[tokio::test]
@@ -1265,6 +2711,22 @@ mod tests {
         // Newest user image kept
         let (_, refs2) = parse_image_markers(&trimmed[2].content);
         assert_eq!(refs2.len(), 1);
+    }
+
+    #[test]
+    fn trim_old_images_counts_latest_tool_messages() {
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/user-old.png]\nOldest".to_string()),
+            ChatMessage::tool("[IMAGE:/tmp/tool-new.png]\nGenerated".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 1);
+        let (_, refs0) = parse_image_markers(&trimmed[0].content);
+        assert!(refs0.is_empty(), "oldest user image should be stripped");
+        assert!(trimmed[0].content.contains("Oldest"));
+
+        let (_, refs1) = parse_image_markers(&trimmed[1].content);
+        assert_eq!(refs1.len(), 1);
     }
 
     #[test]
@@ -1376,9 +2838,9 @@ mod tests {
         }
 
         let messages = vec![
-            ChatMessage::user(format!("[IMAGE:{}]\nOld", paths[0].display())),
-            ChatMessage::user(format!("[IMAGE:{}]\nMid", paths[1].display())),
-            ChatMessage::user(format!("[IMAGE:{}]\nNew", paths[2].display())),
+            ChatMessage::user(format!("[IMAGE:{}]\nOld", paths[0].display().to_string())),
+            ChatMessage::user(format!("[IMAGE:{}]\nMid", paths[1].display().to_string())),
+            ChatMessage::user(format!("[IMAGE:{}]\nNew", paths[2].display().to_string())),
         ];
 
         let config = MultimodalConfig {
@@ -1403,6 +2865,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_messages_caps_to_newest_successful_images() {
+        // Regression for the dead pre-normalization trim: with more valid images
+        // than the cap, normalization must run on all of them and the cap must
+        // keep the *newest* `max_images`, dropping the oldest. Exactly one
+        // "post-normalization image cap exceeded" path should fire — there is no
+        // longer a separate, misleading pre-normalization "trimmed_to" warning.
+        let temp = tempfile::tempdir().unwrap();
+        // Minimal valid PNG (1x1 RGB pixel).
+        let png_data = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
+            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+
+        // Nine distinct valid image files across nine user messages, max 4.
+        let mut messages = Vec::new();
+        for i in 0..9 {
+            let p = temp.path().join(format!("img{i}.png"));
+            std::fs::write(&p, png_data).unwrap();
+            messages.push(ChatMessage::user(format!(
+                "[IMAGE:{}]\nImage {i}",
+                p.display()
+            )));
+        }
+
+        let config = MultimodalConfig {
+            max_images: 4,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            max_image_turns: 0, // disable age-based trimming to isolate the cap
+            ..Default::default()
+        };
+
+        let result = prepare_messages_for_provider(&messages, &config)
+            .await
+            .expect("should succeed");
+
+        // Output is capped to exactly max_images...
+        let surviving = result
+            .messages
+            .iter()
+            .filter(|m| m.content.contains("data:image"))
+            .count();
+        assert_eq!(surviving, 4, "output should keep exactly max_images");
+
+        // ...and it is the newest four that survive; the oldest five are stripped.
+        for (i, m) in result.messages.iter().enumerate() {
+            if i < 5 {
+                assert!(
+                    !m.content.contains("data:image"),
+                    "oldest message {i} should be capped out"
+                );
+                assert!(m.content.contains(&format!("Image {i}")));
+            } else {
+                assert!(
+                    m.content.contains("data:image"),
+                    "newest message {i} should survive the cap"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn prepare_messages_skips_remote_url_when_disabled() {
         let messages = vec![ChatMessage::user(
             "Look [IMAGE:https://example.com/img.png]".to_string(),
@@ -1410,28 +2937,33 @@ mod tests {
 
         let result = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
             .await
-            .expect("should succeed — remote image skipped gracefully");
+            .expect("disabled remote image should be skipped");
 
-        // The image was skipped, so the message should contain the skip placeholder
+        assert!(!result.contains_images);
+        assert_eq!(result.messages.len(), 1);
+        assert!(result.messages[0].content.contains("Look"));
         assert!(
             result.messages[0]
                 .content
-                .contains("Skipped attachments (could not be processed)")
+                .contains("1 attached image(s) could not be loaded")
+        );
+        assert!(
+            !result.messages[0]
+                .content
+                .contains("https://example.com/img.png")
         );
     }
 
     #[tokio::test]
-    async fn prepare_messages_skips_oversized_image_gracefully() {
+    async fn prepare_messages_skips_oversized_local_image() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("big.png");
 
-        // Write a file larger than 1 MB with PNG magic bytes so MIME detection works
-        let mut bytes = vec![0u8; 1024 * 1024 + 1];
-        bytes[..8].copy_from_slice(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']);
+        let bytes = vec![0u8; 1024 * 1024 + 1];
         std::fs::write(&image_path, bytes).unwrap();
 
         let messages = vec![ChatMessage::user(format!(
-            "Check this [IMAGE:{}]",
+            "[IMAGE:{}]",
             image_path.display()
         ))];
         let config = MultimodalConfig {
@@ -1443,14 +2975,106 @@ mod tests {
 
         let result = prepare_messages_for_provider(&messages, &config)
             .await
-            .expect("should succeed — oversized image skipped gracefully");
+            .expect("oversized local image should be skipped");
 
+        assert!(!result.contains_images);
+        assert_eq!(result.messages.len(), 1);
         assert!(
             result.messages[0]
                 .content
-                .contains("Skipped attachments (could not be processed)")
+                .contains("1 attached image(s) could not be loaded")
         );
-        assert!(result.messages[0].content.contains("Check this"));
+        assert!(
+            !result.messages[0]
+                .content
+                .contains(image_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_successful_images_when_some_are_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("ok.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let messages = vec![ChatMessage::user(format!(
+            "Look [IMAGE:{}] and [IMAGE:https://example.com/missing.png]",
+            image_path.display()
+        ))];
+
+        let result = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("valid local image should survive while remote image is skipped");
+
+        assert!(result.contains_images);
+        assert!(
+            result.messages[0]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            result.messages[0]
+                .content
+                .contains("1 of 2 attached image(s) could not be loaded")
+        );
+        assert!(
+            !result.messages[0]
+                .content
+                .contains("https://example.com/missing.png")
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_images_do_not_consume_image_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("older-valid.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let messages = vec![
+            ChatMessage::user(format!(
+                "Older valid image [IMAGE:{}]",
+                image_path.display()
+            )),
+            ChatMessage::user(
+                "Newer broken image [IMAGE:https://example.com/missing.png]".to_string(),
+            ),
+        ];
+        let config = MultimodalConfig {
+            max_images: 1,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            ..Default::default()
+        };
+
+        let result = prepare_messages_for_provider(&messages, &config)
+            .await
+            .expect("broken image should not evict an older valid image");
+
+        assert!(result.contains_images);
+        assert!(
+            result.messages[0]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(result.messages[1].content.contains("Newer broken image"));
+        assert!(
+            result.messages[1]
+                .content
+                .contains("1 attached image(s) could not be loaded")
+        );
+        assert!(
+            !result.messages[1]
+                .content
+                .contains("https://example.com/missing.png")
+        );
     }
 
     #[test]
@@ -1461,7 +3085,7 @@ mod tests {
     }
 
     /// Stripping `[IMAGE:]` markers from history messages leaves only the text
-    /// portion, which is the behaviour needed for non-vision providers (#3674).
+    /// portion, which is the behaviour needed for non-vision model_providers.
     #[test]
     fn parse_image_markers_strips_markers_leaving_caption() {
         let input = "[IMAGE:/tmp/photo.jpg]\n\nDescribe this screenshot";
@@ -1484,6 +3108,8 @@ mod tests {
         assert_eq!(refs.len(), 1);
     }
 
+    // ── Document marker parsing ─────────────────────────────────
+
     #[test]
     fn parse_document_markers_extracts_markers() {
         let input = "Review [DOCUMENT:https://example.com/contract.pdf] please";
@@ -1501,6 +3127,8 @@ mod tests {
         assert!(refs.is_empty());
     }
 
+    // ── Document MIME detection ─────────────────────────────────
+
     #[test]
     fn mime_from_extension_detects_pdf() {
         assert_eq!(mime_from_extension("pdf"), Some("application/pdf"));
@@ -1510,53 +3138,6 @@ mod tests {
     fn mime_from_magic_detects_pdf() {
         let pdf_bytes = b"%PDF-1.4 some content";
         assert_eq!(mime_from_magic(pdf_bytes), Some("application/pdf"));
-    }
-
-    #[tokio::test]
-    async fn prepare_messages_normalizes_local_pdf_document() {
-        let temp = tempfile::tempdir().unwrap();
-        let pdf_path = temp.path().join("test.pdf");
-        // Minimal PDF magic bytes
-        std::fs::write(&pdf_path, b"%PDF-1.4 minimal").unwrap();
-
-        let messages = vec![ChatMessage::user(format!(
-            "Review this doc [DOCUMENT:{}]",
-            pdf_path.display()
-        ))];
-
-        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .unwrap();
-
-        assert!(prepared.contains_documents);
-        let (_, doc_refs) = parse_document_markers(&prepared.messages[0].content);
-        assert_eq!(doc_refs.len(), 1);
-        assert!(doc_refs[0].starts_with("data:application/pdf;base64,"));
-    }
-
-    #[tokio::test]
-    async fn finalize_document_converts_csv_to_inline_text() {
-        let csv = b"name,email\nJohn,john@test.com\n";
-        let result = finalize_document("test.csv", "text/csv", csv)
-            .await
-            .unwrap();
-        assert!(result.starts_with("[INLINE_TEXT:"));
-        assert!(result.contains("name,email"));
-    }
-
-    #[tokio::test]
-    async fn finalize_document_passes_through_pdf() {
-        let pdf = b"%PDF-1.4 minimal";
-        let result = finalize_document("test.pdf", "application/pdf", pdf)
-            .await
-            .unwrap();
-        assert!(result.starts_with("data:application/pdf;base64,"));
-    }
-
-    #[tokio::test]
-    async fn finalize_document_rejects_unknown_mime() {
-        let result = finalize_document("test.xyz", "application/x-unknown", b"data").await;
-        assert!(result.is_err());
     }
 
     #[test]
@@ -1586,7 +3167,55 @@ mod tests {
         assert_eq!(mime, "text/csv");
     }
 
-    // ── URL extraction tests ────────────────────────────────────
+    // ── Document finalization ───────────────────────────────────
+
+    #[tokio::test]
+    async fn finalize_document_passes_through_pdf() {
+        let pdf = b"%PDF-1.4 minimal";
+        let result = finalize_document("test.pdf", "application/pdf", pdf)
+            .await
+            .unwrap();
+        assert!(result.starts_with("data:application/pdf;base64,"));
+    }
+
+    #[tokio::test]
+    async fn finalize_document_converts_csv_to_inline_text() {
+        let csv = b"name,email\nJohn,john@test.com\n";
+        let result = finalize_document("test.csv", "text/csv", csv)
+            .await
+            .unwrap();
+        assert!(result.starts_with("[INLINE_TEXT:"));
+        assert!(result.contains("name,email"));
+    }
+
+    #[tokio::test]
+    async fn finalize_document_rejects_unknown_mime() {
+        let result = finalize_document("test.xyz", "application/x-unknown", b"data").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_normalizes_local_pdf_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let pdf_path = temp.path().join("test.pdf");
+        std::fs::write(&pdf_path, b"%PDF-1.4 minimal").unwrap();
+
+        let messages = vec![ChatMessage::user(format!(
+            "Review this doc [DOCUMENT:{}]",
+            pdf_path.display()
+        ))];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert!(prepared.contains_documents);
+        let (_, doc_refs) = parse_document_markers(&prepared.messages[0].content);
+        assert_eq!(doc_refs.len(), 1);
+        assert!(doc_refs[0].starts_with("data:application/pdf;base64,"));
+    }
+
+    // ── URL extraction from plain text ──────────────────────────
 
     #[test]
     fn inject_url_markers_detects_image_urls() {
@@ -1621,7 +3250,6 @@ mod tests {
     fn inject_url_markers_skips_urls_already_in_markers() {
         let input = "Look [IMAGE:https://cdn.example.com/photo.png] done";
         let result = inject_url_markers(input);
-        // Should NOT double-wrap
         assert!(!result.contains("[IMAGE:[IMAGE:"));
         assert_eq!(
             result.matches("[IMAGE:").count(),
@@ -1663,13 +3291,10 @@ mod tests {
 
     #[test]
     fn inject_url_markers_same_url_inside_and_outside_marker() {
-        // Same URL appears twice: once inside a marker (skip), once outside (inject)
         let input =
             "[IMAGE:https://cdn.example.com/photo.png] and also https://cdn.example.com/photo.png";
         let result = inject_url_markers(input);
-        // The one inside the marker should NOT get double-wrapped
         assert!(result.starts_with("[IMAGE:https://cdn.example.com/photo.png]"));
-        // The one outside should get a marker
         assert!(result.ends_with(
             "https://cdn.example.com/photo.png [IMAGE:https://cdn.example.com/photo.png]"
         ));
@@ -1686,7 +3311,7 @@ mod tests {
         assert!(!result.contains("[DOCUMENT:https://c.com/page.html]"));
     }
 
-    // ── HEIC detection tests ────────────────────────────────────
+    // ── HEIC detection ──────────────────────────────────────────
 
     #[test]
     fn heic_extension_detected() {
@@ -1697,7 +3322,6 @@ mod tests {
 
     #[test]
     fn heic_magic_bytes_detected() {
-        // Minimal HEIC ftyp box: 4 bytes size + "ftyp" + "heic" brand
         let heic_bytes: Vec<u8> = vec![
             0x00, 0x00, 0x00, 0x18, // size = 24
             b'f', b't', b'y', b'p', // type = ftyp
@@ -1712,5 +3336,36 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("HEIC/HEIF not supported"), "got: {msg}");
         assert!(msg.contains("JPEG or PNG"), "got: {msg}");
+    }
+
+    // ── Document reclassification (doc → image by MIME) ──────────
+
+    #[tokio::test]
+    async fn document_with_image_extension_reclassified_to_image() {
+        // A local "document" that is actually a PNG: routed through the image
+        // pipeline and emitted as an [IMAGE:data:...] marker, not a document.
+        let temp = tempfile::tempdir().unwrap();
+        let img_path = temp.path().join("photo.webp");
+        // Minimal WEBP (RIFF....WEBP) so MIME detection picks image/webp.
+        let mut bytes = b"RIFF\x00\x00\x00\x00WEBP".to_vec();
+        bytes.extend_from_slice(&[0u8; 16]);
+        std::fs::write(&img_path, bytes).unwrap();
+
+        let messages = vec![ChatMessage::user(format!(
+            "look [DOCUMENT:{}]",
+            img_path.display()
+        ))];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert!(prepared.contains_images);
+        assert!(!prepared.contains_documents);
+        assert!(
+            prepared.messages[0]
+                .content
+                .contains("[IMAGE:data:image/webp")
+        );
     }
 }

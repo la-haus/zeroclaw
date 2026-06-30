@@ -11,11 +11,11 @@ pub mod runtime_trace;
 pub mod traits;
 pub mod verbose;
 
+pub use self::datadog_log::DatadogLogObserver;
 #[allow(unused_imports)]
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;
-pub use datadog_log::DatadogLogObserver;
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
@@ -25,131 +25,283 @@ pub use traits::{Observer, ObserverEvent};
 #[allow(unused_imports)]
 pub use verbose::VerboseObserver;
 
-use zeroclaw_config::schema::ObservabilityConfig;
+use std::any::Any;
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::RwLock;
+use traits::ObserverMetric;
+use zeroclaw_config::schema::{ObservabilityBackend, ObservabilityConfig};
 
 /// Shared trace context for log↔trace correlation.
 ///
-/// Holds `(trace_id_64bit, span_id)` as decimal strings.
-/// Updated by `OtelObserver` on `AgentStart`/`AgentEnd` and read by
-/// `DatadogLogObserver` so structured logs carry the correct `dd.trace_id`
-/// and `dd.span_id` without relying on the global OpenTelemetry context
-/// (which OtelObserver never registers spans into).
-pub type SharedTraceContext = std::sync::Arc<parking_lot::Mutex<(String, String)>>;
+/// Holds `(trace_id_64bit, span_id)` as decimal strings. Written by
+/// [`otel::OtelObserver`] on `AgentStart` and read by
+/// [`datadog_log::DatadogLogObserver`] so structured logs carry the correct
+/// `dd.trace_id`/`dd.span_id` without relying on the global OpenTelemetry
+/// context (which the instance-scoped `OtelObserver` never registers spans
+/// into). Initialized to `("0", "0")`.
+pub type SharedTraceContext = Arc<parking_lot::Mutex<(String, String)>>;
+
+/// Whether prompt/response text may be attached to observer events and OTEL
+/// spans. Gated by `ZEROCLAW_OTEL_TRACE_CONTENT` (accepts `true`/`1`) and
+/// **off by default**, so the event stream stays content-free unless an
+/// operator explicitly opts in. When this returns `false`, emit sites leave
+/// `LlmRequest::prompt_content` / `LlmResponse::response_content` as `None`
+/// and never pay the cost of serialising prompt/response text.
+pub fn trace_content_enabled() -> bool {
+    std::env::var("ZEROCLAW_OTEL_TRACE_CONTENT")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
+/// Process-wide broadcast hook installed by long-running subsystems (today: the
+/// gateway) so that events emitted by observers built in *other* subsystems —
+/// notably the agent loop's `process_message` — also fan out to the SSE
+/// broadcast channel. Without this, observers created per call site stay
+/// isolated and `/api/events` only sees the gateway's own direct emissions.
+///
+/// Uses `parking_lot::RwLock` so the event-recording path never has to handle
+/// lock poisoning: a panic inside a hook would not silently disable the entire
+/// observability channel on subsequent calls.
+static BROADCAST_HOOK: OnceLock<RwLock<BroadcastHookState>> = OnceLock::new();
+
+struct BroadcastHookEntry {
+    scoped_id: Option<u64>,
+    observer: Arc<dyn Observer>,
+}
+
+#[derive(Default)]
+struct BroadcastHookState {
+    next_scoped_id: u64,
+    entries: Vec<BroadcastHookEntry>,
+}
+
+impl BroadcastHookState {
+    fn current(&self) -> Option<Arc<dyn Observer>> {
+        self.entries.last().map(|entry| entry.observer.clone())
+    }
+}
+
+fn broadcast_hook_slot() -> &'static RwLock<BroadcastHookState> {
+    BROADCAST_HOOK.get_or_init(|| RwLock::new(BroadcastHookState::default()))
+}
+
+/// Install a process-wide observer that will receive every event recorded
+/// through observers built by [`create_observer`]. Calling this again replaces
+/// the previous hook.
+pub fn set_broadcast_hook(observer: Arc<dyn Observer>) {
+    let mut slot = broadcast_hook_slot().write();
+    slot.entries.clear();
+    slot.entries.push(BroadcastHookEntry {
+        scoped_id: None,
+        observer,
+    });
+}
+
+/// Guard returned by [`set_scoped_broadcast_hook`].
+///
+/// Dropping the guard removes the hook it installed, but only if a later caller
+/// has not already replaced the process-wide hook. If multiple scoped hooks are
+/// live at once, dropping the newest hook restores the previous still-live hook.
+#[must_use = "hold the guard for as long as the broadcast hook should remain installed"]
+pub struct BroadcastHookGuard {
+    scoped_id: u64,
+}
+
+impl Drop for BroadcastHookGuard {
+    fn drop(&mut self) {
+        let mut slot = broadcast_hook_slot().write();
+        slot.entries
+            .retain(|entry| entry.scoped_id != Some(self.scoped_id));
+    }
+}
+
+/// Install a process-wide observer and return a guard that clears it on drop.
+#[must_use = "hold the guard for as long as the broadcast hook should remain installed"]
+pub fn set_scoped_broadcast_hook(observer: Arc<dyn Observer>) -> BroadcastHookGuard {
+    let mut slot = broadcast_hook_slot().write();
+    let scoped_id = slot.next_scoped_id;
+    slot.next_scoped_id = slot.next_scoped_id.wrapping_add(1);
+    slot.entries.push(BroadcastHookEntry {
+        scoped_id: Some(scoped_id),
+        observer,
+    });
+    BroadcastHookGuard { scoped_id }
+}
+
+/// Remove the broadcast hook, if any. Intended for tests and orderly shutdown.
+pub fn clear_broadcast_hook() {
+    broadcast_hook_slot().write().entries.clear();
+}
+
+fn current_broadcast_hook() -> Option<Arc<dyn Observer>> {
+    broadcast_hook_slot().read().current()
+}
+
+/// Wrapper that forwards every event to a primary observer plus the
+/// process-wide broadcast hook (when set). Metrics flow only to the primary.
+struct TeeObserver {
+    primary: Box<dyn Observer>,
+}
+
+impl Observer for TeeObserver {
+    fn record_event(&self, event: &ObserverEvent) {
+        self.primary.record_event(event);
+        if let Some(hook) = current_broadcast_hook() {
+            hook.record_event(event);
+        }
+    }
+
+    fn record_metric(&self, metric: &ObserverMetric) {
+        self.primary.record_metric(metric);
+    }
+
+    fn flush(&self) {
+        self.primary.flush();
+    }
+
+    fn name(&self) -> &str {
+        // Delegate so callers (and tests) see the underlying backend name,
+        // not the internal wrapper.
+        self.primary.name()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        // Expose the primary so downcasts (e.g. to PrometheusObserver in the
+        // gateway's /metrics handler) keep working transparently.
+        self.primary.as_any()
+    }
+}
 
 /// Factory: create the right observer from config
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
-    match config.backend.as_str() {
-        "log" => Box::new(LogObserver::new()),
-        "verbose" => Box::new(VerboseObserver::new()),
-        "datadog-log" => Box::new(DatadogLogObserver::new()),
-        "prometheus" => {
+    Box::new(TeeObserver {
+        primary: create_primary_observer(config),
+    })
+}
+
+fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
+    match config.backend {
+        ObservabilityBackend::Log => Box::new(LogObserver::new()),
+        ObservabilityBackend::Verbose => Box::new(VerboseObserver::new()),
+        ObservabilityBackend::DatadogLog => Box::new(DatadogLogObserver::new()),
+        ObservabilityBackend::Prometheus => {
             #[cfg(feature = "observability-prometheus")]
             {
-                Box::new(PrometheusObserver::new())
+                Box::new(PrometheusObserver::shared())
             }
             #[cfg(not(feature = "observability-prometheus"))]
             {
-                tracing::warn!(
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                     "Prometheus backend requested but this build was compiled without `observability-prometheus`; falling back to noop."
                 );
                 Box::new(NoopObserver)
             }
         }
-        "otel" | "opentelemetry" | "otlp" => {
+        ObservabilityBackend::Otel => {
             #[cfg(feature = "observability-otel")]
             {
-                let mut observers: Vec<Box<dyn Observer>> = Vec::new();
-
-                // Shared trace context so DatadogLogObserver can read the
-                // active trace_id/span_id written by OtelObserver.
-                let shared_ctx: SharedTraceContext =
-                    std::sync::Arc::new(parking_lot::Mutex::new(("0".into(), "0".into())));
-
-                // Build consolidated endpoint list
-                let mut endpoints: Vec<(
-                    String,
-                    Option<std::collections::HashMap<String, String>>,
-                )> = Vec::new();
-
-                // Legacy single-endpoint config (backwards compat)
-                if let Some(ref ep) = config.otel_endpoint {
-                    endpoints.push((ep.clone(), config.otel_headers.clone()));
-                }
-
-                // New multi-endpoint config
-                for ep_cfg in &config.otel_endpoints {
-                    // Deduplicate: skip if same endpoint already added from legacy config
-                    if !endpoints.iter().any(|(e, _)| e == &ep_cfg.endpoint) {
-                        endpoints.push((ep_cfg.endpoint.clone(), ep_cfg.headers.clone()));
-                    }
-                }
-
-                // If no endpoints configured at all, use default
-                if endpoints.is_empty() {
-                    endpoints.push(("http://localhost:4318".into(), None));
-                }
-
-                for (i, (endpoint, headers)) in endpoints.iter().enumerate() {
-                    let instance_name = format!("otel-{}", i);
-                    // Only the first observer (Datadog) writes to shared trace context.
-                    // Others (LangSmith/Langfuse) generate different trace IDs that would
-                    // overwrite Datadog's, breaking log↔trace correlation.
-                    let ctx_for_observer = if i == 0 {
-                        Some(shared_ctx.clone())
-                    } else {
-                        None
-                    };
-                    match OtelObserver::new(
-                        Some(endpoint.as_str()),
-                        config.otel_service_name.as_deref(),
-                        headers.clone(),
-                        Some(&instance_name),
-                        ctx_for_observer,
-                    ) {
-                        Ok(obs) => {
-                            tracing::info!(
-                                endpoint = %endpoint,
-                                instance = %instance_name,
-                                "OpenTelemetry observer initialized"
-                            );
-                            observers.push(Box::new(obs));
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to create OTel observer for {}: {e}", endpoint);
-                        }
-                    }
-                }
-
-                // Always include DatadogLogObserver for structured stdout logging
-                // with shared trace context for log↔trace correlation.
-                observers.push(Box::new(
-                    DatadogLogObserver::new().with_trace_context(shared_ctx.clone()),
-                ));
-
-                if observers.is_empty() {
-                    Box::new(NoopObserver)
-                } else if observers.len() == 1 {
-                    observers.pop().unwrap()
-                } else {
-                    Box::new(MultiObserver::new(observers))
-                }
+                create_otel_observer(config)
             }
             #[cfg(not(feature = "observability-otel"))]
             {
-                tracing::warn!(
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                     "OpenTelemetry backend requested but this build was compiled without `observability-otel`; falling back to noop."
                 );
                 Box::new(NoopObserver)
             }
         }
-        "none" | "noop" => Box::new(NoopObserver),
-        _ => {
-            tracing::warn!(
-                "Unknown observability backend '{}', falling back to noop",
-                config.backend
-            );
-            Box::new(NoopObserver)
+        ObservabilityBackend::None => Box::new(NoopObserver),
+    }
+}
+
+/// Build the OTel observer stack: one instance-scoped [`otel::OtelObserver`]
+/// per configured endpoint (legacy `otel_endpoint` plus every
+/// `otel_endpoints` entry), fanning out via [`MultiObserver`], always paired
+/// with a [`DatadogLogObserver`] for structured stdout logs correlated to the
+/// traces. Only the first OTel instance (the Datadog endpoint by convention)
+/// owns the [`SharedTraceContext`]: secondary endpoints (e.g. LangSmith)
+/// generate their own trace IDs that must not overwrite the one the
+/// `DatadogLogObserver` stamps onto `dd.trace_id`.
+#[cfg(feature = "observability-otel")]
+fn create_otel_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
+    let shared_ctx: SharedTraceContext =
+        Arc::new(parking_lot::Mutex::new(("0".into(), "0".into())));
+
+    // Consolidated endpoint list: legacy single endpoint first (backwards
+    // compatible), then each multi-endpoint entry, de-duplicated by URL.
+    let mut endpoints: Vec<(String, Option<std::collections::HashMap<String, String>>)> =
+        Vec::new();
+    if let Some(ref ep) = config.otel_endpoint {
+        endpoints.push((ep.clone(), config.otel_headers.clone()));
+    }
+    for ep_cfg in &config.otel_endpoints {
+        if !endpoints.iter().any(|(e, _)| e == &ep_cfg.endpoint) {
+            endpoints.push((ep_cfg.endpoint.clone(), ep_cfg.headers.clone()));
         }
+    }
+    if endpoints.is_empty() {
+        endpoints.push(("http://localhost:4318".into(), None));
+    }
+
+    let mut observers: Vec<Box<dyn Observer>> = Vec::new();
+    for (i, (endpoint, headers)) in endpoints.iter().enumerate() {
+        let instance_name = format!("otel-{i}");
+        let ctx_for_observer = if i == 0 {
+            Some(shared_ctx.clone())
+        } else {
+            None
+        };
+        match OtelObserver::with_options(
+            Some(endpoint.as_str()),
+            config.otel_service_name.as_deref(),
+            headers.clone(),
+            Some(&instance_name),
+            ctx_for_observer,
+        ) {
+            Ok(obs) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "endpoint": endpoint,
+                            "instance": instance_name,
+                        })),
+                    "OpenTelemetry observer initialized"
+                );
+                observers.push(Box::new(obs));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "endpoint": endpoint,
+                            "error": format!("{}", e),
+                        })),
+                    "Failed to create OTel observer for endpoint"
+                );
+            }
+        }
+    }
+
+    // Always pair the trace pipeline with structured Datadog logs that read the
+    // shared trace context for log↔trace correlation.
+    observers.push(Box::new(
+        DatadogLogObserver::new().with_trace_context(shared_ctx.clone()),
+    ));
+
+    match observers.len() {
+        0 => Box::new(NoopObserver),
+        1 => observers.pop().expect("len checked == 1"),
+        _ => Box::new(MultiObserver::new(observers)),
     }
 }
 
@@ -158,9 +310,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn trace_content_gate_defaults_off_and_honors_env() {
+        // SAFETY: single-threaded test; the env var is unique to this gate and
+        // not read concurrently by any other test.
+        unsafe {
+            std::env::remove_var("ZEROCLAW_OTEL_TRACE_CONTENT");
+        }
+        assert!(
+            !trace_content_enabled(),
+            "content tracing must be OFF by default"
+        );
+        unsafe {
+            std::env::set_var("ZEROCLAW_OTEL_TRACE_CONTENT", "true");
+        }
+        assert!(
+            trace_content_enabled(),
+            "`true` must enable content tracing"
+        );
+        unsafe {
+            std::env::set_var("ZEROCLAW_OTEL_TRACE_CONTENT", "1");
+        }
+        assert!(trace_content_enabled(), "`1` must enable content tracing");
+        unsafe {
+            std::env::set_var("ZEROCLAW_OTEL_TRACE_CONTENT", "no");
+        }
+        assert!(
+            !trace_content_enabled(),
+            "any other value must leave content tracing OFF"
+        );
+        unsafe {
+            std::env::remove_var("ZEROCLAW_OTEL_TRACE_CONTENT");
+        }
+    }
+
+    #[test]
     fn factory_none_returns_noop() {
         let cfg = ObservabilityConfig {
-            backend: "none".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         assert_eq!(create_observer(&cfg).name(), "noop");
@@ -169,7 +355,7 @@ mod tests {
     #[test]
     fn factory_noop_returns_noop() {
         let cfg = ObservabilityConfig {
-            backend: "noop".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         assert_eq!(create_observer(&cfg).name(), "noop");
@@ -178,7 +364,7 @@ mod tests {
     #[test]
     fn factory_log_returns_log() {
         let cfg = ObservabilityConfig {
-            backend: "log".into(),
+            backend: ObservabilityBackend::Log,
             ..ObservabilityConfig::default()
         };
         assert_eq!(create_observer(&cfg).name(), "log");
@@ -187,7 +373,7 @@ mod tests {
     #[test]
     fn factory_verbose_returns_verbose() {
         let cfg = ObservabilityConfig {
-            backend: "verbose".into(),
+            backend: ObservabilityBackend::Verbose,
             ..ObservabilityConfig::default()
         };
         assert_eq!(create_observer(&cfg).name(), "verbose");
@@ -196,7 +382,7 @@ mod tests {
     #[test]
     fn factory_datadog_log_returns_datadog_log() {
         let cfg = ObservabilityConfig {
-            backend: "datadog-log".into(),
+            backend: ObservabilityBackend::DatadogLog,
             ..ObservabilityConfig::default()
         };
         assert_eq!(create_observer(&cfg).name(), "datadog-log");
@@ -205,7 +391,7 @@ mod tests {
     #[test]
     fn factory_prometheus_returns_prometheus() {
         let cfg = ObservabilityConfig {
-            backend: "prometheus".into(),
+            backend: ObservabilityBackend::Prometheus,
             ..ObservabilityConfig::default()
         };
         let expected = if cfg!(feature = "observability-prometheus") {
@@ -217,82 +403,262 @@ mod tests {
     }
 
     #[test]
-    fn factory_otel_returns_multi_with_datadog_log() {
+    fn factory_otel_returns_otel() {
         let cfg = ObservabilityConfig {
-            backend: "otel".into(),
+            backend: ObservabilityBackend::Otel,
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
             ..ObservabilityConfig::default()
         };
-        let obs = create_observer(&cfg);
-        // With otel feature: returns "multi" (OtelObserver + DatadogLogObserver)
-        // Without: returns "noop"
+        // With the otel feature the factory fans out into a MultiObserver
+        // (one OtelObserver per endpoint + a DatadogLogObserver), so the
+        // delegated name is "multi"; without it, falls back to noop.
         let expected = if cfg!(feature = "observability-otel") {
             "multi"
         } else {
             "noop"
         };
-        assert_eq!(obs.name(), expected);
+        assert_eq!(create_observer(&cfg).name(), expected);
     }
 
     #[test]
     fn factory_opentelemetry_alias() {
         let cfg = ObservabilityConfig {
-            backend: "opentelemetry".into(),
+            backend: ObservabilityBackend::Otel,
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
             ..ObservabilityConfig::default()
         };
-        let obs = create_observer(&cfg);
+        // With the otel feature the factory fans out into a MultiObserver
+        // (one OtelObserver per endpoint + a DatadogLogObserver), so the
+        // delegated name is "multi"; without it, falls back to noop.
         let expected = if cfg!(feature = "observability-otel") {
             "multi"
         } else {
             "noop"
         };
-        assert_eq!(obs.name(), expected);
+        assert_eq!(create_observer(&cfg).name(), expected);
     }
 
     #[test]
     fn factory_otlp_alias() {
         let cfg = ObservabilityConfig {
-            backend: "otlp".into(),
+            backend: ObservabilityBackend::Otel,
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
             ..ObservabilityConfig::default()
         };
-        let obs = create_observer(&cfg);
+        // With the otel feature the factory fans out into a MultiObserver
+        // (one OtelObserver per endpoint + a DatadogLogObserver), so the
+        // delegated name is "multi"; without it, falls back to noop.
         let expected = if cfg!(feature = "observability-otel") {
             "multi"
         } else {
             "noop"
         };
-        assert_eq!(obs.name(), expected);
+        assert_eq!(create_observer(&cfg).name(), expected);
     }
 
     #[test]
-    fn factory_unknown_falls_back_to_noop() {
+    fn unknown_backend_falls_back_to_noop_at_load() {
+        let bad: ObservabilityConfig = toml::from_str("backend = \"xyzzy_unknown\"").unwrap();
+        assert_eq!(bad.backend, ObservabilityBackend::None);
+        let empty: ObservabilityConfig = toml::from_str("backend = \"\"").unwrap();
+        assert_eq!(empty.backend, ObservabilityBackend::None);
+        assert_eq!(create_observer(&bad).name(), "noop");
+    }
+
+    use parking_lot::Mutex as PlMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Test observer that counts events and metrics, used to verify the
+    /// broadcast hook fan-out and that downcasts pass through `TeeObserver`.
+    #[derive(Default)]
+    struct CountingObserver {
+        events: AtomicUsize,
+        metrics: AtomicUsize,
+    }
+
+    impl Observer for CountingObserver {
+        fn record_event(&self, _event: &ObserverEvent) {
+            self.events.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn record_metric(&self, _metric: &ObserverMetric) {
+            self.metrics.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn name(&self) -> &str {
+            "counting"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Serialize tests that touch the process-wide broadcast hook so they
+    /// don't observe each other's installations.
+    static HOOK_TEST_LOCK: PlMutex<()> = PlMutex::new(());
+
+    #[test]
+    fn broadcast_hook_receives_events_from_factory_observer() {
+        let _guard = HOOK_TEST_LOCK.lock();
+        clear_broadcast_hook();
+
+        let hook = Arc::new(CountingObserver::default());
+        set_broadcast_hook(hook.clone());
+
         let cfg = ObservabilityConfig {
-            backend: "xyzzy_unknown".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
-        assert_eq!(create_observer(&cfg).name(), "noop");
+        let observer = create_observer(&cfg);
+
+        observer.record_event(&ObserverEvent::HeartbeatTick);
+        observer.record_event(&ObserverEvent::Error {
+            component: "x".into(),
+            message: "y".into(),
+        });
+
+        assert_eq!(hook.events.load(Ordering::SeqCst), 2);
+
+        clear_broadcast_hook();
     }
 
     #[test]
-    fn factory_empty_string_falls_back_to_noop() {
+    fn broadcast_hook_does_not_receive_metrics() {
+        let _guard = HOOK_TEST_LOCK.lock();
+        clear_broadcast_hook();
+
+        let hook = Arc::new(CountingObserver::default());
+        set_broadcast_hook(hook.clone());
+
         let cfg = ObservabilityConfig {
-            backend: String::new(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
-        assert_eq!(create_observer(&cfg).name(), "noop");
+        let observer = create_observer(&cfg);
+
+        observer.record_metric(&ObserverMetric::TokensUsed(10));
+        observer.record_metric(&ObserverMetric::TokensUsed(20));
+
+        assert_eq!(hook.events.load(Ordering::SeqCst), 0);
+        assert_eq!(hook.metrics.load(Ordering::SeqCst), 0);
+
+        clear_broadcast_hook();
     }
 
     #[test]
-    fn factory_garbage_falls_back_to_noop() {
+    fn broadcast_hook_unset_means_only_primary_runs() {
+        let _guard = HOOK_TEST_LOCK.lock();
+        clear_broadcast_hook();
+
         let cfg = ObservabilityConfig {
-            backend: "xyzzy_garbage_123".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
-        assert_eq!(create_observer(&cfg).name(), "noop");
+        let observer = create_observer(&cfg);
+
+        // No hook installed; recording must not panic and must be a no-op.
+        observer.record_event(&ObserverEvent::HeartbeatTick);
+        observer.record_metric(&ObserverMetric::TokensUsed(1));
+    }
+
+    #[test]
+    fn scoped_broadcast_hook_guard_clears_installed_hook_on_drop() {
+        let _guard = HOOK_TEST_LOCK.lock();
+        clear_broadcast_hook();
+
+        let hook = Arc::new(CountingObserver::default());
+        let broadcast_guard = set_scoped_broadcast_hook(hook.clone());
+
+        let cfg = ObservabilityConfig {
+            backend: ObservabilityBackend::None,
+            ..ObservabilityConfig::default()
+        };
+        let observer = create_observer(&cfg);
+        observer.record_event(&ObserverEvent::HeartbeatTick);
+        assert_eq!(hook.events.load(Ordering::SeqCst), 1);
+
+        drop(broadcast_guard);
+        observer.record_event(&ObserverEvent::HeartbeatTick);
+        assert_eq!(hook.events.load(Ordering::SeqCst), 1);
+
+        clear_broadcast_hook();
+    }
+
+    #[test]
+    fn scoped_broadcast_hook_guard_preserves_replacement_hook() {
+        let _guard = HOOK_TEST_LOCK.lock();
+        clear_broadcast_hook();
+
+        let old_hook = Arc::new(CountingObserver::default());
+        let old_guard = set_scoped_broadcast_hook(old_hook.clone());
+
+        let new_hook = Arc::new(CountingObserver::default());
+        set_broadcast_hook(new_hook.clone());
+        drop(old_guard);
+
+        let cfg = ObservabilityConfig {
+            backend: ObservabilityBackend::None,
+            ..ObservabilityConfig::default()
+        };
+        let observer = create_observer(&cfg);
+        observer.record_event(&ObserverEvent::HeartbeatTick);
+
+        assert_eq!(old_hook.events.load(Ordering::SeqCst), 0);
+        assert_eq!(new_hook.events.load(Ordering::SeqCst), 1);
+
+        clear_broadcast_hook();
+    }
+
+    #[test]
+    fn dropping_newer_scoped_broadcast_hook_restores_older_live_hook() {
+        let _guard = HOOK_TEST_LOCK.lock();
+        clear_broadcast_hook();
+
+        let old_hook = Arc::new(CountingObserver::default());
+        let old_guard = set_scoped_broadcast_hook(old_hook.clone());
+
+        let new_hook = Arc::new(CountingObserver::default());
+        let new_guard = set_scoped_broadcast_hook(new_hook.clone());
+
+        let cfg = ObservabilityConfig {
+            backend: ObservabilityBackend::None,
+            ..ObservabilityConfig::default()
+        };
+        let observer = create_observer(&cfg);
+        observer.record_event(&ObserverEvent::HeartbeatTick);
+        assert_eq!(old_hook.events.load(Ordering::SeqCst), 0);
+        assert_eq!(new_hook.events.load(Ordering::SeqCst), 1);
+
+        drop(new_guard);
+        observer.record_event(&ObserverEvent::HeartbeatTick);
+        assert_eq!(old_hook.events.load(Ordering::SeqCst), 1);
+        assert_eq!(new_hook.events.load(Ordering::SeqCst), 1);
+
+        drop(old_guard);
+        observer.record_event(&ObserverEvent::HeartbeatTick);
+        assert_eq!(old_hook.events.load(Ordering::SeqCst), 1);
+        assert_eq!(new_hook.events.load(Ordering::SeqCst), 1);
+
+        clear_broadcast_hook();
+    }
+
+    #[test]
+    fn factory_observer_downcasts_through_tee() {
+        let _guard = HOOK_TEST_LOCK.lock();
+        clear_broadcast_hook();
+
+        let cfg = ObservabilityConfig {
+            backend: ObservabilityBackend::Log,
+            ..ObservabilityConfig::default()
+        };
+        let observer = create_observer(&cfg);
+
+        // `as_any` must surface the primary observer so existing downcasts
+        // (e.g. PrometheusObserver in /metrics) keep working through the tee.
+        assert!(observer.as_any().downcast_ref::<LogObserver>().is_some());
     }
 }

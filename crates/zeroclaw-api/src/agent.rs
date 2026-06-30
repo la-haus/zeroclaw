@@ -1,6 +1,9 @@
 /// Streaming events emitted during an agent turn.
 ///
 /// Used by the gateway WebSocket handler to relay real-time updates to clients.
+/// Consumers that pattern-match on [`TurnEvent::ToolCall`] or
+/// [`TurnEvent::ToolResult`] should preserve the stable `id` field for
+/// call/result correlation.
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
     /// A text chunk from the LLM response (may arrive many times).
@@ -9,12 +12,66 @@ pub enum TurnEvent {
     Thinking { delta: String },
     /// The agent is invoking a tool.
     ToolCall {
+        /// Stable correlation ID shared with the matching [`TurnEvent::ToolResult`].
+        id: String,
         name: String,
         args: serde_json::Value,
     },
     /// A tool has returned a result.
-    ToolResult { name: String, output: String },
-    /// Summary of a completed LLM call (input/output tokens, model, duration).
+    ToolResult {
+        /// Stable correlation ID shared with the originating [`TurnEvent::ToolCall`].
+        id: String,
+        name: String,
+        output: String,
+    },
+    /// The agent is waiting for the operator to approve, deny, or always-allow
+    /// a tool call. The transport (e.g. gateway WebSocket) is expected to
+    /// surface this to the operator and route the response back through the
+    /// same correlation `request_id`. The runtime tool loop pauses until that
+    /// answer arrives or the channel times out.
+    ApprovalRequest {
+        /// Correlation ID. The matching response frame must echo it.
+        request_id: String,
+        tool_name: String,
+        /// Human-readable, secret-redacted summary of the tool arguments.
+        /// Synthesised by `crate::approval::summarize_args`; never the raw
+        /// `args` value.
+        arguments_summary: String,
+        /// How long the channel will wait before auto-denying.
+        timeout_secs: u64,
+    },
+    /// Older whole turns were dropped from the context window to fit the token
+    /// budget. Surfaces a user-visible "context was cut here" marker so trimming
+    /// is never silent. Emitted once per turn boundary when a trim occurs.
+    HistoryTrimmed {
+        dropped_messages: usize,
+        kept_turns: usize,
+        reason: String,
+    },
+    /// Per-LLM-call token usage and cost.
+    ///
+    /// Emitted once per LLM response the agent loop processes; a single turn
+    /// that hops through tools may emit several `Usage` events, one per model
+    /// call. Consumers (e.g. the gateway WS handler) accumulate these into a
+    /// turn total before reporting back to the client. Absence means "usage
+    /// unavailable for this call" rather than zero.
+    Usage {
+        input_tokens: Option<u64>,
+        /// Tokens served from the provider's prompt cache (e.g. Anthropic
+        /// `cache_read_input_tokens`, OpenAI `cached_tokens`). These count
+        /// toward the context window and must be added to `input_tokens` to
+        /// get the true total context size.
+        cached_input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cost_usd: Option<f64>,
+    },
+    /// Summary of a completed LLM call surfaced to streaming clients for
+    /// real-time cost/latency observability (model, tokens, duration, and
+    /// truncated input/output previews). Emitted once per provider call,
+    /// alongside [`TurnEvent::Usage`]. Distinct from `Usage`, which carries
+    /// only the accumulating token/cost totals: `LlmCall` adds the model
+    /// label, wall-clock duration, and previews that the gateway WebSocket
+    /// relays to the CX frontend without depending on OTEL traces.
     LlmCall {
         model: String,
         input_tokens: Option<u64>,

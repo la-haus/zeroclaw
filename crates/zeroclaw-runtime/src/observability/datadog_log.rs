@@ -4,11 +4,15 @@
 //! `lahaus-logger` Python schema so Datadog Log Management can parse, index,
 //! and correlate logs with APM traces without extra pipelines.
 //!
-//! When compiled with `observability-otel`, logs include `dd.trace_id` and
-//! `dd.span_id` extracted from the active OTEL span context — enabling
-//! automatic log↔trace correlation in Datadog.
+//! Correlation: every line carries `dd.trace_id`/`dd.span_id` read from the
+//! [`SharedTraceContext`] written by the [`super::otel::OtelObserver`] on
+//! `AgentStart`. We deliberately do *not* rely on the global OpenTelemetry
+//! context because the OtelObserver is instance-scoped and never registers its
+//! spans as the global current span. When compiled without the
+//! `observability-otel` feature (or when no shared context is attached) the
+//! correlation ids fall back to `"0"`.
 //!
-//! Metrics are a no-op — they go through the OTEL pipeline instead.
+//! Metrics are a no-op — they flow through the OTEL pipeline instead.
 
 use super::SharedTraceContext;
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
@@ -20,8 +24,9 @@ pub struct DatadogLogObserver {
     service: String,
     version: String,
     env: String,
-    /// Shared trace context written by OtelObserver, giving us the active
-    /// trace_id/span_id without relying on the global OpenTelemetry context.
+    /// Shared trace context written by `OtelObserver`, giving us the active
+    /// `(trace_id_64, span_id)` without relying on the global OpenTelemetry
+    /// context.
     trace_context: Option<SharedTraceContext>,
 }
 
@@ -32,7 +37,8 @@ impl Default for DatadogLogObserver {
 }
 
 impl DatadogLogObserver {
-    /// Creates a new observer, reading DD_SERVICE, DD_VERSION, DD_ENV from env.
+    /// Creates a new observer, reading `DD_SERVICE`, `DD_VERSION`, `DD_ENV`
+    /// from the environment (Datadog Unified Service Tagging).
     pub fn new() -> Self {
         Self {
             service: std::env::var("DD_SERVICE").unwrap_or_else(|_| "zeroclaw".into()),
@@ -42,20 +48,19 @@ impl DatadogLogObserver {
         }
     }
 
-    /// Attach a shared trace context for log↔trace correlation.
-    ///
-    /// When set, `current_trace_context()` reads trace_id/span_id from this
-    /// shared state (written by OtelObserver) instead of the global OTEL
-    /// context, which OtelObserver never registers spans into.
+    /// Attach a shared trace context for log↔trace correlation. When set,
+    /// [`current_trace_context`](Self::current_trace_context) reads the
+    /// `(trace_id, span_id)` written by `OtelObserver`.
+    #[must_use]
     pub fn with_trace_context(mut self, ctx: SharedTraceContext) -> Self {
         self.trace_context = Some(ctx);
         self
     }
 
-    /// Get current OTEL trace_id and span_id for Datadog correlation.
-    /// Returns (trace_id_64bit, span_id) as strings, or ("0", "0") if unavailable.
+    /// Current OTEL `(trace_id_64bit, span_id)` for Datadog correlation, as
+    /// decimal strings. Returns `("0", "0")` when unavailable.
     fn current_trace_context(&self) -> (String, String) {
-        // Prefer shared trace context (written by OtelObserver) over global context
+        // Prefer the shared trace context written by OtelObserver.
         if let Some(ref tc) = self.trace_context {
             let pair = tc.lock();
             if pair.0 != "0" {
@@ -63,9 +68,9 @@ impl DatadogLogObserver {
             }
         }
 
-        // Fallback: read from global OpenTelemetry context (may still be "0"
-        // if no spans are registered globally, but kept for standalone usage
-        // without OtelObserver).
+        // Fallback: read from the global OpenTelemetry context. Usually "0"
+        // because the instance-scoped OtelObserver does not register spans
+        // globally, but kept for standalone use without a shared context.
         #[cfg(feature = "observability-otel")]
         {
             use opentelemetry::trace::TraceContextExt;
@@ -73,7 +78,8 @@ impl DatadogLogObserver {
             let span = ctx.span();
             let sc = span.span_context();
             if sc.is_valid() {
-                // Datadog uses 64-bit trace IDs: take lower 64 bits of 128-bit OTEL trace ID
+                // Datadog uses 64-bit trace IDs: take the lower 64 bits of the
+                // 128-bit OTEL trace ID.
                 let trace_id_128 = u128::from_be_bytes(sc.trace_id().to_bytes());
                 let trace_id_64 = (trace_id_128 & ((1u128 << 64) - 1)) as u64;
                 let span_id = u64::from_be_bytes(sc.span_id().to_bytes());
@@ -97,7 +103,7 @@ impl DatadogLogObserver {
             "dd.span_id": span_id,
             "attributes": attributes,
         });
-        println!("{}", line);
+        println!("{line}");
     }
 }
 
@@ -105,15 +111,17 @@ impl Observer for DatadogLogObserver {
     fn record_event(&self, event: &ObserverEvent) {
         match event {
             ObserverEvent::AgentStart {
-                provider,
+                model_provider,
                 model,
+                channel,
+                agent_alias,
+                turn_id,
                 user_id,
                 session_id,
                 message_id,
-                input,
             } => {
                 let mut attrs = json!({
-                    "provider": provider,
+                    "provider": model_provider,
                     "model": model,
                 });
                 if let Some(uid) = user_id {
@@ -125,14 +133,20 @@ impl Observer for DatadogLogObserver {
                 if let Some(mid) = message_id {
                     attrs["message_id"] = json!(mid);
                 }
-                if let Some(inp) = input {
-                    attrs["input"] = json!(inp);
+                if let Some(ch) = channel {
+                    attrs["channel"] = json!(ch);
+                }
+                if let Some(alias) = agent_alias {
+                    attrs["agent_alias"] = json!(alias);
+                }
+                if let Some(tid) = turn_id {
+                    attrs["turn_id"] = json!(tid);
                 }
                 self.emit("info", "agent.start", attrs);
             }
 
             ObserverEvent::LlmRequest {
-                provider,
+                model_provider,
                 model,
                 messages_count,
                 ..
@@ -141,7 +155,7 @@ impl Observer for DatadogLogObserver {
                     "info",
                     "llm.call.start",
                     json!({
-                        "provider": provider,
+                        "provider": model_provider,
                         "model": model,
                         "messages_count": messages_count,
                     }),
@@ -149,7 +163,7 @@ impl Observer for DatadogLogObserver {
             }
 
             ObserverEvent::LlmResponse {
-                provider,
+                model_provider,
                 model,
                 duration,
                 success,
@@ -160,7 +174,7 @@ impl Observer for DatadogLogObserver {
             } => {
                 let level = if *success { "info" } else { "error" };
                 let mut attrs = json!({
-                    "provider": provider,
+                    "provider": model_provider,
                     "model": model,
                     "duration_ms": duration.as_millis() as u64,
                     "success": success,
@@ -181,26 +195,25 @@ impl Observer for DatadogLogObserver {
             }
 
             ObserverEvent::AgentEnd {
-                provider,
+                model_provider,
                 model,
                 duration,
                 tokens_used,
                 cost_usd,
-                output,
+                ..
             } => {
                 let mut attrs = json!({
-                    "provider": provider,
+                    "provider": model_provider,
                     "model": model,
                     "duration_ms": duration.as_millis() as u64,
                 });
                 if let Some(tokens) = tokens_used {
-                    attrs["total_tokens"] = json!(tokens);
+                    attrs["input_tokens"] = json!(tokens.input_tokens);
+                    attrs["output_tokens"] = json!(tokens.output_tokens);
+                    attrs["total_tokens"] = json!(tokens.input_tokens + tokens.output_tokens);
                 }
                 if let Some(cost) = cost_usd {
                     attrs["cost_usd"] = json!(cost);
-                }
-                if let Some(out) = output {
-                    attrs["output"] = json!(out);
                 }
                 self.emit("info", "agent.end", attrs);
             }
@@ -219,18 +232,20 @@ impl Observer for DatadogLogObserver {
                 tool,
                 duration,
                 success,
+                result,
                 ..
             } => {
                 let level = if *success { "info" } else { "error" };
-                self.emit(
-                    level,
-                    "tool.call.complete",
-                    json!({
-                        "tool": tool,
-                        "duration_ms": duration.as_millis() as u64,
-                        "success": success,
-                    }),
-                );
+                let mut attrs = json!({
+                    "tool": tool,
+                    "duration_ms": duration.as_millis() as u64,
+                    "success": success,
+                });
+                // On failure, carry the scrubbed tool output as the error reason.
+                if !*success && let Some(res) = result {
+                    attrs["error_message"] = json!(res);
+                }
+                self.emit(level, "tool.call.complete", attrs);
             }
 
             ObserverEvent::Error { component, message } => {
@@ -255,57 +270,9 @@ impl Observer for DatadogLogObserver {
                 );
             }
 
-            ObserverEvent::HandStarted { hand_name } => {
-                self.emit(
-                    "info",
-                    "hand.start",
-                    json!({
-                        "hand": hand_name,
-                    }),
-                );
-            }
-
-            ObserverEvent::HandCompleted {
-                hand_name,
-                duration_ms,
-                findings_count,
-            } => {
-                self.emit(
-                    "info",
-                    "hand.complete",
-                    json!({
-                        "hand": hand_name,
-                        "duration_ms": duration_ms,
-                        "findings_count": findings_count,
-                    }),
-                );
-            }
-
-            ObserverEvent::HandFailed {
-                hand_name,
-                error,
-                duration_ms,
-            } => {
-                self.emit(
-                    "error",
-                    "hand.failed",
-                    json!({
-                        "hand": hand_name,
-                        "error_message": error,
-                        "duration_ms": duration_ms,
-                    }),
-                );
-            }
-
-            // Skip noisy/low-value events
-            ObserverEvent::HeartbeatTick
-            | ObserverEvent::TurnComplete
-            | ObserverEvent::CacheHit { .. }
-            | ObserverEvent::CacheMiss { .. }
-            | ObserverEvent::DeploymentStarted { .. }
-            | ObserverEvent::DeploymentCompleted { .. }
-            | ObserverEvent::DeploymentFailed { .. }
-            | ObserverEvent::RecoveryCompleted { .. } => {}
+            // Skip noisy/low-value events and any future (`#[non_exhaustive]`)
+            // variants added by upstream `zeroclaw-api`.
+            _ => {}
         }
     }
 
@@ -325,7 +292,21 @@ impl Observer for DatadogLogObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability::traits::TurnTokenUsage;
     use std::time::Duration;
+
+    fn agent_start() -> ObserverEvent {
+        ObserverEvent::AgentStart {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            channel: Some("wss".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+            user_id: Some("user-42".into()),
+            session_id: Some("session-7".into()),
+            message_id: Some("msg-9".into()),
+        }
+    }
 
     #[test]
     fn name_returns_datadog_log() {
@@ -336,53 +317,79 @@ mod tests {
     #[test]
     fn all_events_without_panic() {
         let obs = DatadogLogObserver::new();
-        obs.record_event(&ObserverEvent::AgentStart {
-            provider: "anthropic".into(),
-            model: "claude-sonnet-4-6".into(),
-            user_id: None,
-            session_id: None,
-            message_id: None,
-            input: None,
-        });
+        obs.record_event(&agent_start());
         obs.record_event(&ObserverEvent::LlmRequest {
-            provider: "anthropic".into(),
+            model_provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             messages_count: 5,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
             prompt_content: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "anthropic".into(),
+            model_provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             duration: Duration::from_millis(1500),
             success: true,
             error_message: None,
             input_tokens: Some(1000),
             output_tokens: Some(200),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
             response_content: None,
-        });
-        obs.record_event(&ObserverEvent::ToolCallStart {
-            tool: "shell".into(),
-            arguments: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: Some("call_1".into()),
             duration: Duration::from_millis(50),
-            success: true,
-            output: None,
+            success: false,
+            arguments: Some(r#"{"command":"false"}"#.into()),
+            result: Some("exit status 1".into()),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::Error {
-            component: "provider".into(),
+            component: "model_provider".into(),
             message: "rate limited".into(),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
-            provider: "anthropic".into(),
+            model_provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             duration: Duration::from_secs(30),
-            tokens_used: Some(5000),
+            tokens_used: Some(TurnTokenUsage {
+                input_tokens: 1000,
+                output_tokens: 200,
+            }),
             cost_usd: Some(0.015),
-            output: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
+    }
+
+    #[test]
+    fn reads_trace_id_from_shared_context() {
+        let ctx: SharedTraceContext =
+            std::sync::Arc::new(parking_lot::Mutex::new(("12345".into(), "67890".into())));
+        let obs = DatadogLogObserver::new().with_trace_context(ctx);
+        let (trace_id, span_id) = obs.current_trace_context();
+        assert_eq!(trace_id, "12345");
+        assert_eq!(span_id, "67890");
+    }
+
+    #[test]
+    fn unset_shared_context_falls_back_to_zero() {
+        let ctx: SharedTraceContext =
+            std::sync::Arc::new(parking_lot::Mutex::new(("0".into(), "0".into())));
+        let obs = DatadogLogObserver::new().with_trace_context(ctx);
+        // No OTEL global span in this unit test → "0".
+        let (trace_id, span_id) = obs.current_trace_context();
+        assert_eq!(trace_id, "0");
+        assert_eq!(span_id, "0");
     }
 
     #[test]

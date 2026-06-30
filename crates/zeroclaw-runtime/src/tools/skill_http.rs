@@ -25,11 +25,11 @@ pub struct SkillHttpTool {
 impl SkillHttpTool {
     /// Create a new skill HTTP tool.
     ///
-    /// The tool name is prefixed with the skill name (`skill_name.tool_name`)
+    /// The tool name is prefixed with the skill name (`skill_name__tool_name`)
     /// to prevent collisions with built-in tools.
     pub fn new(skill_name: &str, tool: &crate::skills::SkillTool) -> Self {
         Self {
-            tool_name: format!("{}.{}", skill_name, tool.name),
+            tool_name: crate::tools::skill_tool::composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
             url_template: tool.command.clone(),
             args: tool.args.clone(),
@@ -104,7 +104,16 @@ impl Tool for SkillHttpTool {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
             .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "skill_http tool: reqwest client build failed"
+                );
+                anyhow::Error::msg(format!("Failed to build HTTP client: {e}"))
+            })?;
 
         let response = match client.get(&url).send().await {
             Ok(resp) => resp,
@@ -167,13 +176,16 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/weather?city={{city}}".to_string(),
             args,
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
         }
     }
 
     #[test]
     fn skill_http_tool_name_is_prefixed() {
         let tool = SkillHttpTool::new("weather_skill", &sample_http_tool());
-        assert_eq!(tool.name(), "weather_skill.get_weather");
+        assert_eq!(tool.name(), "weather_skill__get_weather");
     }
 
     #[test]
@@ -203,9 +215,31 @@ mod tests {
     fn skill_http_tool_spec_roundtrip() {
         let tool = SkillHttpTool::new("weather_skill", &sample_http_tool());
         let spec = tool.spec();
-        assert_eq!(spec.name, "weather_skill.get_weather");
+        assert_eq!(spec.name, "weather_skill__get_weather");
         assert_eq!(spec.description, "Fetch weather for a city");
         assert_eq!(spec.parameters["type"], "object");
+    }
+
+    #[test]
+    fn skill_http_tool_name_sanitized_for_provider_regex() {
+        // A plugin-namespaced HTTP skill (colons) or a dotted tool name must
+        // still yield a provider-valid function name, the same as shell/builtin
+        // tools, so #6678 cannot survive through the HTTP registration path.
+        let mut st = sample_http_tool();
+        st.name = "fetch.weather".to_string();
+        let tool = SkillHttpTool::new("pr-review-toolkit:code-reviewer", &st);
+        let name = tool.name();
+        assert!(
+            !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "HTTP skill tool name `{name}` is not provider-valid",
+        );
+        // A valid name must still pass through unchanged (no spurious suffix).
+        let plain = SkillHttpTool::new("weather_skill", &sample_http_tool());
+        assert_eq!(plain.name(), "weather_skill__get_weather");
     }
 
     #[test]
@@ -216,6 +250,9 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/ping".to_string(),
             args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillHttpTool::new("s", &st);
         let schema = tool.parameters_schema();

@@ -98,6 +98,13 @@ fn validate_options(args: &serde_json::Value) -> Result<Vec<String>, String> {
     Ok(options)
 }
 
+fn duration_minutes_or_default(args: &serde_json::Value) -> u64 {
+    args.get("duration_minutes")
+        .and_then(|v| v.as_u64())
+        .filter(|duration| *duration > 0)
+        .unwrap_or(DEFAULT_DURATION_MINUTES)
+}
+
 /// Returns true for channel names that support native polls (Telegram, Discord).
 fn supports_native_poll(channel_name: &str) -> bool {
     let lower = channel_name.to_ascii_lowercase();
@@ -139,6 +146,7 @@ impl Tool for PollTool {
                 },
                 "duration_minutes": {
                     "type": "integer",
+                    "minimum": 1,
                     "description": "Poll duration in minutes (default: 60)"
                 },
                 "multi_select": {
@@ -169,7 +177,16 @@ impl Tool for PollTool {
             .and_then(|v| v.as_str())
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'question' parameter"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "question"})),
+                    "poll: missing question parameter"
+                );
+                anyhow::Error::msg("Missing 'question' parameter")
+            })?
             .to_string();
 
         let options = match validate_options(&args) {
@@ -183,10 +200,7 @@ impl Tool for PollTool {
             }
         };
 
-        let duration_minutes = args
-            .get("duration_minutes")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_DURATION_MINUTES);
+        let duration_minutes = duration_minutes_or_default(&args);
 
         let multi_select = args
             .get("multi_select")
@@ -209,17 +223,33 @@ impl Tool for PollTool {
             let channels = self.channels.read();
             if let Some(ref name) = requested_channel {
                 let ch = channels.get(name.as_str()).cloned().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Channel '{}' not found. Available: {}",
-                        name,
-                        channels.keys().cloned().collect::<Vec<_>>().join(", ")
-                    )
+                    let available = channels.keys().cloned().collect::<Vec<_>>().join(", ");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "channel_requested": name,
+                                "available": &available,
+                            })),
+                        "poll: requested channel not found"
+                    );
+                    anyhow::Error::msg(format!(
+                        "Channel '{name}' not found. Available: {available}"
+                    ))
                 })?;
                 (name.clone(), ch)
             } else {
                 // Fall back to first available channel
                 let (name, ch) = channels.iter().next().ok_or_else(|| {
-                    anyhow::anyhow!("No channels available. Configure at least one channel.")
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"missing": "channels"})),
+                        "poll: no channels configured"
+                    );
+                    anyhow::Error::msg("No channels available. Configure at least one channel.")
                 })?;
                 (name.clone(), ch.clone())
             }
@@ -282,6 +312,17 @@ mod tests {
                 name: name.to_string(),
                 sent: Arc::new(RwLock::new(Vec::new())),
             }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StubChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
         }
     }
 
@@ -384,6 +425,47 @@ mod tests {
     fn format_text_poll_multi_select_label() {
         let text = format_text_poll("Pick any", &["A".into(), "B".into()], 60, true);
         assert!(text.contains("multiple choices allowed"));
+    }
+
+    #[test]
+    fn duration_minutes_zero_uses_default() {
+        assert_eq!(
+            duration_minutes_or_default(&json!({ "duration_minutes": 0 })),
+            DEFAULT_DURATION_MINUTES
+        );
+        assert_eq!(
+            duration_minutes_or_default(&json!({ "duration_minutes": 15 })),
+            15
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_zero_duration_uses_default_in_sent_text_and_output() {
+        let security = Arc::new(SecurityPolicy::default());
+        let stub = Arc::new(StubChannel::new("slack"));
+        let sent = Arc::clone(&stub.sent);
+        let channel: Arc<dyn Channel> = stub;
+        let channels = make_channel_map(vec![channel]);
+        let tool = PollTool::new(security, channels);
+
+        let result = tool
+            .execute(json!({
+                "question": "Lunch?",
+                "options": ["Pizza", "Sushi"],
+                "channel": "slack",
+                "recipient": "general",
+                "duration_minutes": 0
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        assert!(result.output.contains("Duration: 60 min"));
+
+        let sent = sent.read();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Poll closes in 60 min"));
+        assert!(!sent[0].contains("Poll closes in 0 min"));
     }
 
     #[test]

@@ -1,58 +1,50 @@
-use zeroclaw_api::provider::ChatMessage;
-
-pub use zeroclaw_config::scattered_types::HistoryPrunerConfig;
+use zeroclaw_api::model_provider::ChatMessage;
 
 // ---------------------------------------------------------------------------
-// Stats
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PruneStats {
-    pub messages_before: usize,
-    pub messages_after: usize,
-    pub collapsed_pairs: usize,
-    pub dropped_messages: usize,
-}
-
-// ---------------------------------------------------------------------------
-// Token estimation
-// ---------------------------------------------------------------------------
-
-fn estimate_tokens(messages: &[ChatMessage]) -> usize {
-    let raw: usize = messages
-        .iter()
-        .map(|m| m.content.len().div_ceil(4) + 4)
-        .sum();
-    // Apply 1.2x safety margin consistent with context_compressor to avoid
-    // underestimation that leads to context_length_exceeded errors.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    {
-        (raw as f64 * 1.2) as usize
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Protected-index helpers
-// ---------------------------------------------------------------------------
-
-fn protected_indices(messages: &[ChatMessage], keep_recent: usize) -> Vec<bool> {
-    let len = messages.len();
-    let mut protected = vec![false; len];
-    for (i, msg) in messages.iter().enumerate() {
-        if msg.role == "system" {
-            protected[i] = true;
-        }
-    }
-    let recent_start = len.saturating_sub(keep_recent);
-    for p in protected.iter_mut().skip(recent_start) {
-        *p = true;
-    }
-    protected
-}
-
 // ---------------------------------------------------------------------------
 // Orphaned tool-message sanitiser
 // ---------------------------------------------------------------------------
+
+/// Outcome of a single `remove_orphaned_tool_messages` pass. The caller
+/// is responsible for logging — that's where the agent/channel/session
+/// context lives.
+#[derive(Debug, Default, Clone)]
+pub struct PrunedOrphans {
+    /// Total tool / assistant messages removed across both passes.
+    pub removed: usize,
+    /// `tool_call_id`s that lost their pairing.
+    pub orphan_tool_call_ids: Vec<String>,
+}
+
+/// True when the assistant at `prev_idx` is itself an unresolved tool-call
+/// dispatch: it claims `tool_calls` but the rows between it and `next_idx`
+/// do not answer all of them. This is the genuinely poisoned shape where a
+/// second dispatch follows a first that never landed — distinct from a
+/// healthy `assistant(text preamble)` → `assistant(tool_calls)` turn, where
+/// the preamble has no tool_calls and is left untouched.
+fn assistant_is_unresolved_dispatch(
+    messages: &[ChatMessage],
+    prev_idx: usize,
+    next_idx: usize,
+) -> bool {
+    match extract_assistant_tool_call_ids(&messages[prev_idx].content) {
+        Some(ids) if !ids.is_empty() => {
+            let between = &messages[prev_idx + 1..next_idx];
+            !ids.iter().all(|id| {
+                between.iter().any(|m| {
+                    m.role == "tool" && extract_tool_call_id(&m.content).as_ref() == Some(id)
+                })
+            })
+        }
+        _ => false,
+    }
+}
+
+impl PrunedOrphans {
+    pub fn is_empty(&self) -> bool {
+        self.removed == 0
+    }
+}
 
 /// Remove `tool`-role messages whose `tool_call_id` has no matching
 /// `tool_use` / `tool_calls` entry in a preceding assistant message.
@@ -60,24 +52,40 @@ fn protected_indices(messages: &[ChatMessage], keep_recent: usize) -> Vec<bool> 
 /// After any history truncation (drain, remove, prune) the first surviving
 /// message(s) may be `tool` results whose assistant request was trimmed away.
 /// The Anthropic API (and others) reject these with a 400 error.
-///
-/// Returns the number of messages removed.
-pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
-    // Pass 1: Remove assistant(tool_calls) + their tool_results when the
-    // assistant is preceded by another assistant. Normalization would merge
-    // them, destroying structured tool_use blocks and orphaning the results.
-    let mut removed = 0usize;
+pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedOrphans {
+    let mut outcome = PrunedOrphans::default();
+    // Pass 1: Remove a second `assistant(tool_calls)` (and its immediate
+    // tool results) only when the *preceding* assistant is itself
+    // problematic in a way that normalization would corrupt:
+    //
+    //   * a collapsed tool-exchange summary whose merge would orphan this
+    //     dispatch's results (the GLM-history case, #7013), or
+    //   * an unresolved tool-call dispatch — a first dispatch that never
+    //     landed, immediately followed by this one (the poisoned
+    //     double-dispatch case).
+    //
+    // A healthy turn shape `assistant(text preamble)` → `assistant(tool_calls)`
+    // → `tool` must NOT be touched: the preamble has no tool_calls and is
+    // neither a summary nor an unresolved dispatch, so it is left intact.
+    // Nuking the dispatch there produces the "amnesia mid-tool-loop"
+    // failure where the model sees the next turn with none of its work.
     let mut i = 0;
     while i < messages.len() {
-        if messages[i].role == "assistant"
-            && extract_assistant_tool_call_ids(&messages[i].content).is_some()
+        let assistant_tool_call_ids = if messages[i].role == "assistant" {
+            extract_assistant_tool_call_ids(&messages[i].content)
+        } else {
+            None
+        };
+        if let Some(doomed_ids) = assistant_tool_call_ids
             && i > 0
             && messages[i - 1].role == "assistant"
+            && assistant_is_unresolved_dispatch(messages, i - 1, i)
         {
-            let doomed_ids =
-                extract_assistant_tool_call_ids(&messages[i].content).unwrap_or_default();
+            outcome
+                .orphan_tool_call_ids
+                .extend(doomed_ids.iter().cloned());
             messages.remove(i);
-            removed += 1;
+            outcome.removed += 1;
             while i < messages.len() && messages[i].role == "tool" {
                 let dominated = match extract_tool_call_id(&messages[i].content) {
                     Some(id) => doomed_ids.iter().any(|d| d == &id),
@@ -85,7 +93,7 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
                 };
                 if dominated {
                     messages.remove(i);
-                    removed += 1;
+                    outcome.removed += 1;
                 } else {
                     break;
                 }
@@ -99,8 +107,7 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
     // is not in the preceding assistant's structured tool_calls array.
     // A substring match on the assistant's *text* is NOT sufficient —
     // compaction summaries are instructed to preserve identifiers, so an
-    // id can appear in prose without an actual tool_use block backing it
-    // (see #5813).
+    // id can appear in prose without an actual tool_use block backing it.
     i = 0;
     while i < messages.len() {
         if messages[i].role != "tool" {
@@ -125,20 +132,16 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
         };
 
         if is_orphan {
+            if let Some(id) = extract_tool_call_id(&messages[i].content) {
+                outcome.orphan_tool_call_ids.push(id);
+            }
             messages.remove(i);
-            removed += 1;
+            outcome.removed += 1;
         } else {
             i += 1;
         }
     }
-    if removed > 0 {
-        tracing::warn!(
-            count = removed,
-            "Removed {removed} orphaned tool message(s) from history — this indicates a prior \
-             tool_use/tool_result pairing inconsistency that was auto-healed"
-        );
-    }
-    removed
+    outcome
 }
 
 /// Try to extract a `tool_call_id` from a tool-role message's JSON content.
@@ -171,136 +174,6 @@ fn extract_assistant_tool_call_ids(content: &str) -> Option<Vec<String>> {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConfig) -> PruneStats {
-    let messages_before = messages.len();
-    if !config.enabled || messages.is_empty() {
-        return PruneStats {
-            messages_before,
-            messages_after: messages_before,
-            collapsed_pairs: 0,
-            dropped_messages: 0,
-        };
-    }
-
-    let mut collapsed_pairs: usize = 0;
-
-    // Phase 1 – collapse assistant+tool groups atomically.
-    // An assistant message followed by one or more consecutive tool messages
-    // forms an atomic group (tool_use + tool_result pairing). Collapsing only
-    // part of the group would orphan tool_use blocks, causing API 400 errors
-    // from providers that enforce pairing (e.g., Anthropic). See #4810.
-    //
-    // The group is collapsed only when *every* tool in it is unprotected —
-    // the same all-or-nothing rule Phase 2 uses. If `keep_recent` protects
-    // any tool in the group we skip the whole group. Partial collapse would
-    // leave a protected tool behind whose parent assistant has been
-    // rewritten to a summary with no "tool_calls" marker, which Phase 3's
-    // orphan sweep then evicts — silently violating `keep_recent`. See
-    // #5823.
-    if config.collapse_tool_results {
-        let mut i = 0;
-        while i < messages.len() {
-            let protected = protected_indices(messages, config.keep_recent);
-            if messages[i].role == "assistant" && !protected[i] {
-                // Count consecutive tool messages following this assistant
-                // and remember whether any of them is protected.
-                let mut tool_count = 0;
-                let mut any_tool_protected = false;
-                while i + 1 + tool_count < messages.len()
-                    && messages[i + 1 + tool_count].role == "tool"
-                {
-                    if protected[i + 1 + tool_count] {
-                        any_tool_protected = true;
-                    }
-                    tool_count += 1;
-                }
-                if tool_count > 0 && !any_tool_protected {
-                    let summary =
-                        format!("[Tool exchange: {tool_count} tool call(s) — results collapsed]");
-                    messages[i] = ChatMessage {
-                        role: "assistant".to_string(),
-                        content: summary,
-                    };
-                    for _ in 0..tool_count {
-                        messages.remove(i + 1);
-                    }
-                    collapsed_pairs += tool_count;
-                    continue;
-                }
-                if tool_count > 0 {
-                    // Protected tool inside the group → skip the whole
-                    // group intact so Phase 3's orphan sweep has no
-                    // pretext to remove those tools.
-                    i += 1 + tool_count;
-                    continue;
-                }
-            }
-            i += 1;
-        }
-    }
-
-    // Phase 2 – budget enforcement: drop messages to fit token budget.
-    // Tool groups (assistant + consecutive tool messages) are dropped
-    // atomically to preserve tool_use/tool_result pairing. See #4810.
-    let mut dropped_messages: usize = 0;
-    while estimate_tokens(messages) > config.max_tokens {
-        let protected = protected_indices(messages, config.keep_recent);
-        let mut dropped_any = false;
-        let mut i = 0;
-        while i < messages.len() {
-            if protected[i] {
-                i += 1;
-                continue;
-            }
-            if messages[i].role == "assistant" {
-                // Count following tool messages — drop as atomic group,
-                // but skip if any tool in the group is protected.
-                let mut tool_count = 0;
-                let mut any_tool_protected = false;
-                while i + 1 + tool_count < messages.len()
-                    && messages[i + 1 + tool_count].role == "tool"
-                {
-                    if protected[i + 1 + tool_count] {
-                        any_tool_protected = true;
-                    }
-                    tool_count += 1;
-                }
-                if tool_count > 0 && !any_tool_protected {
-                    for _ in 0..=tool_count {
-                        messages.remove(i);
-                    }
-                    dropped_messages += 1 + tool_count;
-                    dropped_any = true;
-                    break;
-                } else if tool_count > 0 {
-                    // Group has protected tools — skip past it
-                    i += 1 + tool_count;
-                    continue;
-                }
-            }
-            // Non-tool-group message — safe to drop individually
-            messages.remove(i);
-            dropped_messages += 1;
-            dropped_any = true;
-            break;
-        }
-        if !dropped_any {
-            break;
-        }
-    }
-
-    // Phase 3 – remove orphaned tool messages left behind by phases 1-2.
-    let orphans_removed = remove_orphaned_tool_messages(messages);
-    dropped_messages += orphans_removed;
-
-    PruneStats {
-        messages_before,
-        messages_after: messages.len(),
-        collapsed_pairs,
-        dropped_messages,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,292 +182,6 @@ mod tests {
         ChatMessage {
             role: role.to_string(),
             content: content.to_string(),
-        }
-    }
-
-    #[test]
-    fn prune_disabled_is_noop() {
-        let mut messages = vec![
-            msg("system", "You are helpful."),
-            msg("user", "Hello"),
-            msg("assistant", "Hi there!"),
-        ];
-        let config = HistoryPrunerConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        let stats = prune_history(&mut messages, &config);
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0].content, "You are helpful.");
-        assert_eq!(stats.messages_before, 3);
-        assert_eq!(stats.messages_after, 3);
-        assert_eq!(stats.collapsed_pairs, 0);
-    }
-
-    #[test]
-    fn prune_under_budget_no_change() {
-        let mut messages = vec![
-            msg("system", "You are helpful."),
-            msg("user", "Hello"),
-            msg("assistant", "Hi!"),
-        ];
-        let config = HistoryPrunerConfig {
-            enabled: true,
-            max_tokens: 8192,
-            keep_recent: 2,
-            collapse_tool_results: false,
-        };
-        let stats = prune_history(&mut messages, &config);
-        assert_eq!(messages.len(), 3);
-        assert_eq!(stats.collapsed_pairs, 0);
-        assert_eq!(stats.dropped_messages, 0);
-    }
-
-    #[test]
-    fn prune_collapses_tool_pairs() {
-        let tool_result = "a".repeat(160);
-        let mut messages = vec![
-            msg("system", "sys"),
-            msg("assistant", "calling tool X"),
-            msg("tool", &tool_result),
-            msg("user", "thanks"),
-            msg("assistant", "done"),
-        ];
-        let config = HistoryPrunerConfig {
-            enabled: true,
-            max_tokens: 100_000,
-            keep_recent: 2,
-            collapse_tool_results: true,
-        };
-        let stats = prune_history(&mut messages, &config);
-        assert_eq!(stats.collapsed_pairs, 1);
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[1].role, "assistant");
-        assert!(messages[1].content.contains("1 tool call(s)"));
-    }
-
-    #[test]
-    fn prune_preserves_system_and_recent() {
-        let big = "x".repeat(40_000);
-        let mut messages = vec![
-            msg("system", "system prompt"),
-            msg("user", &big),
-            msg("assistant", "old reply"),
-            msg("user", "recent1"),
-            msg("assistant", "recent2"),
-        ];
-        let config = HistoryPrunerConfig {
-            enabled: true,
-            max_tokens: 100,
-            keep_recent: 2,
-            collapse_tool_results: false,
-        };
-        let stats = prune_history(&mut messages, &config);
-        assert!(messages.iter().any(|m| m.role == "system"));
-        assert!(messages.iter().any(|m| m.content == "recent1"));
-        assert!(messages.iter().any(|m| m.content == "recent2"));
-        assert!(stats.dropped_messages > 0);
-    }
-
-    #[test]
-    fn prune_drops_oldest_when_over_budget() {
-        let filler = "y".repeat(400);
-        let mut messages = vec![
-            msg("system", "sys"),
-            msg("user", &filler),
-            msg("assistant", &filler),
-            msg("user", "recent-user"),
-            msg("assistant", "recent-assistant"),
-        ];
-        let config = HistoryPrunerConfig {
-            enabled: true,
-            max_tokens: 150,
-            keep_recent: 2,
-            collapse_tool_results: false,
-        };
-        let stats = prune_history(&mut messages, &config);
-        assert!(stats.dropped_messages >= 1);
-        assert_eq!(messages[0].role, "system");
-        assert!(messages.iter().any(|m| m.content == "recent-user"));
-        assert!(messages.iter().any(|m| m.content == "recent-assistant"));
-    }
-
-    #[test]
-    fn prune_empty_messages() {
-        let mut messages: Vec<ChatMessage> = vec![];
-        let config = HistoryPrunerConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        let stats = prune_history(&mut messages, &config);
-        assert_eq!(stats.messages_before, 0);
-        assert_eq!(stats.messages_after, 0);
-    }
-
-    #[test]
-    fn prune_collapses_multi_tool_group() {
-        let mut messages = vec![
-            msg("system", "sys"),
-            msg(
-                "assistant",
-                r#"{"content":null,"tool_calls":[{"id":"t1","name":"shell","arguments":"{}"},{"id":"t2","name":"web","arguments":"{}"}]}"#,
-            ),
-            msg("tool", r#"{"tool_call_id":"t1","content":"result1"}"#),
-            msg("tool", r#"{"tool_call_id":"t2","content":"result2"}"#),
-            msg("user", "thanks"),
-            msg("assistant", "done"),
-        ];
-        let config = HistoryPrunerConfig {
-            enabled: true,
-            max_tokens: 100_000,
-            keep_recent: 2,
-            collapse_tool_results: true,
-        };
-        let stats = prune_history(&mut messages, &config);
-        assert_eq!(stats.collapsed_pairs, 2);
-        // assistant(tool_calls) + 2 tool messages → 1 summary assistant
-        assert_eq!(messages.len(), 4); // sys, summary, user, assistant
-        assert!(messages[1].content.contains("2 tool call(s)"));
-        // No tool messages remain
-        assert!(!messages.iter().any(|m| m.role == "tool"));
-    }
-
-    #[test]
-    fn prune_drops_tool_group_atomically() {
-        let big = "x".repeat(2000);
-        let mut messages = vec![
-            msg("system", "sys"),
-            msg("assistant", &big),
-            msg("tool", &big),
-            msg("tool", &big),
-            msg("user", "recent"),
-            msg("assistant", "recent reply"),
-        ];
-        let config = HistoryPrunerConfig {
-            enabled: true,
-            max_tokens: 50, // very low — forces drops
-            keep_recent: 2,
-            collapse_tool_results: false, // skip collapse, go straight to drop
-        };
-        let stats = prune_history(&mut messages, &config);
-        assert!(stats.dropped_messages >= 3); // assistant + 2 tools dropped together
-        // No orphaned tool messages
-        for (i, m) in messages.iter().enumerate() {
-            if m.role == "tool" {
-                assert!(
-                    i > 0 && messages[i - 1].role == "assistant",
-                    "tool message at index {i} has no preceding assistant"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn prune_never_orphans_tool_use() {
-        // Simulate a conversation with multiple tool groups
-        let filler = "y".repeat(500);
-        let mut messages = vec![
-            msg("system", "sys"),
-            msg("user", "q1"),
-            msg("assistant", &filler), // tool group 1
-            msg("tool", &filler),
-            msg("user", "q2"),
-            msg("assistant", &filler), // tool group 2
-            msg("tool", &filler),
-            msg("tool", &filler),
-            msg("user", "recent"),
-            msg("assistant", "recent reply"),
-        ];
-        let config = HistoryPrunerConfig {
-            enabled: true,
-            max_tokens: 100,
-            keep_recent: 2,
-            collapse_tool_results: true,
-        };
-        prune_history(&mut messages, &config);
-        // Verify invariant: no tool message without a preceding assistant
-        for (i, m) in messages.iter().enumerate() {
-            if m.role == "tool" {
-                assert!(
-                    i > 0 && messages[i - 1].role == "assistant",
-                    "orphaned tool message at index {i}: {:?}",
-                    messages.iter().map(|m| &m.role).collect::<Vec<_>>()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn prune_protects_recent_tool_groups() {
-        let mut messages = vec![
-            msg("system", "sys"),
-            msg("user", "old"),
-            msg("assistant", "old reply"),
-            msg("user", "do something"),
-            msg(
-                "assistant",
-                r#"{"content":"checking","tool_calls":[{"id":"toolu_recent","name":"shell","arguments":"{}"}]}"#,
-            ),
-            msg(
-                "tool",
-                r#"{"tool_call_id":"toolu_recent","content":"tool result"}"#,
-            ),
-            msg("user", "recent"),
-        ];
-        let config = HistoryPrunerConfig {
-            enabled: true,
-            max_tokens: 100_000,
-            keep_recent: 3, // protects last 3: tool call, tool result, recent
-            collapse_tool_results: true,
-        };
-        let stats = prune_history(&mut messages, &config);
-        // Protected tool group should not be collapsed
-        assert!(messages.iter().any(|m| m.role == "tool"));
-        assert_eq!(stats.collapsed_pairs, 0);
-    }
-
-    #[test]
-    fn prune_under_realistic_token_pressure_preserves_tool_pairing() {
-        // Simulate 15 tool iterations with realistic content sizes
-        let mut messages = vec![msg("system", "You are helpful.")];
-        messages.push(msg("user", "Research this topic thoroughly"));
-
-        // 15 tool iterations — each adds assistant(tool_calls) + tool(result)
-        for i in 0..15 {
-            let tool_json = format!(
-                r#"{{"content":"iteration {i}","tool_calls":[{{"id":"t{i}","name":"web_search","arguments":"{{}}"}}]}}"#
-            );
-            messages.push(msg("assistant", &tool_json));
-            // Realistic tool result size (~2K chars each)
-            let result = format!(
-                r#"{{"tool_call_id":"t{i}","content":"{}"}}"#,
-                "x".repeat(2000)
-            );
-            messages.push(msg("tool", &result));
-        }
-        messages.push(msg("assistant", "Here's what I found..."));
-
-        // 33 messages total: system + user + 15*(assistant+tool) + final assistant
-        assert_eq!(messages.len(), 33);
-
-        let config = HistoryPrunerConfig {
-            enabled: true,
-            max_tokens: 2000, // Forces pruning of older iterations
-            keep_recent: 4,
-            collapse_tool_results: true,
-        };
-
-        prune_history(&mut messages, &config);
-
-        // Invariant: no orphaned tool messages after pruning
-        for (i, m) in messages.iter().enumerate() {
-            if m.role == "tool" {
-                assert!(
-                    i > 0 && messages[i - 1].role == "assistant",
-                    "orphaned tool at index {i}: roles = {:?}",
-                    messages.iter().map(|m| &m.role).collect::<Vec<_>>()
-                );
-            }
         }
     }
 
@@ -619,8 +206,8 @@ mod tests {
             msg("user", "thanks"),
             msg("assistant", "done"),
         ];
-        let removed = remove_orphaned_tool_messages(&mut messages);
-        assert_eq!(removed, 2);
+        let pruned = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(pruned.removed, 2);
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].role, "user");
@@ -639,8 +226,8 @@ mod tests {
             msg("tool", tool_result),
             msg("assistant", "done"),
         ];
-        let removed = remove_orphaned_tool_messages(&mut messages);
-        assert_eq!(removed, 0);
+        let pruned = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(pruned.removed, 0);
         assert_eq!(messages.len(), 5);
     }
 
@@ -657,8 +244,8 @@ mod tests {
             msg("tool", r#"{"content":"r3","tool_call_id":"toolu_ccc"}"#),
             msg("assistant", "all done"),
         ];
-        let removed = remove_orphaned_tool_messages(&mut messages);
-        assert_eq!(removed, 0);
+        let pruned = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(pruned.removed, 0);
         assert_eq!(messages.len(), 7);
     }
 
@@ -674,8 +261,8 @@ mod tests {
             msg("tool", r#"{"content":"stale","tool_call_id":"toolu_GONE"}"#),
             msg("assistant", "done"),
         ];
-        let removed = remove_orphaned_tool_messages(&mut messages);
-        assert_eq!(removed, 1);
+        let pruned = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(pruned.removed, 1);
         assert_eq!(messages.len(), 5);
         // The valid tool result stays, the orphan is gone.
         assert_eq!(messages[3].role, "tool");
@@ -696,43 +283,68 @@ mod tests {
             msg("user", "next"),
             msg("assistant", "ok"),
         ];
-        let removed = remove_orphaned_tool_messages(&mut messages);
-        assert_eq!(removed, 1);
+        let pruned = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(pruned.removed, 1);
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[2].role, "user");
     }
 
     #[test]
-    fn consecutive_assistant_with_tool_calls_stripped() {
-        // When poisoned turn removal leaves an assistant(text) followed by
-        // assistant(tool_calls), the second assistant and its tool_results
-        // must be removed — normalization would merge them, destroying the
-        // structured tool_use blocks and orphaning the results at the API.
-        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_DEAD","name":"shell","arguments":"{}"}]}"#;
+    fn preamble_then_tool_calls_is_kept_intact() {
+        // Healthy shape: `[A: "let me check"] [A: tool_calls] [T: result]`.
+        // The assistant first emits a brief preamble, then dispatches the
+        // tool, then the tool returns. This is the normal flow of a real
+        // tool-using turn — Pass 1 must NOT touch it.
+        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_LIVE","name":"shell","arguments":"{}"}]}"#;
         let mut messages = vec![
             msg("system", "sys"),
             msg("user", "do something"),
-            msg("assistant", "Here are the results."),
+            msg("assistant", "Let me check."),
             msg("assistant", tool_calls_assistant),
-            msg("tool", r#"{"content":"ok","tool_call_id":"toolu_DEAD"}"#),
-            msg("assistant", "The provider returned an empty response."),
+            msg("tool", r#"{"content":"ok","tool_call_id":"toolu_LIVE"}"#),
+            msg("assistant", "Here are the results."),
         ];
-        let removed = remove_orphaned_tool_messages(&mut messages);
+        let before = messages.len();
+        let pruned = remove_orphaned_tool_messages(&mut messages);
         assert_eq!(
-            removed, 2,
-            "should remove assistant(tool_calls) + tool_result"
+            pruned.removed, 0,
+            "preamble + dispatch + result is a healthy turn, not orphan poisoning"
         );
+        assert_eq!(messages.len(), before);
+    }
+
+    #[test]
+    fn back_to_back_unresolved_tool_calls_strips_later_dispatch() {
+        // Genuinely poisoned shape: `[A: tool_calls A]` followed
+        // immediately by `[A: tool_calls B]` with no tool result for A
+        // sitting between them. The earlier dispatch is unresolved, so
+        // the later assistant + its results are removed to restore a
+        // well-formed turn.
+        let first_dispatch = r#"{"content":null,"tool_calls":[{"id":"toolu_LOST","name":"shell","arguments":"{}"}]}"#;
+        let second_dispatch = r#"{"content":null,"tool_calls":[{"id":"toolu_DEAD","name":"shell","arguments":"{}"}]}"#;
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("user", "do something"),
+            msg("assistant", first_dispatch),
+            msg("assistant", second_dispatch),
+            msg("tool", r#"{"content":"ok","tool_call_id":"toolu_DEAD"}"#),
+            msg("assistant", "summary"),
+        ];
+        let pruned = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(
+            pruned.removed, 2,
+            "second dispatch + its tool_result must be removed when prior dispatch is unresolved"
+        );
+        // What survives: sys, user, first_dispatch (now orphaned), summary.
+        // Pass 2 then sweeps any remaining orphan tool messages — there
+        // are none after Pass 1, but the orphaned first_dispatch itself
+        // (assistant with tool_calls and no responses) stays, because
+        // this function only removes *tool*-role orphans in Pass 2,
+        // not stranded assistant dispatches.
         assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[1].role, "user");
-        assert_eq!(messages[2].role, "assistant");
-        assert_eq!(messages[2].content, "Here are the results.");
-        assert_eq!(messages[3].role, "assistant");
-        assert_eq!(
-            messages[3].content,
-            "The provider returned an empty response."
-        );
+        assert_eq!(messages[2].content, first_dispatch);
+        assert_eq!(messages[3].content, "summary");
     }
 
     #[test]
@@ -747,68 +359,9 @@ mod tests {
             msg("tool", "plain text result without json"),
             msg("assistant", "done"),
         ];
-        let removed = remove_orphaned_tool_messages(&mut messages);
-        assert_eq!(removed, 0);
+        let pruned = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(pruned.removed, 0);
         assert_eq!(messages.len(), 5);
-    }
-
-    #[test]
-    fn phase2_budget_respects_protected_tool_messages() {
-        // Phase 2 should not drop tool messages that fall within the
-        // keep_recent protection window, even when the assistant that
-        // starts the group is outside the window.
-        let tool_content = r#"{"tool_call_id":"toolu_recent","content":"result"}"#;
-        let assistant_tool = r#"{"content":"calling","tool_calls":[{"id":"toolu_recent","name":"shell","arguments":"{}"}]}"#;
-        let mut messages = vec![
-            msg("system", "sys"),
-            msg("user", "old question"),
-            msg(
-                "assistant",
-                "old answer with lots of padding text to inflate token count significantly beyond budget",
-            ),
-            msg("user", "another old question"),
-            msg("assistant", assistant_tool),  // outside keep_recent
-            msg("tool", tool_content),         // inside keep_recent (3rd from end)
-            msg("user", "recent question"),    // inside keep_recent (2nd from end)
-            msg("assistant", "recent answer"), // inside keep_recent (1st from end)
-        ];
-        // Budget tight enough that Phase 2 fires, keep_recent=3 protects last 3
-        let config = HistoryPrunerConfig {
-            enabled: true,
-            max_tokens: 50,
-            keep_recent: 3,
-            collapse_tool_results: true,
-        };
-        prune_history(&mut messages, &config);
-        // The protected tool message must survive
-        assert!(
-            messages.iter().any(|m| m.content.contains("toolu_recent")),
-            "Protected tool message was dropped by Phase 2 budget enforcement"
-        );
-    }
-
-    /// Regression test for issue #5743: MiniMax rejects orphaned tool-role
-    /// messages whose assistant (with `tool_calls`) was trimmed by the
-    /// channel orchestrator's proactive history trimming.
-    #[test]
-    fn orphan_tool_from_trimmed_channel_history() {
-        // Simulates the scenario: channel history was trimmed and the
-        // assistant message containing tool_calls was dropped, leaving
-        // orphaned tool results with MiniMax-style IDs.
-        let tool_result =
-            r#"{"content":"search results","tool_call_id":"chatcmpl-tool-92a12a15c14f3b36"}"#;
-        let mut messages = vec![
-            msg("system", "You are a helpful assistant"),
-            msg("tool", tool_result),
-            msg("assistant", "Here are the search results"),
-            msg("user", "Thanks, now summarize them"),
-        ];
-        let removed = remove_orphaned_tool_messages(&mut messages);
-        assert_eq!(removed, 1, "orphaned tool message should be removed");
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[1].role, "assistant");
-        assert_eq!(messages[2].role, "user");
     }
 
     /// Regression test for issue #5813: a compaction summary preserves
@@ -831,66 +384,35 @@ mod tests {
             ),
             msg("user", "new question"),
         ];
-        let removed = remove_orphaned_tool_messages(&mut messages);
+        let pruned = remove_orphaned_tool_messages(&mut messages);
         assert_eq!(
-            removed, 1,
+            pruned.removed, 1,
             "orphan must be removed even if its id is mentioned in summary text"
         );
         assert!(!messages.iter().any(|m| m.role == "tool"));
     }
 
-    /// Regression for #5823:
-    ///
-    /// When `keep_recent` protects the *tail* of a multi-tool group but not
-    /// the preceding assistant, Phase 1 used to collapse the unprotected
-    /// tools and rewrite the assistant to a summary that no longer contained
-    /// `"tool_calls"`. Phase 3's orphan sweep then classified the still-live
-    /// protected tool as an orphan (because the new summary does not contain
-    /// `"tool_calls"`) and removed it — silently violating `keep_recent`.
-    ///
-    /// After the fix Phase 1 treats the group as atomic: if any tool in it
-    /// is protected, the entire group is left intact.
+    /// Regression test for issue #5743: MiniMax rejects orphaned tool-role
+    /// messages whose assistant (with `tool_calls`) was trimmed by the
+    /// channel orchestrator's proactive history trimming.
     #[test]
-    fn prune_does_not_evict_protected_tool_when_group_straddles_keep_recent() {
+    fn orphan_tool_from_trimmed_channel_history() {
+        // Simulates the scenario: channel history was trimmed and the
+        // assistant message containing tool_calls was dropped, leaving
+        // orphaned tool results with MiniMax-style IDs.
+        let tool_result =
+            r#"{"content":"search results","tool_call_id":"chatcmpl-tool-92a12a15c14f3b36"}"#;
         let mut messages = vec![
-            msg("system", "sys"),
-            msg("user", "query"),
-            msg(
-                "assistant",
-                r#"{"content":null,"tool_calls":[
-                    {"id":"t1","name":"shell","arguments":"{}"},
-                    {"id":"t2","name":"web","arguments":"{}"}
-                ]}"#,
-            ),
-            msg("tool", r#"{"tool_call_id":"t1","content":"first"}"#),
-            msg(
-                "tool",
-                r#"{"tool_call_id":"t2","content":"PROTECTED second"}"#,
-            ),
-            msg("user", "follow up"),
-            msg("assistant", "final"),
+            msg("system", "You are a helpful assistant"),
+            msg("tool", tool_result),
+            msg("assistant", "Here are the search results"),
+            msg("user", "Thanks, now summarize them"),
         ];
-
-        let config = HistoryPrunerConfig {
-            enabled: true,
-            // Budget is well above the estimated token cost so Phase 2 does
-            // not drop anything; this test isolates the Phase 1 / Phase 3
-            // interaction.
-            max_tokens: 100_000,
-            keep_recent: 3,
-            collapse_tool_results: true,
-        };
-
-        let stats = prune_history(&mut messages, &config);
-
-        assert_eq!(stats.messages_before, 7);
-        assert!(
-            messages
-                .iter()
-                .any(|m| m.content.contains("PROTECTED second")),
-            "a tool message protected by keep_recent must survive; \
-             got roles {:?}",
-            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
-        );
+        let pruned = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(pruned.removed, 1, "orphaned tool message should be removed");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[2].role, "user");
     }
 }

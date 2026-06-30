@@ -7,7 +7,8 @@ mod memory_loop_continuity;
 mod memory_restart;
 mod report_template_tool_test;
 
-// Channel-specific integration tests — require agent-runtime (full channels)
+// Channel-/email-specific integration tests — require the full channel surface
+// (agent-runtime). Excluded from the minimal `agent-core` build.
 #[cfg(feature = "agent-runtime")]
 mod channel_matrix;
 #[cfg(feature = "agent-runtime")]
