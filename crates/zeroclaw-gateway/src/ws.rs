@@ -226,12 +226,19 @@ pub async fn handle_ws_chat(
             .into_response();
     };
     {
+        // Accept the upgrade when the alias is either explicitly configured
+        // OR can be instantiated on-demand from the gateway template agent
+        // (`[gateway].template_agent`). Without a usable template, unknown
+        // aliases are rejected (historical behavior). The actual derivation
+        // happens in `handle_socket` against the per-connection config copy.
         let cfg = state.config.read();
-        if cfg.agent(&agent_alias).is_none() {
+        if cfg.agent(&agent_alias).is_none()
+            && cfg.derive_template_agent_config(&agent_alias).is_none()
+        {
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 format!(
-                    "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured."
+                    "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured and no [gateway].template_agent to instantiate from."
                 ),
             )
                 .into_response();
@@ -303,7 +310,31 @@ async fn handle_socket(
     // Hydrate session metadata from persistence (if available). Agent
     // construction is deferred until after the optional `connect` frame so the
     // client can provide a per-session cwd for the security sandbox root.
-    let config = state.config.read().clone();
+    //
+    // On-demand template instantiation: when the requested alias has no
+    // explicit `[agents.<alias>]` entry but a `[gateway].template_agent` is
+    // configured, synthesize an ephemeral agent config by cloning the template
+    // and re-keying it under the requested alias in THIS per-connection copy of
+    // the config. Memory then scopes (isolates) per requested alias via
+    // `Memory::ensure_agent_uuid`, while behavior mirrors the template. The
+    // shared global `Config` is never mutated. Explicit config always wins.
+    let mut config = state.config.read().clone();
+    if config.agent(&agent_alias).is_none()
+        && let Some(derived) = config.derive_template_agent_config(&agent_alias)
+    {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "agent": &agent_alias,
+                    "template": config.gateway.template_agent.as_deref(),
+                })
+            ),
+            "WS instantiating on-demand agent from template; memory isolated per requested alias"
+        );
+        config.agents.insert(agent_alias.clone(), derived);
+    }
+    let config = config;
     let ws_memory = match resolve_ws_memory_handle(&config, &agent_alias).await {
         Ok(memory) => memory,
         Err(e) => {
@@ -437,8 +468,10 @@ async fn handle_socket(
     // across turns. The session cwd becomes the security sandbox root; config
     // workspace remains the daemon data directory. Routes through the
     // backchannel constructor so this WS session shares its tool-approval
-    // path with the operator-driven dashboard. The agent_alias was
-    // validated up-front in handle_ws_chat against the configured agents.
+    // path with the operator-driven dashboard. The agent_alias was validated
+    // up-front in handle_ws_chat (explicit config or template-derivable), and
+    // the per-connection `config` above carries the template-derived entry for
+    // on-demand aliases.
     let mut agent =
         match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd_and_mcp_backchannel(
             &config,
@@ -1771,6 +1804,44 @@ mod tests {
             "zeroclaw.v1, bearer.zc_tok, other".parse().unwrap(),
         );
         assert_eq!(extract_ws_token(&headers, None), Some("zc_tok"));
+    }
+
+    #[test]
+    fn ws_agent_gate_accept_reject_and_template_instantiation() {
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let mut cfg = Config::default();
+        cfg.agents
+            .insert("cx".to_string(), AliasedAgentConfig::default());
+
+        // Explicit alias → accepted as-is (config wins, no derivation).
+        assert!(cfg.agent("cx").is_some());
+        assert!(
+            cfg.derive_template_agent_config("cx").is_none(),
+            "explicit alias must never derive from the template"
+        );
+
+        // Unknown alias, NO template → the upgrade gate rejects: both the
+        // explicit lookup and the template derivation are empty.
+        assert!(cfg.agent("tenant-1").is_none());
+        assert!(cfg.derive_template_agent_config("tenant-1").is_none());
+
+        // Configure the template → unknown alias is now instantiated
+        // on-demand and (per handle_socket) injected under the REQUESTED
+        // alias in the per-connection config copy, isolating memory/workspace.
+        cfg.gateway.template_agent = Some("cx".to_string());
+        let derived = cfg
+            .derive_template_agent_config("tenant-1")
+            .expect("unknown alias must instantiate from template");
+        let mut scoped = cfg.clone();
+        scoped.agents.insert("tenant-1".to_string(), derived);
+        assert!(scoped.agent("tenant-1").is_some());
+        assert!(
+            scoped
+                .agent_workspace_dir("tenant-1")
+                .ends_with("agents/tenant-1/workspace"),
+            "on-demand agent memory/workspace must scope to its own alias"
+        );
     }
 
     #[test]

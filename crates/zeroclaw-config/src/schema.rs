@@ -4137,6 +4137,50 @@ impl Config {
         self.agents.get(agent_alias)
     }
 
+    /// Synthesize an ephemeral per-connection agent config for an otherwise
+    /// unconfigured `requested_alias` by cloning the configured gateway
+    /// template agent (`[gateway].template_agent`).
+    ///
+    /// Returns `None` when:
+    /// - `requested_alias` already has an explicit `[agents.<alias>]` entry
+    ///   (explicit config always wins over the template), OR
+    /// - no `template_agent` is configured (or it is blank — the historical
+    ///   reject-unknown-alias behavior), OR
+    /// - the referenced template alias is not itself a configured agent.
+    ///
+    /// On `Some`, behavior (skills/SOUL/model/memory backend) mirrors the
+    /// template, but `workspace.path` is cleared so the derived agent's
+    /// filesystem + markdown memory resolve to
+    /// `<install>/agents/<requested_alias>/workspace/`, keeping memory
+    /// isolated per requested alias. SQL/Qdrant backends already isolate via
+    /// the per-alias `agent_id` (see `Memory::ensure_agent_uuid`), so the
+    /// same derived config yields an isolated memory scope for every backend
+    /// kind. The caller is expected to insert the result under
+    /// `requested_alias` in a per-connection copy of the `Config`; the shared
+    /// global `Config` is never mutated.
+    #[must_use]
+    pub fn derive_template_agent_config(
+        &self,
+        requested_alias: &str,
+    ) -> Option<AliasedAgentConfig> {
+        if self.agents.contains_key(requested_alias) {
+            return None;
+        }
+        let template_alias = self
+            .gateway
+            .template_agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let mut derived = self.agents.get(template_alias)?.clone();
+        // Re-root the derived agent's workspace so filesystem + markdown
+        // memory resolve under the REQUESTED alias, not the template's. SQL
+        // backends isolate via the per-alias agent_id regardless; clearing
+        // this guarantees isolation for every backend kind.
+        derived.workspace.path = None;
+        Some(derived)
+    }
+
     /// Resolve the runtime-active agent alias the orchestrator binds
     /// channels to. Mirrors the same selection logic as
     /// `start_channels()` in zeroclaw-channels: prefer the migration-
@@ -6386,6 +6430,19 @@ pub struct GatewayConfig {
     /// Default: 600s (10 minutes).
     #[serde(default = "default_gateway_long_running_request_timeout_secs")]
     pub long_running_request_timeout_secs: u64,
+
+    /// Alias of an existing `[agents.<alias>]` entry to use as the on-demand
+    /// template for unconfigured WebSocket agents. When set, a WS connection
+    /// requesting an agent alias that has no explicit `[agents.<alias>]`
+    /// entry is instantiated on-demand by cloning this template agent
+    /// (skills/SOUL/model/memory backend), re-keyed to the requested alias so
+    /// memory scopes (isolates) per requested alias. Enables zero-config
+    /// multi-tenant: one alias per tenant, no per-tenant config or redeploy.
+    /// `None` (default) preserves the historical behavior: unknown aliases
+    /// are rejected. Explicit `[agents.<alias>]` config always wins over the
+    /// template.
+    #[serde(default)]
+    pub template_agent: Option<String>,
 }
 
 fn default_gateway_port() -> u16 {
@@ -6463,6 +6520,7 @@ impl Default for GatewayConfig {
             tls: None,
             request_timeout_secs: default_gateway_request_timeout_secs(),
             long_running_request_timeout_secs: default_gateway_long_running_request_timeout_secs(),
+            template_agent: None,
         }
     }
 }
@@ -23848,10 +23906,12 @@ allowed_numbers = ["+1", "+2"]
             tls: None,
             request_timeout_secs: 30,
             long_running_request_timeout_secs: 600,
+            template_agent: Some("cx".into()),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.require_pairing);
+        assert_eq!(parsed.template_agent.as_deref(), Some("cx"));
         assert!(parsed.session_persistence);
         assert_eq!(parsed.session_ttl_hours, 0);
         assert!(!parsed.allow_public_bind);
@@ -31208,5 +31268,94 @@ model_provider = \"ollama.default\"
         let from_empty: BuiltinHooksConfig = toml::from_str("").unwrap();
         let default = BuiltinHooksConfig::default();
         assert_eq!(from_empty.command_logger, default.command_logger);
+    }
+
+    /// Build the multi-agent fixture and designate `alpha` as the gateway
+    /// template, marking it with a distinctive skill bundle + explicit
+    /// workspace path so derivation can be asserted against the template.
+    fn template_test_config() -> Config {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.skill_bundles = vec!["cx-soul".to_string()];
+        alpha.workspace.path = Some(std::path::PathBuf::from("/srv/template/workspace"));
+        config.gateway.template_agent = Some("alpha".to_string());
+        config
+    }
+
+    #[test]
+    async fn derive_template_agent_instantiates_unknown_alias_scoped_to_alias() {
+        let config = template_test_config();
+
+        // Unknown alias `tenant-42` with a template configured → derive.
+        let derived = config
+            .derive_template_agent_config("tenant-42")
+            .expect("unknown alias must derive from the configured template");
+
+        // Behavior (skills/SOUL/model) mirrors the template…
+        assert_eq!(derived.skill_bundles, vec!["cx-soul".to_string()]);
+        assert_eq!(derived.model_provider.as_str(), "anthropic.default");
+
+        // …but the workspace path is re-rooted (cleared) so filesystem +
+        // markdown memory isolate under the REQUESTED alias, not the
+        // template's shared path.
+        assert!(
+            derived.workspace.path.is_none(),
+            "derived workspace.path must be cleared for per-alias isolation"
+        );
+
+        // Inserting under the requested alias yields an isolated memory
+        // scope: agent_workspace_dir resolves to the requested alias dir.
+        let mut scoped = config.clone();
+        scoped.agents.insert("tenant-42".to_string(), derived);
+        let ws = scoped.agent_workspace_dir("tenant-42");
+        assert!(
+            ws.ends_with("agents/tenant-42/workspace"),
+            "memory/workspace must scope to requested alias, got: {}",
+            ws.display()
+        );
+        // The template's own workspace is untouched.
+        assert_eq!(
+            scoped.agent_workspace_dir("alpha"),
+            std::path::PathBuf::from("/srv/template/workspace")
+        );
+    }
+
+    #[test]
+    async fn derive_template_agent_rejects_unknown_alias_without_template() {
+        let mut config = multi_agent_test_config();
+        config.gateway.template_agent = None;
+        assert!(
+            config.derive_template_agent_config("tenant-42").is_none(),
+            "without a template, unknown aliases must NOT derive (reject)"
+        );
+
+        // Blank template is treated as unset.
+        config.gateway.template_agent = Some("   ".to_string());
+        assert!(
+            config.derive_template_agent_config("tenant-42").is_none(),
+            "blank template_agent must be treated as unset"
+        );
+    }
+
+    #[test]
+    async fn derive_template_agent_explicit_alias_wins_over_template() {
+        let config = template_test_config();
+        // `alpha` is an explicit agent → derivation returns None; the caller
+        // must use the explicit `[agents.alpha]` config, not the template.
+        assert!(
+            config.derive_template_agent_config("alpha").is_none(),
+            "explicit config must win over the template"
+        );
+        assert!(config.agent("alpha").is_some());
+    }
+
+    #[test]
+    async fn derive_template_agent_none_when_template_alias_missing() {
+        let mut config = multi_agent_test_config();
+        config.gateway.template_agent = Some("ghost".to_string());
+        assert!(
+            config.derive_template_agent_config("tenant-42").is_none(),
+            "a template pointing at a non-existent agent must not derive"
+        );
     }
 }
