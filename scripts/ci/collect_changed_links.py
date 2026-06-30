@@ -89,8 +89,15 @@ def normalize_link_target(raw_target: str, source_path: str) -> str | None:
     if not path_without_fragment:
         return None
 
+    # Drop false positives from code snippets that look like inline links to the
+    # regex (e.g. PowerShell `[Environment]::SetEnvironmentVariable('Path', ...)`):
+    # real local doc-link targets are filesystem paths and never contain quotes,
+    # parentheses, or commas.
+    if any(ch in path_without_fragment for ch in "'\"(),"):
+        return None
+
     # Keep this changed-line gate aligned with the built-book link checker:
-    # site-absolute links and generated rustdoc API paths are assembled outside
+    # site-absolute links and generated reference/API paths are assembled outside
     # authored Markdown, so this script should not fail CI before mdBook builds.
     if (
         path_without_fragment.startswith("/")
@@ -104,6 +111,12 @@ def normalize_link_target(raw_target: str, source_path: str) -> str | None:
     )
 
     if not resolved or resolved == ".":
+        return None
+
+    # Generated reference pages (mdBook `refs`) are produced at build time and not
+    # committed, like the rustdoc `api/` tree above; don't fail the changed-line
+    # gate on links to them before mdBook builds.
+    if resolved.endswith(("reference/cli.md", "reference/config.md")):
         return None
 
     return resolved

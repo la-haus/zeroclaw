@@ -62,7 +62,7 @@ zeroclaw quickstart --model-provider openrouter --model openrouter/auto \
 - `--api-key <key>` — API key (omit for local providers like ollama)
 - `--agent <alias>` — agent alias (defaults to a sanitized provider name)
 
-Creates `~/.zeroclaw/config.toml` with `0600` permissions. Quickstart is idempotent — re-running it on a configured install leaves the existing config alone. To change one field afterward, use `zeroclaw config set <key>=<value>`; to reconfigure channels, use `zeroclaw config set channels.<name>.<field>=<value>` (per-channel guides live under [Channels → Overview](../../docs/book/src/channels/overview.md)).
+Creates `~/.zeroclaw/config.toml` with `0600` permissions. Quickstart is idempotent — re-running it on a configured install leaves the existing config alone. To change one field afterward, use `zeroclaw config set <key>=<value>`; to reconfigure channels, use `zeroclaw config set channels.<name>.<field>=<value>` (per-channel guides live under [Channels → Overview](../../../../docs/book/src/channels/overview.md)).
 
 ---
 
