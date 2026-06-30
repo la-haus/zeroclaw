@@ -299,6 +299,21 @@ agent-runtime = [
     "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
 ]
 
+# Minimal API-only agent build — agent loop, tools, gateway, persistence and the
+# crypto/net core, WITHOUT the TUI (`ratatui`/`crossterm`). Channels and email
+# remain opt-in via `default-channels`/`channels-full`/`channel-*` exactly as for
+# `agent-runtime`. Built for lightweight Docker images of the CX agents that only
+# need WebSocket/REST (gateway), e.g.:
+#   cargo build --no-default-features --features "agent-core,observability-otel"
+agent-core = [
+    "dep:zeroclaw-runtime", "dep:zeroclaw-eval", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
+    "dep:rusqlite",
+    "dep:ring", "dep:lru", "dep:chrono-tz", "dep:cron", "dep:glob", "dep:which",
+    "dep:tokio-tungstenite", "dep:tokio-socks", "dep:hostname",
+    "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
+    "gateway",
+]
+
 # Lean channel bundle included in `default`. These channels cover local/editor
 # ACP, gateway/webhook ingress, and common first-run external chat/email paths.
 default-channels = [

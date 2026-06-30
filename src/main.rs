@@ -50,11 +50,11 @@ use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 /// feature the runtime crate is absent, so the English `fallback` is used.
 #[allow(unused_variables)]
 fn t(key: &str, fallback: &str) -> String {
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     {
         zeroclaw_runtime::i18n::get_required_cli_string(key)
     }
-    #[cfg(not(feature = "agent-runtime"))]
+    #[cfg(not(any(feature = "agent-runtime", feature = "agent-core")))]
     {
         fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
     }
@@ -63,27 +63,27 @@ fn t(key: &str, fallback: &str) -> String {
 /// `t` with `{$name}` arguments.
 #[allow(unused_variables)]
 fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     {
         zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
     }
-    #[cfg(not(feature = "agent-runtime"))]
+    #[cfg(not(any(feature = "agent-runtime", feature = "agent-core")))]
     {
         fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
     }
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn qta(key: &str, args: &[(&str, &str)]) -> String {
     zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn quickstart_row(key: &str, glyph: &str, summary: &str) -> String {
     qta(key, &[("glyph", glyph), ("summary", summary)])
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn quickstart_step_label(step: zeroclaw_runtime::quickstart::QuickstartStep) -> String {
     t(step.label_key(), step.label())
 }
@@ -182,7 +182,7 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
 }
 
 fn print_no_command_help(cmd: clap::Command) -> Result<()> {
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     {
         println!(
             "{}",
@@ -197,7 +197,7 @@ fn print_no_command_help(cmd: clap::Command) -> Result<()> {
                 .unwrap_or("Try `zeroclaw quickstart` to create your first agent.")
         );
     }
-    #[cfg(not(feature = "agent-runtime"))]
+    #[cfg(not(any(feature = "agent-runtime", feature = "agent-core")))]
     {
         println!("{}", t("cli-no-command", "No command provided."));
         println!(
@@ -229,84 +229,84 @@ fn pause_after_no_command_help() {
     let _ = std::io::stdin().read_line(&mut line);
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod agent;
 mod alias_cli;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod approval;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod auth;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod channels;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod cli_input;
 mod commands;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod rag {
     pub use zeroclaw::rag::*;
 }
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod browse;
 mod config;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod cost;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod cron;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod daemon;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod doctor;
 #[cfg(feature = "gateway")]
 mod gateway;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod hardware;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod health;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod heartbeat;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod hooks;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod i18n;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod identity;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod integrations;
 mod memory;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod migration;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod multimodal;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod observability;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod peripherals;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod platform;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod security;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod security_status;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod service;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod skillforge;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod skills;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod sop;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod tools;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod trust;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod tunnel;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod util;
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 mod verifiable_intent;
 
 use config::Config;
@@ -397,7 +397,7 @@ impl LogLevel {
 }
 
 /// Subcommands for `zeroclaw eval`.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 #[derive(Subcommand, Debug)]
 enum EvalCommands {
     /// Run a suite of evaluation cases.
@@ -645,7 +645,7 @@ Examples:
     },
 
     /// Inspect the active security posture derived from local config and host detection
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     Security {
         #[command(subcommand)]
         security_command: SecurityCommands,
@@ -942,7 +942,7 @@ Examples:
         quick: bool,
     },
 
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     /// Run the agent evaluation harness
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
@@ -1072,7 +1072,7 @@ enum DeprecatedPropsCommands {
     Any(Vec<String>),
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn runtime_dir_env_is_explicit(name: &str, value: &str) -> bool {
     match name {
         "ZEROCLAW_CONFIG_DIR" | "ZEROCLAW_DATA_DIR" => !value.trim().is_empty(),
@@ -1081,7 +1081,7 @@ fn runtime_dir_env_is_explicit(name: &str, value: &str) -> bool {
     }
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn resolve_homebrew_onboard_config_dir(
     exe: &Path,
     env_lookup: impl Fn(&str) -> Option<String>,
@@ -1101,7 +1101,7 @@ fn resolve_homebrew_onboard_config_dir(
     zeroclaw_runtime::service::homebrew_var_dir_from_exe(exe)
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn apply_homebrew_onboard_config_dir_with(
     exe: &Path,
     env_lookup: impl Fn(&str) -> Option<String>,
@@ -1112,7 +1112,7 @@ fn apply_homebrew_onboard_config_dir_with(
     Some(config_dir)
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn apply_homebrew_onboard_config_dir() {
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -1151,7 +1151,7 @@ fn apply_homebrew_onboard_config_dir() {
 /// `--agent`) silently seed the relevant selector's value and mark it
 /// `[✓]` if the seed is enough to satisfy the selector; the user can
 /// still open that selector and overwrite it.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 async fn run_quickstart_cli(
     model_provider: Option<String>,
     model: Option<String>,
@@ -2368,7 +2368,7 @@ async fn run_quickstart_cli(
 /// cancels (Esc on a select / confirm), `Some(value)` otherwise.
 /// Used by both the model-provider field form and the channel field
 /// form so the two sub-flows share a single prompt implementation.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 /// Recognize a `providers.models.<type>.<alias>.model` config path and
 /// return `<type>` if the family is in the canonical model-provider
 /// registry. Used by `config set` to offer a live model picker when
@@ -2417,7 +2417,7 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
     Ok(created)
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn trimmed_agent_name_for_templates(prior_name: Option<&str>) -> String {
     prior_name
         .map(|s| s.trim().to_string())
@@ -2427,7 +2427,7 @@ fn trimmed_agent_name_for_templates(prior_name: Option<&str>) -> String {
         })
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn prompt_for_field(
     desc: &zeroclaw_runtime::quickstart::FieldDescriptor,
     seed: Option<&str>,
@@ -2505,7 +2505,7 @@ fn prompt_for_field(
 /// cancels. Returns `Some(Ok(preset_name))` for a fresh preset
 /// pick or `Some(Err(existing_alias))` for a reuse pick so the
 /// caller can map into the right `SelectorChoice` variant.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn pick_preset(
     prompt: &str,
     presets: Vec<(&'static str, &'static str, &'static str)>,
@@ -2565,7 +2565,7 @@ fn pick_preset(
     Ok(Some(Ok(presets[i].0)))
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn which_zerocode_on_path() -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|p| p.join("zerocode").is_file()))
@@ -2692,7 +2692,7 @@ enum ConfigCommands {
     },
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 #[derive(Subcommand, Debug)]
 enum SecurityCommands {
     /// Show security posture for the default or selected agent risk profile
@@ -2925,15 +2925,15 @@ enum MemoryCommands {
 }
 
 fn apply_i18n_to_command(cmd: clap::Command) -> clap::Command {
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     {
         apply_cmd_translations(cmd, "cli")
     }
-    #[cfg(not(feature = "agent-runtime"))]
+    #[cfg(not(any(feature = "agent-runtime", feature = "agent-core")))]
     cmd
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn apply_cmd_translations(cmd: clap::Command, prefix: &str) -> clap::Command {
     let sub_names: Vec<String> = cmd
         .get_subcommands()
@@ -2965,7 +2965,7 @@ fn apply_cmd_translations(cmd: clap::Command, prefix: &str) -> clap::Command {
 /// fetch can never be coerced to a path/host outside the known set. Also
 /// enforces a strict syntactic allowlist as a belt-and-suspenders guard against
 /// path traversal.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn validated_locale(locale: &str) -> Result<String> {
     let ok_shape = !locale.is_empty()
         && locale.len() <= 16
@@ -2994,7 +2994,7 @@ fn validated_locale(locale: &str) -> Result<String> {
 /// and a strict syntactic allowlist; the destination path is built from
 /// `ftl_locale_dir` and canonicalized to confirm it stays under the data dir,
 /// so neither the locale nor catalog can drive a write outside the FTL store.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
     let locale = validated_locale(locale)?;
 
@@ -3115,7 +3115,7 @@ async fn main() -> Result<()> {
     // Install default crypto model_provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
         eprintln!(
             "{}",
@@ -3127,7 +3127,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     crate::i18n::init(&crate::i18n::detect_locale());
 
     let cmd = apply_i18n_to_command(Cli::command());
@@ -3227,7 +3227,7 @@ async fn main() -> Result<()> {
     // flags (`--api-key`, `--model-provider`, `--quick`, `--<section>-only`,
     // positional section subcommands) error so scripted callers fail
     // loudly rather than silently doing the wrong thing.
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     if let Commands::Onboard {
         section,
         quick,
@@ -3280,9 +3280,9 @@ async fn main() -> Result<()> {
 
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     if config.security.otp.enabled {
         let config_dir = config
             .config_path
@@ -3306,7 +3306,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    #[cfg(not(feature = "agent-runtime"))]
+    #[cfg(not(any(feature = "agent-runtime", feature = "agent-core")))]
     {
         // Kernel-only mode: minimal CLI agent without channels/tools/gateway
         match cli.command {
@@ -3415,7 +3415,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     {
         // Wire cron delivery to the channels orchestrator. Registered before
         // dispatch so that *any* command path that may execute cron jobs —
@@ -3437,7 +3437,7 @@ async fn main() -> Result<()> {
         ));
     }
 
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     match cli.command {
         Commands::Onboard { .. }
         | Commands::Completions { .. }
@@ -3846,7 +3846,7 @@ async fn main() -> Result<()> {
             }
 
             // Wire CLI channel for interactive mode
-            #[cfg(feature = "agent-runtime")]
+            #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
             zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
                 Box::new(zeroclaw_channels::cli::CliChannel::new("cli"))
             }));
@@ -4500,7 +4500,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        #[cfg(feature = "agent-runtime")]
+        #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
         Commands::Security {
             security_command: SecurityCommands::Status { agent, json },
         } => {
@@ -4523,11 +4523,11 @@ async fn main() -> Result<()> {
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
         Commands::Models { model_command } => {
-            #[cfg(feature = "agent-runtime")]
+            #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
             {
                 dispatch_models_command(model_command, &mut config).await
             }
-            #[cfg(not(feature = "agent-runtime"))]
+            #[cfg(not(any(feature = "agent-runtime", feature = "agent-core")))]
             {
                 match model_command {
                     ModelCommands::List {
@@ -5872,7 +5872,7 @@ async fn main() -> Result<()> {
     }
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn handle_estop_command(
     config: &Config,
     estop_command: Option<EstopSubcommands>,
@@ -5953,7 +5953,7 @@ fn handle_estop_command(
     }
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn build_engage_level(
     level: Option<EstopLevelArg>,
     domains: Vec<String>,
@@ -5994,7 +5994,7 @@ fn build_engage_level(
     }
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn build_resume_selector(
     network: bool,
     domains: Vec<String>,
@@ -6017,7 +6017,7 @@ fn build_resume_selector(
     Ok(security::ResumeSelector::KillAll)
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn print_estop_status(state: &security::EstopState) {
     println!("{}", t("cli-estop-status", "Estop status:"));
     println!(
@@ -6175,7 +6175,7 @@ fn log_gateway_start(host: &str, port: u16) {
 }
 
 /// Gracefully shutdown a running gateway via the admin endpoint.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> Result<()> {
     let url = gateway_admin_url(host, port, path_prefix, "/admin/shutdown");
     let client = reqwest::Client::new();
@@ -6220,7 +6220,7 @@ async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> R
 /// Keeps the "add another client" path distinct from the destructive
 /// "rotate after compromise" paths (#6984) without resorting to bare flag
 /// booleans threaded through the fetch helper.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 enum PaircodeAction {
     /// GET the current code; do not mint or revoke anything.
     Show,
@@ -6232,7 +6232,7 @@ enum PaircodeAction {
     RotateDevice(String),
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 impl PaircodeAction {
     /// True when the action mints a new code (POST), false for `Show` (GET).
     fn mints_code(&self) -> bool {
@@ -6258,7 +6258,7 @@ impl PaircodeAction {
 }
 
 /// Outcome of a `get-paircode` request.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 enum PaircodeResult {
     /// A code was returned (with an optional human-readable message).
     Code {
@@ -6275,7 +6275,7 @@ enum PaircodeResult {
 /// `Show` issues a GET; the other actions POST to `/admin/paircode/new`,
 /// optionally carrying a `rotate` query so the gateway revokes the matching
 /// tokens before minting the new code.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 async fn fetch_paircode(
     host: &str,
     port: u16,
@@ -6361,13 +6361,13 @@ async fn fetch_paircode(
     }
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn gateway_admin_url(host: &str, port: u16, path_prefix: Option<&str>, admin_path: &str) -> String {
     let prefix = path_prefix.unwrap_or("");
     format!("http://{host}:{port}{prefix}{admin_path}")
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn paircode_no_code_message(
     host: &str,
     port: u16,
@@ -6455,7 +6455,7 @@ fn paircode_no_code_message(
     indent_paircode_lines(lines)
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn paircode_command(
     host: &str,
     port: u16,
@@ -6477,7 +6477,7 @@ fn paircode_command(
     command
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn indent_paircode_lines(lines: Vec<String>) -> String {
     lines
         .into_iter()
@@ -6497,7 +6497,7 @@ fn indent_paircode_lines(lines: Vec<String>) -> String {
 // to the binary; auth/mod.rs in zeroclaw-providers shouldn't pull it in,
 // so reads live here and trait flows accept the resulting string.
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn read_auth_input(prompt: &str) -> Result<String> {
     let input = Password::new()
         .with_prompt(prompt)
@@ -6506,7 +6506,7 @@ fn read_auth_input(prompt: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn read_plain_input(prompt: &str) -> Result<String> {
     let input: String = cli_input::Input::new()
         .with_prompt(prompt)
@@ -6514,7 +6514,7 @@ fn read_plain_input(prompt: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
     match profile
         .token_set
@@ -6535,7 +6535,7 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
     let auth_service = auth::AuthService::from_config(config);
     let auth_cli_formatter =
@@ -7035,7 +7035,7 @@ fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
 }
 
 /// Persist `model` as the default for the first configured provider.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 async fn handle_models_set(config: &mut Config, model: &str) -> Result<()> {
     crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
     let (type_key, alias) = {
@@ -7073,7 +7073,7 @@ async fn handle_models_set(config: &mut Config, model: &str) -> Result<()> {
 /// same dispatch boundary that `zeroclaw models set <model>` uses.  If
 /// someone changes the `Set` arm back to the read-only doctor path, the
 /// test will fail.
-#[cfg(feature = "agent-runtime")]
+#[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
 async fn dispatch_models_command(model_command: ModelCommands, config: &mut Config) -> Result<()> {
     match model_command {
         ModelCommands::List {
@@ -7120,13 +7120,13 @@ mod tests {
     use std::net::TcpListener;
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn ensure_map_key_materializes_typed_provider_entries() {
         use crate::config::schema::Config;
         for (path, value) in [
@@ -7149,7 +7149,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn ensure_map_key_ignores_non_map_paths() {
         use crate::config::schema::Config;
         let mut config = Config::default();
@@ -7158,7 +7158,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn onboard_help_includes_model_flag() {
         let cmd = Cli::command();
         let onboard = cmd
@@ -7177,7 +7177,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn gateway_admin_url_uses_unprefixed_admin_path_by_default() {
         assert_eq!(
             gateway_admin_url("127.0.0.1", 42617, None, "/admin/paircode"),
@@ -7186,7 +7186,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn gateway_admin_url_prepends_configured_path_prefix() {
         assert_eq!(
             gateway_admin_url("localhost", 42617, Some("/zeroclaw"), "/admin/paircode/new"),
@@ -7195,7 +7195,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn onboard_cli_accepts_model_provider_and_api_key_in_quick_mode() {
         let cli = Cli::try_parse_from([
             "zeroclaw",
@@ -7229,7 +7229,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn completions_cli_parses_supported_shells() {
         for shell in ["bash", "fish", "zsh", "powershell", "elvish"] {
             let cli = Cli::try_parse_from(["zeroclaw", "completions", shell])
@@ -7242,7 +7242,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn completion_generation_mentions_binary_name() {
         let mut output = Vec::new();
         write_shell_completion(CompletionShell::Bash, &mut output)
@@ -7255,7 +7255,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn bash_completion_avoids_infinite_recursion() {
         let mut output = Vec::new();
         write_shell_completion(CompletionShell::Bash, &mut output)
@@ -7275,7 +7275,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn onboard_cli_accepts_force_flag() {
         let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--force"])
             .expect("onboard --force should parse");
@@ -7287,14 +7287,14 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn onboard_cli_rejects_removed_interactive_flag() {
         // --interactive was removed; onboard auto-detects TTY instead.
         assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn onboard_cli_parses_quick_flag() {
         let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--quick"])
             .expect("onboard --quick should parse");
@@ -7306,7 +7306,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn gateway_get_paircode_cli_accepts_port_and_host_overrides() {
         let cli = Cli::try_parse_from([
             "zeroclaw",
@@ -7342,7 +7342,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn security_status_cli_requires_agent_and_parses_json_form() {
         let err = Cli::try_parse_from(["zeroclaw", "security", "status"])
             .expect_err("security status requires --agent");
@@ -7366,7 +7366,7 @@ mod tests {
     /// `--rotate-device` so the destructive path cannot be silently combined
     /// with "add another client".
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn gateway_get_paircode_rotate_flags_parse_and_conflict() {
         let cli = Cli::try_parse_from(["zeroclaw", "gateway", "get-paircode", "--rotate"])
             .expect("gateway get-paircode --rotate should parse");
@@ -7417,7 +7417,7 @@ mod tests {
     /// `path_prefix` through `gateway_admin_url`; this test pins that the URL
     /// we'd actually send still hits `<prefix>/admin/paircode/new`.
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn paircode_url_combines_host_port_override_with_configured_path_prefix() {
         assert_eq!(
             gateway_admin_url(
@@ -7435,7 +7435,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn paircode_no_code_message_explains_bare_command_does_not_mint() {
         let default = config::GatewayConfig::default();
         let msg = paircode_no_code_message(
@@ -7455,7 +7455,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn paircode_no_code_message_preserves_host_port_on_suggestions() {
         let default = config::GatewayConfig::default();
         let msg = paircode_no_code_message(
@@ -7478,7 +7478,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn paircode_no_code_message_omits_configured_default_host_port() {
         let msg = paircode_no_code_message(
             "192.168.1.20",
@@ -7497,7 +7497,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn paircode_no_code_message_for_new_suggests_rotate() {
         let default = config::GatewayConfig::default();
         let msg = paircode_no_code_message(
@@ -7649,7 +7649,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn onboard_cli_quick_and_channels_only_conflict() {
         // --quick and --channels-only should both parse at the CLI level
         // (the conflict is checked at runtime), but we verify both flags parse.
@@ -7661,7 +7661,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn onboard_cli_bare_parses() {
         let cli = Cli::try_parse_from(["zeroclaw", "onboard"]).expect("bare onboard should parse");
 
@@ -7672,7 +7672,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn onboard_cli_positional_sections_parse() {
         // Drive from the canonical const so adding a section forces
         // parser coverage here. clap subcommand names are the
@@ -7690,7 +7690,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn homebrew_onboard_config_dir_detects_cellar_paths() {
         assert_eq!(
             resolve_homebrew_onboard_config_dir(
@@ -7709,7 +7709,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn homebrew_onboard_config_dir_detects_brew_bin_symlink_layout() {
         let temp = tempfile::tempdir().expect("tempdir");
         let prefix = temp.path().join("homebrew");
@@ -7723,7 +7723,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn homebrew_onboard_config_dir_preserves_explicit_runtime_paths() {
         let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
 
@@ -7743,7 +7743,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn homebrew_onboard_config_dir_treats_workspace_whitespace_as_explicit() {
         let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
 
@@ -7756,7 +7756,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn apply_homebrew_onboard_config_dir_sets_detected_config_dir() {
         let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
         let mut applied = None;
@@ -7778,7 +7778,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn apply_homebrew_onboard_config_dir_skips_explicit_config_dir() {
         let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
         let mut applied = None;
@@ -7794,7 +7794,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn cli_parses_estop_default_engage() {
         let cli = Cli::try_parse_from(["zeroclaw", "estop"]).expect("estop command should parse");
 
@@ -7815,7 +7815,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn cli_parses_estop_resume_domain() {
         let cli = Cli::try_parse_from(["zeroclaw", "estop", "resume", "--domain", "*.chase.com"])
             .expect("estop resume command should parse");
@@ -7830,7 +7830,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn agent_command_parses_with_temperature() {
         let cli = Cli::try_parse_from([
             "zeroclaw",
@@ -7851,7 +7851,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn agent_command_parses_without_temperature() {
         let cli = Cli::try_parse_from([
             "zeroclaw",
@@ -7872,7 +7872,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn agent_command_parses_session_state_file() {
         let cli = Cli::try_parse_from([
             "zeroclaw",
@@ -7895,7 +7895,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn agent_uses_provider_temperature_when_unset() {
         // When the user doesn't pass --temperature, the agent CLI
         // resolves from the agent's model_provider entry's temperature,
@@ -7922,7 +7922,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn config_set_materializes_missing_typed_provider_alias() {
         let mut config = Config::default();
         let path = "providers.models.deepseek.default.model";
@@ -7973,7 +7973,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn config_set_materializes_missing_tts_provider_alias() {
         let mut config = Config::default();
         let path = "providers.tts.openai.alloy.voice";
@@ -8005,7 +8005,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn config_set_materializes_missing_transcription_provider_alias() {
         let mut config = Config::default();
         let raw = "providers.transcription.groq.fast.model";
@@ -8058,7 +8058,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     fn agent_fallback_uses_hardcoded_when_config_uses_default() {
         // Test that when config uses default value (0.7), fallback still works
         let config = Config::default();
@@ -8079,7 +8079,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     async fn gate_security_posture_fails_closed_unless_allowed() {
         use crate::config::schema::Config;
 
@@ -8121,7 +8121,7 @@ mod tests {
     /// so changing the `Set` arm back to the read-only doctor path will fail
     /// this test.
     #[tokio::test]
-    #[cfg(feature = "agent-runtime")]
+    #[cfg(any(feature = "agent-runtime", feature = "agent-core"))]
     async fn models_set_persists_model_and_preserves_slash_bearing_ids() {
         use crate::config::schema::{AnthropicModelProviderConfig, Config, ModelProviderConfig};
 
