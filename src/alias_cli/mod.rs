@@ -570,6 +570,9 @@ async fn agent_delete_owned_state(
 }
 
 #[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
+// async kept for signature parity with the gateway+agent-runtime variant that
+// the call site always `.await`s; this stub has nothing to await.
+#[allow(clippy::unused_async)]
 async fn agent_delete_owned_state(
     _config: &Config,
     _alias: &str,
@@ -645,6 +648,9 @@ async fn agent_rename_owned_state(
 }
 
 #[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
+// async kept for signature parity with the gateway+agent-runtime variant that
+// the call site always `.await`s; this stub has nothing to await.
+#[allow(clippy::unused_async)]
 async fn agent_rename_owned_state(
     _config: &Config,
     _from: &str,
