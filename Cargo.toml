@@ -315,6 +315,9 @@ observability-prometheus = [
     "zeroclaw-gateway/observability-prometheus",
 ]
 observability-otel = ["zeroclaw-runtime/observability-otel"]
+# PostgreSQL memory backend — durable shared store over the network, decouples
+# agent memory from a POSIX filesystem (EFS). For API-only / serverless agents.
+memory-postgres = ["zeroclaw-memory/memory-postgres"]
 hardware = ["dep:zeroclaw-hardware", "zeroclaw-hardware/hardware"]
 peripheral-rpi = ["dep:zeroclaw-hardware", "zeroclaw-hardware/peripheral-rpi"]
 sandbox-landlock = ["zeroclaw-runtime/sandbox-landlock"]
@@ -338,7 +341,7 @@ ci-all = [
     "hardware", "peripheral-rpi",
     "sandbox-landlock", "sandbox-bubblewrap",
     "browser-native", "plugins-wasm", "probe", "rag-pdf",
-    "webauthn",
+    "webauthn", "memory-postgres",
 ]
 
 [profile.dev]

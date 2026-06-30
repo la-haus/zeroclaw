@@ -15,6 +15,8 @@ pub mod markdown;
 pub mod namespaced;
 pub mod none;
 pub mod policy;
+#[cfg(feature = "memory-postgres")]
+pub mod postgres;
 pub mod qdrant;
 pub mod response_cache;
 pub mod retrieval;
@@ -66,6 +68,15 @@ where
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
+            Ok(Box::new(MarkdownMemory::new(workspace_dir)))
+        }
+        // Postgres is wired earlier in the storage-aware factory (it needs the
+        // connection config). Reaching here means it was requested without a
+        // db_url; fall back to markdown so the agent still boots.
+        MemoryBackendKind::Postgres => {
+            tracing::warn!(
+                "Postgres memory backend requires db_url in [storage.provider]{unknown_context}, falling back to markdown"
+            );
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
         }
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
@@ -360,6 +371,43 @@ pub fn create_memory_with_storage_and_routes(
             qdrant_api_key,
             embedder,
         )));
+    }
+
+    if matches!(backend_kind, MemoryBackendKind::Postgres) {
+        let storage = storage_provider
+            .context("Postgres memory backend requires a [storage.provider] section with db_url")?;
+        let db_url = storage
+            .db_url
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("ZEROCLAW_STORAGE_DB_URL").ok())
+            .filter(|s| !s.trim().is_empty())
+            .context(
+                "Postgres memory backend requires db_url in [storage.provider] or ZEROCLAW_STORAGE_DB_URL env var",
+            )?;
+
+        #[cfg(feature = "memory-postgres")]
+        {
+            tracing::info!(
+                "📦 PostgreSQL memory backend configured (schema: {}, table: {})",
+                storage.schema,
+                storage.table
+            );
+            return Ok(Box::new(postgres::PostgresMemory::new(
+                &db_url,
+                &storage.schema,
+                &storage.table,
+                storage.connect_timeout_secs,
+            )?));
+        }
+
+        #[cfg(not(feature = "memory-postgres"))]
+        {
+            let _ = &db_url;
+            anyhow::bail!(
+                "memory backend 'postgres' selected but this binary was built without the `memory-postgres` feature; rebuild with --features memory-postgres"
+            );
+        }
     }
 
     create_memory_with_builders(
