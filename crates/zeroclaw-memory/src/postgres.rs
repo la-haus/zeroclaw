@@ -156,8 +156,7 @@ impl PostgresMemory {
                     config.connect_timeout(Duration::from_secs(bounded));
                 }
 
-                let mut client = config
-                    .connect(NoTls)
+                let mut client = connect_postgres(&config)
                     .context("failed to connect to PostgreSQL memory backend")?;
 
                 Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
@@ -385,6 +384,54 @@ fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
 
 fn quote_identifier(value: &str) -> String {
     format!("\"{value}\"")
+}
+
+/// Connect honoring the URL's `sslmode`. Managed Postgres (RDS, Cloud SQL, …)
+/// commonly enforce TLS (`rds.force_ssl=1`), which the upstream `NoTls`-only
+/// path cannot satisfy. `sslmode=disable` → plaintext; anything else → TLS via
+/// native-tls. Server-certificate verification uses the system trust store plus
+/// an optional CA from `PGSSLROOTCERT` (e.g. the Amazon RDS global bundle). Set
+/// `ZEROCLAW_PG_TLS_INSECURE=1` to encrypt without verifying the server cert
+/// (testing only — do not use in production).
+fn connect_postgres(config: &postgres::Config) -> Result<Client> {
+    use postgres::config::SslMode;
+
+    if matches!(config.get_ssl_mode(), SslMode::Disable) {
+        return config
+            .connect(NoTls)
+            .context("failed to connect to PostgreSQL (sslmode=disable)");
+    }
+
+    let mut builder = native_tls::TlsConnector::builder();
+    if let Ok(ca_path) = std::env::var("PGSSLROOTCERT")
+        && !ca_path.trim().is_empty()
+    {
+        let pem = std::fs::read(&ca_path)
+            .with_context(|| format!("reading PGSSLROOTCERT at {ca_path}"))?;
+        let cert =
+            native_tls::Certificate::from_pem(&pem).context("parsing PGSSLROOTCERT as PEM")?;
+        builder.add_root_certificate(cert);
+    }
+    if env_is_truthy("ZEROCLAW_PG_TLS_INSECURE") {
+        builder
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true);
+    }
+    let connector = postgres_native_tls::MakeTlsConnector::new(
+        builder.build().context("building TLS connector")?,
+    );
+    config
+        .connect(connector)
+        .context("failed to connect to PostgreSQL over TLS")
+}
+
+fn env_is_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
 }
 
 #[async_trait]
