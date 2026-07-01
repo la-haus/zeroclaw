@@ -245,6 +245,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 user_id: _,
                 session_id,
                 message_id,
+                namespace,
             } => {
                 let mut json = serde_json::json!({
                     "type": "agent_start",
@@ -258,6 +259,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 add_optional_string(&mut json, "turn_id", turn_id);
                 add_optional_string(&mut json, "session_id", session_id);
                 add_optional_string(&mut json, "message_id", message_id);
+                add_optional_string(&mut json, "namespace", namespace);
                 json
             }
             zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
@@ -565,6 +567,7 @@ mod tests {
                 user_id: None,
                 session_id: None,
                 message_id: None,
+                namespace: None,
             },
             ObserverEvent::AgentEnd {
                 model_provider: "p".into(),

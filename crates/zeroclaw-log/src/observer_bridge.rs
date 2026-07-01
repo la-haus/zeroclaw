@@ -121,6 +121,11 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
                 .get("message_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
+            namespace: event
+                .attributes
+                .get("namespace")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
         }),
         "agent_end" => Some(ObserverEvent::AgentEnd {
             model_provider,

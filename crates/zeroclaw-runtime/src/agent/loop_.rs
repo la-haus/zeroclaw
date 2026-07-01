@@ -1479,6 +1479,7 @@ pub async fn run(
             user_id: None,
             session_id: None,
             message_id: None,
+            namespace: None,
         });
 
         // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
@@ -2018,6 +2019,7 @@ pub async fn run(
                                 user_id: None,
                                 session_id: None,
                                 message_id: None,
+                                namespace: None,
                             });
 
                             continue;
@@ -2544,6 +2546,7 @@ pub async fn run(
                                     user_id: None,
                                     session_id: None,
                                     message_id: None,
+                                    namespace: None,
                                 });
 
                                 continue;

@@ -2744,6 +2744,7 @@ async fn handle_webhook(
             user_id: None,
             session_id: session_id.clone(),
             message_id: None,
+            namespace: None,
         },
     );
     state.observer.record_event(

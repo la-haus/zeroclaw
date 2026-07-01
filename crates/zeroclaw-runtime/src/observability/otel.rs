@@ -310,6 +310,7 @@ impl Observer for OtelObserver {
                 user_id,
                 session_id,
                 message_id,
+                namespace,
             } => {
                 self.agent_starts.add(
                     1,
@@ -339,6 +340,11 @@ impl Observer for OtelObserver {
                 if let Some(mid) = message_id {
                     span_attrs.push(KeyValue::new("message.id", mid.clone()));
                 }
+                if let Some(ns) = namespace {
+                    // Per-tenant span attribute — filterable in Datadog APM and
+                    // any generic OTLP backend (Langfuse reads span attributes).
+                    span_attrs.push(KeyValue::new("zeroclaw.namespace", ns.clone()));
+                }
                 if langsmith_compat_enabled() {
                     span_attrs.push(KeyValue::new("langsmith.span.kind", "chain"));
                     span_attrs.push(KeyValue::new(
@@ -355,6 +361,9 @@ impl Observer for OtelObserver {
                     if let Some(mid) = message_id {
                         span_attrs
                             .push(KeyValue::new("langsmith.metadata.message_id", mid.clone()));
+                    }
+                    if let Some(ns) = namespace {
+                        span_attrs.push(KeyValue::new("langsmith.metadata.namespace", ns.clone()));
                     }
                     if let Some(ch) = channel {
                         span_attrs.push(KeyValue::new("langsmith.metadata.channel", ch.clone()));
@@ -1014,6 +1023,7 @@ mod tests {
             user_id: Some("user-1".into()),
             session_id: Some("session-corr".into()),
             message_id: Some("msg-corr".into()),
+            namespace: Some("cx_acme".into()),
         });
 
         // The agent span's 64-bit trace id + span id must be published so the
@@ -1043,6 +1053,7 @@ mod tests {
             user_id: Some("user-1".into()),
             session_id: Some("session-ls".into()),
             message_id: Some("msg-ls".into()),
+            namespace: Some("cx_acme".into()),
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "anthropic".into(),
@@ -1086,6 +1097,7 @@ mod tests {
             user_id: None,
             session_id: None,
             message_id: None,
+            namespace: None,
         });
         obs.record_event(&ObserverEvent::LlmRequest {
             model_provider: "openrouter".into(),
@@ -1351,6 +1363,7 @@ mod tests {
             user_id: None,
             session_id: Some("session-1".into()),
             message_id: Some("msg-1".into()),
+            namespace: Some("cx_acme".into()),
         });
 
         assert!(

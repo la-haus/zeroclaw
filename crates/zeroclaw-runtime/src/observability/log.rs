@@ -28,11 +28,15 @@ impl Observer for LogObserver {
                 user_id,
                 session_id: _,
                 message_id: _,
+                namespace,
             } => {
                 let mut attrs =
                     ::serde_json::json!({"model_provider": model_provider, "model": model});
                 if let Some(uid) = user_id {
                     attrs["user_id"] = ::serde_json::json!(uid);
+                }
+                if let Some(ns) = namespace {
+                    attrs["namespace"] = ::serde_json::json!(ns);
                 }
                 ::zeroclaw_log::record!(
                     INFO,
@@ -332,6 +336,7 @@ mod tests {
             user_id: None,
             session_id: None,
             message_id: None,
+            namespace: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),

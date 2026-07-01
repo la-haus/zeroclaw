@@ -119,6 +119,7 @@ impl Observer for DatadogLogObserver {
                 user_id,
                 session_id,
                 message_id,
+                namespace,
             } => {
                 let mut attrs = json!({
                     "provider": model_provider,
@@ -132,6 +133,9 @@ impl Observer for DatadogLogObserver {
                 }
                 if let Some(mid) = message_id {
                     attrs["message_id"] = json!(mid);
+                }
+                if let Some(ns) = namespace {
+                    attrs["namespace"] = json!(ns);
                 }
                 if let Some(ch) = channel {
                     attrs["channel"] = json!(ch);
@@ -305,6 +309,7 @@ mod tests {
             user_id: Some("user-42".into()),
             session_id: Some("session-7".into()),
             message_id: Some("msg-9".into()),
+            namespace: Some("cx_acme".into()),
         }
     }
 

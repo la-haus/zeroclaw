@@ -43,6 +43,7 @@ mod tests {
             user_id: None,
             session_id: None,
             message_id: None,
+            namespace: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "test".into(),
