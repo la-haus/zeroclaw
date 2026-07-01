@@ -549,12 +549,12 @@ async fn handle_socket(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": format!("{e:#}")})),
                     "Agent initialization failed"
                 );
                 let err = serde_json::json!({
                     "type": "error",
-                    "message": format!("Failed to initialise agent: {e}"),
+                    "message": format!("Failed to initialise agent: {e:#}"),
                     "code": "AGENT_INIT_FAILED"
                 });
                 let _ = sender.send(Message::Text(err.to_string().into())).await;
