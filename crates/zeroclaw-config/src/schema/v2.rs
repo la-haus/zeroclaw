@@ -3565,6 +3565,7 @@ pub fn migrate_postgres_memory_to_v3(
             IF NOT EXISTS (
                 SELECT 1 FROM pg_constraint
                 WHERE conname = 'memories_agent_id_notnull_chk'
+                  AND conrelid = '{qualified_table}'::regclass
             ) THEN
                 ALTER TABLE {qualified_table}
                     ADD CONSTRAINT memories_agent_id_notnull_chk
@@ -3578,6 +3579,7 @@ pub fn migrate_postgres_memory_to_v3(
             IF NOT EXISTS (
                 SELECT 1 FROM pg_constraint
                 WHERE conname = 'memories_agent_id_fk'
+                  AND conrelid = '{qualified_table}'::regclass
             ) THEN
                 ALTER TABLE {qualified_table}
                     ADD CONSTRAINT memories_agent_id_fk
@@ -3593,6 +3595,7 @@ pub fn migrate_postgres_memory_to_v3(
             IF NOT EXISTS (
                 SELECT 1 FROM pg_constraint
                 WHERE conname = 'memories_agent_key_uniq'
+                  AND conrelid = '{qualified_table}'::regclass
             ) THEN
                 ALTER TABLE {qualified_table}
                     ADD CONSTRAINT memories_agent_key_uniq UNIQUE (agent_id, key);

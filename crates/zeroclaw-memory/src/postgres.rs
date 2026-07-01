@@ -156,8 +156,7 @@ impl PostgresMemory {
                     config.connect_timeout(Duration::from_secs(bounded));
                 }
 
-                let mut client = config
-                    .connect(NoTls)
+                let mut client = connect_postgres(&config)
                     .context("failed to connect to PostgreSQL memory backend")?;
 
                 Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
@@ -385,6 +384,89 @@ fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
 
 fn quote_identifier(value: &str) -> String {
     format!("\"{value}\"")
+}
+
+/// Connect honoring the URL's `sslmode`. Managed Postgres (RDS, Cloud SQL, …)
+/// commonly enforce TLS (`rds.force_ssl=1`), which the upstream `NoTls`-only
+/// path cannot satisfy. `sslmode=disable` → plaintext; anything else → TLS via
+/// native-tls. Server-certificate verification uses the system trust store plus
+/// an optional CA from `PGSSLROOTCERT` (e.g. the Amazon RDS global bundle). Set
+/// `ZEROCLAW_PG_TLS_INSECURE=1` to encrypt without verifying the server cert
+/// (testing only — do not use in production).
+fn connect_postgres(config: &postgres::Config) -> Result<Client> {
+    use postgres::config::SslMode;
+
+    if matches!(config.get_ssl_mode(), SslMode::Disable) {
+        return config
+            .connect(NoTls)
+            .context("failed to connect to PostgreSQL (sslmode=disable)");
+    }
+
+    let mut builder = native_tls::TlsConnector::builder();
+    if let Ok(ca_path) = std::env::var("PGSSLROOTCERT")
+        && !ca_path.trim().is_empty()
+    {
+        let pem = std::fs::read(&ca_path)
+            .with_context(|| format!("reading PGSSLROOTCERT at {ca_path}"))?;
+        // The Amazon RDS "global-bundle.pem" concatenates every regional CA, so
+        // parse each PEM block and add them all — `Certificate::from_pem` reads
+        // only the first, which would drop the CA that actually signs the
+        // server cert. Fall back to treating the file as a single certificate.
+        let mut added = 0usize;
+        for block in split_pem_certificates(&pem) {
+            if let Ok(cert) = native_tls::Certificate::from_pem(&block) {
+                builder.add_root_certificate(cert);
+                added += 1;
+            }
+        }
+        if added == 0 {
+            let cert =
+                native_tls::Certificate::from_pem(&pem).context("parsing PGSSLROOTCERT as PEM")?;
+            builder.add_root_certificate(cert);
+        }
+    }
+    if env_is_truthy("ZEROCLAW_PG_TLS_INSECURE") {
+        builder
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true);
+    }
+    let connector = postgres_native_tls::MakeTlsConnector::new(
+        builder.build().context("building TLS connector")?,
+    );
+    config
+        .connect(connector)
+        .context("failed to connect to PostgreSQL over TLS")
+}
+
+/// Split a PEM file into its individual `-----BEGIN CERTIFICATE-----` …
+/// `-----END CERTIFICATE-----` blocks (inclusive of the delimiters). Bundles
+/// like the Amazon RDS `global-bundle.pem` concatenate many roots; each block
+/// must be added to the trust store separately.
+fn split_pem_certificates(pem: &[u8]) -> Vec<Vec<u8>> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let text = String::from_utf8_lossy(pem);
+    let mut out = Vec::new();
+    let mut rest = text.as_ref();
+    while let Some(start) = rest.find(BEGIN) {
+        let after = &rest[start..];
+        let Some(end_rel) = after.find(END) else {
+            break;
+        };
+        let end = end_rel + END.len();
+        out.push(after.as_bytes()[..end].to_vec());
+        rest = &after[end..];
+    }
+    out
+}
+
+fn env_is_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
 }
 
 #[async_trait]
@@ -911,6 +993,23 @@ mod tests {
     fn valid_identifiers_pass_validation() {
         assert!(validate_identifier("public", "schema").is_ok());
         assert!(validate_identifier("_memories_01", "table").is_ok());
+    }
+
+    #[test]
+    fn split_pem_certificates_handles_bundle() {
+        let one = "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n";
+        let two = "-----BEGIN CERTIFICATE-----\nBBB\n-----END CERTIFICATE-----\n";
+        let bundle = format!("# comment\n{one}\n{two}");
+        let blocks = split_pem_certificates(bundle.as_bytes());
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].starts_with(b"-----BEGIN CERTIFICATE-----"));
+        assert!(blocks[0].ends_with(b"-----END CERTIFICATE-----"));
+        assert!(String::from_utf8_lossy(&blocks[1]).contains("BBB"));
+    }
+
+    #[test]
+    fn split_pem_certificates_empty_when_no_blocks() {
+        assert!(split_pem_certificates(b"not a pem file").is_empty());
     }
 
     #[test]

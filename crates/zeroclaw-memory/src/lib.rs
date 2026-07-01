@@ -515,6 +515,31 @@ pub fn create_memory_for_migration(
     )
 }
 
+/// Lowercase the alias and map every non-`[a-z0-9_]` byte to `_`, prefixing a
+/// leading `_` when the first char is not a letter/underscore, so an agent
+/// alias (e.g. a UUID with hyphens) is a valid PostgreSQL schema identifier
+/// component. `d8bf4a82-e9c5-...` -> `d8bf4a82_e9c5_...`.
+fn sanitize_schema_ident(alias: &str) -> String {
+    let mut s: String = alias
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if !s
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    {
+        s.insert(0, '_');
+    }
+    s
+}
+
 /// Build the per-agent memory wrapper for `agent_alias`.
 ///
 /// Wraps the appropriate inner backend with `AgentScopedMemory` (for
@@ -569,10 +594,28 @@ pub async fn create_memory_for_agent(
     // install-wide factory using the install workspace_dir, then wrap
     // with AgentScopedMemory holding the agent's UUID + resolved
     // allowlist UUIDs.
+    // Per-agent Postgres schema: when the configured schema contains the
+    // `{alias}` placeholder, substitute an identifier-safe form of the agent
+    // alias so each tenant's memory lands in its own schema (auto-created via
+    // CREATE SCHEMA IF NOT EXISTS at connect time). One pod serves many tenants,
+    // schema-isolated, with no per-tenant provisioning (Terraform or code).
+    let active_storage = config.resolve_active_storage();
+    let pg_scoped;
+    let active_storage = match active_storage {
+        zeroclaw_config::schema::ActiveStorage::Postgres(pg) if pg.schema.contains("{alias}") => {
+            let mut cloned = pg.clone();
+            cloned.schema = pg
+                .schema
+                .replace("{alias}", &sanitize_schema_ident(agent_alias));
+            pg_scoped = cloned;
+            zeroclaw_config::schema::ActiveStorage::Postgres(&pg_scoped)
+        }
+        other => other,
+    };
     let inner = create_memory_with_storage_and_routes(
         &config.memory,
         &config.embedding_routes,
-        config.resolve_active_storage(),
+        active_storage,
         &config.data_dir,
         api_key,
     )?;

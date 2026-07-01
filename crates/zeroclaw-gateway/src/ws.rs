@@ -186,6 +186,51 @@ fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) ->
     None
 }
 
+/// Maximum accepted length of an `agent` alias from the WebSocket query.
+///
+/// Aliases configured under `[agents.<alias>]` are already capped at 63 chars
+/// by `validate_alias_key`; this bound only guards the on-demand path where the
+/// alias arrives untrusted from `?agent=<alias>`. 128 leaves head-room for
+/// callers that namespace tenants into the alias while staying well below any
+/// filesystem `NAME_MAX`.
+const MAX_AGENT_ALIAS_LEN: usize = 128;
+
+/// Reject an `agent` alias that is not a filesystem-safe identifier.
+///
+/// The alias arrives untrusted from the `?agent=<alias>` WebSocket query param
+/// and flows directly into filesystem paths — the per-agent workspace dir
+/// (`Config::agent_workspace_dir` joins the raw alias), the SQLite/markdown
+/// memory store, and on-demand template instantiation. An alias carrying path
+/// separators or `..` would escape the intended `<install>/agents/<alias>/`
+/// subtree (e.g. `?agent=../../etc/cron.d`), so it must be validated *before*
+/// any path is built or any on-demand agent is materialised.
+///
+/// "Safe" here is deliberately a strict superset of `validate_alias_key`
+/// (lowercase, single underscore, no hyphen): every legitimately-configured
+/// alias passes this gate, while the on-demand path additionally tolerates
+/// mixed case, hyphens, and dots (`empresa-123`, `cx_acme`). The rules:
+///
+/// - non-empty, at most [`MAX_AGENT_ALIAS_LEN`] bytes;
+/// - every char in `[A-Za-z0-9._-]` — bans `/`, `\`, NUL, whitespace, etc.;
+/// - no `..` anywhere — bans the parent-directory traversal component;
+/// - must not start with `.` or `-` — bans hidden/dotfile names and aliases
+///   that could be mistaken for CLI flags.
+fn is_safe_agent_alias(alias: &str) -> bool {
+    if alias.is_empty() || alias.len() > MAX_AGENT_ALIAS_LEN {
+        return false;
+    }
+    if alias.contains("..") {
+        return false;
+    }
+    let first = alias.as_bytes()[0];
+    if first == b'.' || first == b'-' {
+        return false;
+    }
+    alias
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// GET /ws/chat — WebSocket upgrade for agent chat
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
@@ -225,13 +270,33 @@ pub async fn handle_ws_chat(
         )
             .into_response();
     };
+    // Reject path-traversal / unsafe aliases up-front. The alias flows into
+    // filesystem paths (workspace dir, SQLite/markdown memory) and on-demand
+    // instantiation; an alias with `..`, `/`, or `\` could escape the agent's
+    // intended subtree. Applied to BOTH explicit and on-demand aliases — every
+    // configured alias already satisfies the stricter `validate_alias_key`, so
+    // this never rejects a legitimately-configured agent.
+    if !is_safe_agent_alias(&agent_alias) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "Invalid `agent` alias — must be a filesystem-safe identifier (letters, digits, `.`, `_`, `-`; no `/`, `\\`, or `..`; not starting with `.`/`-`; ≤128 chars).",
+        )
+            .into_response();
+    }
     {
+        // Accept the upgrade when the alias is either explicitly configured
+        // OR can be instantiated on-demand from the gateway template agent
+        // (`[gateway].template_agent`). Without a usable template, unknown
+        // aliases are rejected (historical behavior). The actual derivation
+        // happens in `handle_socket` against the per-connection config copy.
         let cfg = state.config.read();
-        if cfg.agent(&agent_alias).is_none() {
+        if cfg.agent(&agent_alias).is_none()
+            && cfg.derive_template_agent_config(&agent_alias).is_none()
+        {
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 format!(
-                    "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured."
+                    "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured and no [gateway].template_agent to instantiate from."
                 ),
             )
                 .into_response();
@@ -303,7 +368,31 @@ async fn handle_socket(
     // Hydrate session metadata from persistence (if available). Agent
     // construction is deferred until after the optional `connect` frame so the
     // client can provide a per-session cwd for the security sandbox root.
-    let config = state.config.read().clone();
+    //
+    // On-demand template instantiation: when the requested alias has no
+    // explicit `[agents.<alias>]` entry but a `[gateway].template_agent` is
+    // configured, synthesize an ephemeral agent config by cloning the template
+    // and re-keying it under the requested alias in THIS per-connection copy of
+    // the config. Memory then scopes (isolates) per requested alias via
+    // `Memory::ensure_agent_uuid`, while behavior mirrors the template. The
+    // shared global `Config` is never mutated. Explicit config always wins.
+    let mut config = state.config.read().clone();
+    if config.agent(&agent_alias).is_none()
+        && let Some(derived) = config.derive_template_agent_config(&agent_alias)
+    {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "agent": &agent_alias,
+                    "template": config.gateway.template_agent.as_deref(),
+                })
+            ),
+            "WS instantiating on-demand agent from template; memory isolated per requested alias"
+        );
+        config.agents.insert(agent_alias.clone(), derived);
+    }
+    let config = config;
     let ws_memory = match resolve_ws_memory_handle(&config, &agent_alias).await {
         Ok(memory) => memory,
         Err(e) => {
@@ -437,8 +526,10 @@ async fn handle_socket(
     // across turns. The session cwd becomes the security sandbox root; config
     // workspace remains the daemon data directory. Routes through the
     // backchannel constructor so this WS session shares its tool-approval
-    // path with the operator-driven dashboard. The agent_alias was
-    // validated up-front in handle_ws_chat against the configured agents.
+    // path with the operator-driven dashboard. The agent_alias was validated
+    // up-front in handle_ws_chat (explicit config or template-derivable), and
+    // the per-connection `config` above carries the template-derived entry for
+    // on-demand aliases.
     let mut agent =
         match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd_and_mcp_backchannel(
             &config,
@@ -458,12 +549,12 @@ async fn handle_socket(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": format!("{e:#}")})),
                     "Agent initialization failed"
                 );
                 let err = serde_json::json!({
                     "type": "error",
-                    "message": format!("Failed to initialise agent: {e}"),
+                    "message": format!("Failed to initialise agent: {e:#}"),
                     "code": "AGENT_INIT_FAILED"
                 });
                 let _ = sender.send(Message::Text(err.to_string().into())).await;
@@ -1698,6 +1789,50 @@ mod tests {
     use axum::http::HeaderMap;
 
     #[test]
+    fn safe_agent_alias_accepts_normal_aliases() {
+        assert!(is_safe_agent_alias("empresa-123"));
+        assert!(is_safe_agent_alias("cx_acme"));
+        assert!(is_safe_agent_alias("default"));
+        assert!(is_safe_agent_alias("prod_v2"));
+        assert!(is_safe_agent_alias("Tenant.Acme_01"));
+        assert!(is_safe_agent_alias("a"));
+    }
+
+    #[test]
+    fn safe_agent_alias_rejects_parent_traversal() {
+        assert!(!is_safe_agent_alias(".."));
+        assert!(!is_safe_agent_alias("../../etc/cron.d"));
+        assert!(!is_safe_agent_alias("foo/../bar"));
+        assert!(!is_safe_agent_alias("a..b"));
+    }
+
+    #[test]
+    fn safe_agent_alias_rejects_path_separators() {
+        assert!(!is_safe_agent_alias("foo/bar"));
+        assert!(!is_safe_agent_alias("/etc/passwd"));
+        assert!(!is_safe_agent_alias("foo\\bar"));
+        assert!(!is_safe_agent_alias("C:\\Windows"));
+    }
+
+    #[test]
+    fn safe_agent_alias_rejects_leading_dot_or_dash() {
+        assert!(!is_safe_agent_alias(".hidden"));
+        assert!(!is_safe_agent_alias("-rf"));
+        assert!(!is_safe_agent_alias(".ssh"));
+    }
+
+    #[test]
+    fn safe_agent_alias_rejects_empty_oversized_and_funky_chars() {
+        assert!(!is_safe_agent_alias(""));
+        assert!(!is_safe_agent_alias(&"a".repeat(MAX_AGENT_ALIAS_LEN + 1)));
+        assert!(is_safe_agent_alias(&"a".repeat(MAX_AGENT_ALIAS_LEN)));
+        assert!(!is_safe_agent_alias("space here"));
+        assert!(!is_safe_agent_alias("tab\there"));
+        assert!(!is_safe_agent_alias("nul\0byte"));
+        assert!(!is_safe_agent_alias("emoji😀"));
+    }
+
+    #[test]
     fn extract_ws_token_from_authorization_header() {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer zc_test123".parse().unwrap());
@@ -1771,6 +1906,44 @@ mod tests {
             "zeroclaw.v1, bearer.zc_tok, other".parse().unwrap(),
         );
         assert_eq!(extract_ws_token(&headers, None), Some("zc_tok"));
+    }
+
+    #[test]
+    fn ws_agent_gate_accept_reject_and_template_instantiation() {
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let mut cfg = Config::default();
+        cfg.agents
+            .insert("cx".to_string(), AliasedAgentConfig::default());
+
+        // Explicit alias → accepted as-is (config wins, no derivation).
+        assert!(cfg.agent("cx").is_some());
+        assert!(
+            cfg.derive_template_agent_config("cx").is_none(),
+            "explicit alias must never derive from the template"
+        );
+
+        // Unknown alias, NO template → the upgrade gate rejects: both the
+        // explicit lookup and the template derivation are empty.
+        assert!(cfg.agent("tenant-1").is_none());
+        assert!(cfg.derive_template_agent_config("tenant-1").is_none());
+
+        // Configure the template → unknown alias is now instantiated
+        // on-demand and (per handle_socket) injected under the REQUESTED
+        // alias in the per-connection config copy, isolating memory/workspace.
+        cfg.gateway.template_agent = Some("cx".to_string());
+        let derived = cfg
+            .derive_template_agent_config("tenant-1")
+            .expect("unknown alias must instantiate from template");
+        let mut scoped = cfg.clone();
+        scoped.agents.insert("tenant-1".to_string(), derived);
+        assert!(scoped.agent("tenant-1").is_some());
+        assert!(
+            scoped
+                .agent_workspace_dir("tenant-1")
+                .ends_with("agents/tenant-1/workspace"),
+            "on-demand agent memory/workspace must scope to its own alias"
+        );
     }
 
     #[test]
