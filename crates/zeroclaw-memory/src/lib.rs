@@ -540,6 +540,16 @@ fn sanitize_schema_ident(alias: &str) -> String {
     s
 }
 
+/// Replace the `{namespace}` (preferred) and `{alias}` (back-compat)
+/// placeholders in a storage-schema template with an identifier-safe form of
+/// the tenant `key`, so `cx_{namespace}` + key `d8bf4a82-...` → `cx_d8bf4a82_...`.
+fn substitute_schema_placeholder(schema: &str, key: &str) -> String {
+    let ident = sanitize_schema_ident(key);
+    schema
+        .replace("{namespace}", &ident)
+        .replace("{alias}", &ident)
+}
+
 /// Build the per-agent memory wrapper for `agent_alias`.
 ///
 /// Wraps the appropriate inner backend with `AgentScopedMemory` (for
@@ -556,6 +566,25 @@ fn sanitize_schema_ident(alias: &str) -> String {
 pub async fn create_memory_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<Arc<dyn Memory>> {
+    create_memory_for_agent_in_namespace(config, agent_alias, None, api_key).await
+}
+
+/// Like [`create_memory_for_agent`] but decouples the tenant boundary
+/// (`namespace`) from the agent identity (`agent_alias`).
+///
+/// `namespace` drives the `{namespace}`/`{alias}` placeholder in the storage
+/// schema (Postgres), so a single schema `cx_<namespace>` can hold many agents,
+/// each attributed by its own `agent_id` (the `agent_alias`). When `namespace`
+/// is `None` the schema key falls back to `agent_alias`, preserving the
+/// historical one-alias-one-schema behavior. Everything else — the agents-table
+/// UUID resolution, the `read_memory_from` allowlist, and the wrapper choice —
+/// is identical to [`create_memory_for_agent`].
+pub async fn create_memory_for_agent_in_namespace(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    namespace: Option<&str>,
     api_key: Option<&str>,
 ) -> anyhow::Result<Arc<dyn Memory>> {
     use zeroclaw_config::multi_agent::MemoryBackendKind as ConfigBackend;
@@ -594,19 +623,23 @@ pub async fn create_memory_for_agent(
     // install-wide factory using the install workspace_dir, then wrap
     // with AgentScopedMemory holding the agent's UUID + resolved
     // allowlist UUIDs.
-    // Per-agent Postgres schema: when the configured schema contains the
-    // `{alias}` placeholder, substitute an identifier-safe form of the agent
-    // alias so each tenant's memory lands in its own schema (auto-created via
-    // CREATE SCHEMA IF NOT EXISTS at connect time). One pod serves many tenants,
+    // Per-tenant Postgres schema: when the configured schema contains a
+    // `{namespace}` (preferred) or `{alias}` (back-compat) placeholder,
+    // substitute an identifier-safe form of the namespace key so each tenant's
+    // memory lands in its own schema (auto-created via CREATE SCHEMA IF NOT
+    // EXISTS at connect time). `namespace` decouples tenant (schema) from agent
+    // identity (agent_id) — one schema, many agents. Falls back to the agent
+    // alias, preserving one-alias-one-schema. One pod serves many tenants,
     // schema-isolated, with no per-tenant provisioning (Terraform or code).
+    let schema_key = namespace.unwrap_or(agent_alias);
     let active_storage = config.resolve_active_storage();
     let pg_scoped;
     let active_storage = match active_storage {
-        zeroclaw_config::schema::ActiveStorage::Postgres(pg) if pg.schema.contains("{alias}") => {
+        zeroclaw_config::schema::ActiveStorage::Postgres(pg)
+            if pg.schema.contains("{namespace}") || pg.schema.contains("{alias}") =>
+        {
             let mut cloned = pg.clone();
-            cloned.schema = pg
-                .schema
-                .replace("{alias}", &sanitize_schema_ident(agent_alias));
+            cloned.schema = substitute_schema_placeholder(&pg.schema, schema_key);
             pg_scoped = cloned;
             zeroclaw_config::schema::ActiveStorage::Postgres(&pg_scoped)
         }
@@ -679,6 +712,33 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::schema::EmbeddingRouteConfig;
+
+    #[test]
+    fn sanitize_schema_ident_maps_uuid_to_snake() {
+        assert_eq!(
+            sanitize_schema_ident("d8bf4a82-e9c5-491e-946f-1326ffa7f5e4"),
+            "d8bf4a82_e9c5_491e_946f_1326ffa7f5e4"
+        );
+        // Leading non-letter/underscore gets a `_` prefix.
+        assert_eq!(sanitize_schema_ident("1abc"), "_1abc");
+        assert_eq!(sanitize_schema_ident("ACME Corp"), "acme_corp");
+    }
+
+    #[test]
+    fn substitute_schema_placeholder_replaces_namespace_and_alias() {
+        let key = "d8bf4a82-e9c5-491e-946f-1326ffa7f5e4";
+        assert_eq!(
+            substitute_schema_placeholder("cx_{namespace}", key),
+            "cx_d8bf4a82_e9c5_491e_946f_1326ffa7f5e4"
+        );
+        // `{alias}` stays supported for back-compat and resolves identically.
+        assert_eq!(
+            substitute_schema_placeholder("cx_{alias}", key),
+            "cx_d8bf4a82_e9c5_491e_946f_1326ffa7f5e4"
+        );
+        // No placeholder → schema is returned verbatim.
+        assert_eq!(substitute_schema_placeholder("public", key), "public");
+    }
 
     #[test]
     fn factory_sqlite() {
