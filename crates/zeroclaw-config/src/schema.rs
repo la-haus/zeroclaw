@@ -20215,16 +20215,16 @@ mod ssrf_guard_tests {
     #[test]
     fn is_internal_ip_flags_internal_ranges() {
         for addr in [
-            "169.254.169.254", // IMDS link-local
-            "10.0.0.1",        // RFC1918
-            "172.16.0.1",      // RFC1918
-            "192.168.1.1",     // RFC1918
-            "127.0.0.1",       // loopback v4
-            "0.0.0.0",         // unspecified v4
-            "::1",             // loopback v6
-            "::",              // unspecified v6
-            "fe80::1",         // link-local v6
-            "fc00::1",         // unique-local v6
+            "169.254.169.254",        // IMDS link-local
+            "10.0.0.1",               // RFC1918
+            "172.16.0.1",             // RFC1918
+            "192.168.1.1",            // RFC1918
+            "127.0.0.1",              // loopback v4
+            "0.0.0.0",                // unspecified v4
+            "::1",                    // loopback v6
+            "::",                     // unspecified v6
+            "fe80::1",                // link-local v6
+            "fc00::1",                // unique-local v6
             "::ffff:169.254.169.254", // IPv4-mapped IMDS (must not bypass)
             "::ffff:10.0.0.1",        // IPv4-mapped RFC1918 (must not bypass)
         ] {
