@@ -38,6 +38,11 @@ pub enum ObserverEvent {
         /// (e.g. the originating channel message id). `None` when the
         /// caller has no message-level id to attribute the turn to.
         message_id: Option<String>,
+        /// Optional tenant/namespace (the schema-isolation key, decoupled from
+        /// the agent identity). Emitted as a span/log attribute so per-tenant
+        /// traces are filterable across every OTLP backend (Datadog, LangSmith,
+        /// Langfuse). `None` for single-tenant callers.
+        namespace: Option<String>,
     },
     /// A request is about to be sent to an LLM model_provider.
     ///

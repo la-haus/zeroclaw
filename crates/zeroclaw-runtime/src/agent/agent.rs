@@ -177,6 +177,11 @@ pub struct Agent {
     pub session_id: Option<String>,
     /// Optional inbound-message identifier for trace correlation.
     pub message_id: Option<String>,
+    /// Optional tenant/namespace (schema-isolation key, decoupled from the
+    /// agent identity). Set by front-ends (e.g. the gateway WS handler) so
+    /// `AgentStart` events carry it as a per-tenant trace attribute across all
+    /// OTLP backends (Datadog, LangSmith, Langfuse).
+    pub namespace: Option<String>,
     history: Vec<ConversationMessage>,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
     available_hints: Vec<String>,
@@ -699,6 +704,7 @@ impl AgentBuilder {
             user_id: None,
             session_id: None,
             message_id: None,
+            namespace: None,
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
@@ -2194,6 +2200,7 @@ impl Agent {
             user_id: self.user_id.clone(),
             session_id: self.session_id.clone(),
             message_id: self.message_id.clone(),
+            namespace: self.namespace.clone(),
         });
 
         let mut guard = TurnGuard {
@@ -2572,6 +2579,7 @@ impl Agent {
             user_id: self.user_id.clone(),
             session_id: self.session_id.clone(),
             message_id: self.message_id.clone(),
+            namespace: self.namespace.clone(),
         });
 
         let mut guard = TurnGuard {

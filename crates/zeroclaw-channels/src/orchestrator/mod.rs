@@ -4979,6 +4979,7 @@ async fn process_channel_message_body(
                             user_id: None,
                             session_id: None,
                             message_id: None,
+                            namespace: None,
                         });
 
                         continue;

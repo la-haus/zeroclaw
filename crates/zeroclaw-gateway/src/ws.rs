@@ -633,6 +633,9 @@ async fn handle_socket(
     // AgentStart events emit them for Datadog/LangSmith trace correlation.
     agent.session_id = Some(session_id.clone());
     agent.message_id = message_id.clone();
+    // Carry the tenant namespace so AgentStart events attribute every turn to
+    // its tenant across all OTLP backends (Datadog, LangSmith, Langfuse).
+    agent.namespace = namespace.clone();
     if let Some(ref mid) = message_id {
         ::zeroclaw_log::record!(
             INFO,
