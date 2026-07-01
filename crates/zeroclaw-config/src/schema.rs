@@ -6443,6 +6443,18 @@ pub struct GatewayConfig {
     /// template.
     #[serde(default)]
     pub template_agent: Option<String>,
+
+    /// Require the WebSocket `namespace` (the schema-isolation key that drives
+    /// the `{namespace}`/`{alias}` storage-schema placeholder) to be a valid
+    /// UUID. Defends the on-demand multi-tenant path against a flood of random
+    /// namespaces each triggering a `CREATE SCHEMA` on a shared database
+    /// (catalog-bloat DoS): with this on, an attacker cannot enumerate
+    /// `tenant-1..N` — only well-formed UUIDs are admitted. Enforced only when
+    /// a namespace value is actually used to materialise a schema (placeholder
+    /// present). `false` (default) preserves upstream behavior. Set `true` when
+    /// tenants are UUID-keyed (e.g. La Haus enterprise codes).
+    #[serde(default)]
+    pub require_uuid_namespace: bool,
 }
 
 fn default_gateway_port() -> u16 {
@@ -6521,6 +6533,7 @@ impl Default for GatewayConfig {
             request_timeout_secs: default_gateway_request_timeout_secs(),
             long_running_request_timeout_secs: default_gateway_long_running_request_timeout_secs(),
             template_agent: None,
+            require_uuid_namespace: false,
         }
     }
 }
@@ -23915,11 +23928,13 @@ allowed_numbers = ["+1", "+2"]
             request_timeout_secs: 30,
             long_running_request_timeout_secs: 600,
             template_agent: Some("cx".into()),
+            require_uuid_namespace: true,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.require_pairing);
         assert_eq!(parsed.template_agent.as_deref(), Some("cx"));
+        assert!(parsed.require_uuid_namespace);
         assert!(parsed.session_persistence);
         assert_eq!(parsed.session_ttl_hours, 0);
         assert!(!parsed.allow_public_bind);

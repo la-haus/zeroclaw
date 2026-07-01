@@ -134,6 +134,14 @@ pub struct WsQuery {
     /// session is bound to an explicit agent (no default agent exists).
     #[serde(default, alias = "agentAlias", alias = "agent")]
     pub agent_alias: Option<String>,
+    /// Optional tenant/namespace: the schema-isolation key that drives the
+    /// `{namespace}` storage-schema placeholder, decoupled from the agent
+    /// identity. Lets N agents (distinct `agent` aliases, each with its own
+    /// SOUL/skills/`agent_id`) share one tenant schema `cx_<namespace>`. When
+    /// absent, the schema key falls back to the agent alias (historical
+    /// one-alias-one-schema behavior).
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// Project root / working directory for this session.
     #[serde(default)]
     pub cwd: Option<String>,
@@ -231,6 +239,17 @@ fn is_safe_agent_alias(alias: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// Whether the effective schema-namespace key is admissible under the
+/// `[gateway].require_uuid_namespace` gate.
+///
+/// Off → everything passes (upstream default). On → only a well-formed UUID
+/// passes, so an attacker cannot flood the shared database with `CREATE SCHEMA`
+/// for enumerated `tenant-1..N` namespaces (catalog-bloat DoS); UUID-keyed
+/// tenants (enterprise codes) still connect normally.
+fn uuid_namespace_gate_passes(require_uuid: bool, schema_key: &str) -> bool {
+    !require_uuid || uuid::Uuid::parse_str(schema_key).is_ok()
+}
+
 /// GET /ws/chat — WebSocket upgrade for agent chat
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
@@ -283,6 +302,35 @@ pub async fn handle_ws_chat(
         )
             .into_response();
     }
+    // The tenant namespace flows into a Postgres schema identifier (via the
+    // `{namespace}` placeholder), so it is validated with the same
+    // filesystem/identifier-safe gate as the alias before any schema is built.
+    let namespace = params.namespace.filter(|s| !s.trim().is_empty());
+    if let Some(ref ns) = namespace
+        && !is_safe_agent_alias(ns)
+    {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "Invalid `namespace` — must be a filesystem-safe identifier (letters, digits, `.`, `_`, `-`; no `/`, `\\`, or `..`; not starting with `.`/`-`; ≤128 chars).",
+        )
+            .into_response();
+    }
+    // DoS guard for the on-demand multi-tenant path: when configured, the
+    // effective schema-namespace key (namespace, else the alias) must be a valid
+    // UUID. Without this, a flood of random namespaces would each trigger a
+    // `CREATE SCHEMA` on a shared database (catalog-bloat DoS). UUID-keyed
+    // tenants (e.g. enterprise codes) cannot be enumerated as `tenant-1..N`.
+    {
+        let require_uuid = state.config.read().gateway.require_uuid_namespace;
+        let schema_key = namespace.as_deref().unwrap_or(&agent_alias);
+        if !uuid_namespace_gate_passes(require_uuid, schema_key) {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "Invalid tenant namespace — `[gateway].require_uuid_namespace` is enabled, so the `namespace` (or `agent` when no namespace is given) must be a valid UUID.",
+            )
+                .into_response();
+        }
+    }
     {
         // Accept the upgrade when the alias is either explicitly configured
         // OR can be instantiated on-demand from the gateway template agent
@@ -313,6 +361,7 @@ pub async fn handle_ws_chat(
             socket,
             state,
             agent_alias,
+            namespace,
             session_id,
             session_name,
             session_cwd,
@@ -329,6 +378,7 @@ const GW_SESSION_PREFIX: &str = "gw_";
 async fn resolve_ws_memory_handle(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
+    namespace: Option<&str>,
 ) -> anyhow::Result<Option<Arc<dyn zeroclaw_memory::Memory>>> {
     if config.agent(agent_alias).is_some_and(|agent| {
         matches!(
@@ -342,15 +392,21 @@ async fn resolve_ws_memory_handle(
     let api_key = config
         .resolved_model_provider_for_agent(agent_alias)
         .and_then(|(_, _, cfg)| cfg.api_key.clone());
-    zeroclaw_memory::create_memory_for_agent(config, agent_alias, api_key.as_deref())
-        .await
-        .map(Some)
+    zeroclaw_memory::create_memory_for_agent_in_namespace(
+        config,
+        agent_alias,
+        namespace,
+        api_key.as_deref(),
+    )
+    .await
+    .map(Some)
 }
 
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
     agent_alias: String,
+    namespace: Option<String>,
     session_id: Option<String>,
     session_name: Option<String>,
     session_cwd: Option<String>,
@@ -393,22 +449,23 @@ async fn handle_socket(
         config.agents.insert(agent_alias.clone(), derived);
     }
     let config = config;
-    let ws_memory = match resolve_ws_memory_handle(&config, &agent_alias).await {
-        Ok(memory) => memory,
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "agent": &agent_alias,
-                        "error": format!("{e:#}"),
-                    })),
-                "WS per-agent memory resolution failed; consolidation disabled for connection"
-            );
-            None
-        }
-    };
+    let ws_memory =
+        match resolve_ws_memory_handle(&config, &agent_alias, namespace.as_deref()).await {
+            Ok(memory) => memory,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "agent": &agent_alias,
+                            "error": format!("{e:#}"),
+                        })),
+                    "WS per-agent memory resolution failed; consolidation disabled for connection"
+                );
+                None
+            }
+        };
     let mut resumed = false;
     let mut message_count: usize = 0;
     let mut effective_name: Option<String> = None;
@@ -1789,6 +1846,23 @@ mod tests {
     use axum::http::HeaderMap;
 
     #[test]
+    fn uuid_namespace_gate_off_admits_anything() {
+        assert!(uuid_namespace_gate_passes(false, "tenant-1"));
+        assert!(uuid_namespace_gate_passes(false, "not-a-uuid"));
+    }
+
+    #[test]
+    fn uuid_namespace_gate_on_requires_uuid() {
+        assert!(uuid_namespace_gate_passes(
+            true,
+            "d8bf4a82-e9c5-491e-946f-1326ffa7f5e4"
+        ));
+        assert!(!uuid_namespace_gate_passes(true, "tenant-1"));
+        assert!(!uuid_namespace_gate_passes(true, "cx_acme"));
+        assert!(!uuid_namespace_gate_passes(true, ""));
+    }
+
+    #[test]
     fn safe_agent_alias_accepts_normal_aliases() {
         assert!(is_safe_agent_alias("empresa-123"));
         assert!(is_safe_agent_alias("cx_acme"));
@@ -2024,7 +2098,7 @@ mod tests {
         agent.memory.backend = MemoryBackendKind::None;
         config.agents.insert("web".to_string(), agent);
 
-        let memory = resolve_ws_memory_handle(&config, "web")
+        let memory = resolve_ws_memory_handle(&config, "web", None)
             .await
             .expect("WS per-agent memory resolution");
 
