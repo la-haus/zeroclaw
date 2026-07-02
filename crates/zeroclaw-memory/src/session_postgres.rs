@@ -21,6 +21,18 @@
 //! reply — blocking a `recv`, not starting a runtime, so no panic. The client
 //! is also dropped on that thread when the channel closes, which is where
 //! `Client::drop`'s own `block_on` is safe.
+//!
+//! ## Performance note (sync trait × remote Postgres)
+//!
+//! `SessionBackend` is synchronous, so the gateway calls these methods directly
+//! from Tokio worker threads and each call blocks the worker until the round
+//! trip to RDS completes (tens of ms), unlike the local SQLite backend (<1ms).
+//! Under heavy concurrency this can starve workers and add tail latency. Session
+//! ops are low-frequency (a handful per turn: load on connect, append on turn
+//! end, state transitions) so the impact is bounded, but a future async
+//! `SessionBackend` (or a `spawn_blocking` wrapper at the call sites) would
+//! remove it. The connection is reused across calls and self-heals on drop
+//! (see the reconnect check in the worker loop), so there is no per-op connect.
 
 use crate::postgres::{connect_postgres, quote_identifier, validate_identifier};
 use anyhow::{Context, Result};
@@ -85,6 +97,32 @@ impl PostgresSessionBackend {
                         // Run jobs until the backend (and its Sender) is dropped;
                         // `client` is then dropped here, off the Tokio runtime.
                         while let Ok(job) = job_rx.recv() {
+                            // Self-heal a dropped connection: RDS closes idle
+                            // connections (timeouts, restarts, network blips), and
+                            // without this every session op would fail permanently
+                            // for the pod's lifetime. Reconnect before serving the
+                            // job; if reconnect fails, run against the stale client
+                            // so the job's own error handling returns cleanly (and
+                            // the next job retries the reconnect).
+                            if client.is_closed() {
+                                match connect() {
+                                    Ok(fresh) => client = fresh,
+                                    Err(e) => {
+                                        ::zeroclaw_log::record!(
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Note
+                                            )
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                            .with_attrs(::serde_json::json!({
+                                                "error": format!("{e:#}"),
+                                            })),
+                                            "PostgreSQL session connection lost; reconnect failed, will retry on next op"
+                                        );
+                                    }
+                                }
+                            }
                             job(&mut client);
                         }
                     }
@@ -229,11 +267,15 @@ impl SessionBackend for PostgresSessionBackend {
         );
         self.with_client(
             move |c| {
-                c.execute(&insert, &[&key, &role, &content, &now])
+                // Atomic: the message row and the metadata counter/last_activity
+                // must both land or neither, or a mid-op failure would orphan a
+                // message or skew the count.
+                let mut tx = c.transaction().map_err(std::io::Error::other)?;
+                tx.execute(&insert, &[&key, &role, &content, &now])
                     .map_err(std::io::Error::other)?;
-                c.execute(&upsert, &[&key, &now])
+                tx.execute(&upsert, &[&key, &now])
                     .map_err(std::io::Error::other)?;
-                Ok(())
+                tx.commit().map_err(std::io::Error::other)
             },
             Err(std::io::Error::other("session worker unavailable")),
         )
@@ -253,10 +295,12 @@ impl SessionBackend for PostgresSessionBackend {
         );
         self.with_client(
             move |c| {
-                let n = c.execute(&del, &[&key]).map_err(std::io::Error::other)?;
+                let mut tx = c.transaction().map_err(std::io::Error::other)?;
+                let n = tx.execute(&del, &[&key]).map_err(std::io::Error::other)?;
                 if n > 0 {
-                    c.execute(&dec, &[&key]).map_err(std::io::Error::other)?;
+                    tx.execute(&dec, &[&key]).map_err(std::io::Error::other)?;
                 }
+                tx.commit().map_err(std::io::Error::other)?;
                 Ok(n > 0)
             },
             Err(std::io::Error::other("session worker unavailable")),
@@ -310,8 +354,10 @@ impl SessionBackend for PostgresSessionBackend {
         );
         self.with_client(
             move |c| {
-                let n = c.execute(&del, &[&key]).map_err(std::io::Error::other)?;
-                c.execute(&reset, &[&key]).map_err(std::io::Error::other)?;
+                let mut tx = c.transaction().map_err(std::io::Error::other)?;
+                let n = tx.execute(&del, &[&key]).map_err(std::io::Error::other)?;
+                tx.execute(&reset, &[&key]).map_err(std::io::Error::other)?;
+                tx.commit().map_err(std::io::Error::other)?;
                 Ok(n as usize)
             },
             Err(std::io::Error::other("session worker unavailable")),
@@ -327,11 +373,13 @@ impl SessionBackend for PostgresSessionBackend {
         let del_meta = format!("DELETE FROM {} WHERE session_key = $1", self.qualified_meta);
         self.with_client(
             move |c| {
-                c.execute(&del_msgs, &[&key])
+                let mut tx = c.transaction().map_err(std::io::Error::other)?;
+                tx.execute(&del_msgs, &[&key])
                     .map_err(std::io::Error::other)?;
-                let n = c
+                let n = tx
                     .execute(&del_meta, &[&key])
                     .map_err(std::io::Error::other)?;
+                tx.commit().map_err(std::io::Error::other)?;
                 Ok(n > 0)
             },
             Err(std::io::Error::other("session worker unavailable")),

@@ -81,6 +81,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::ChannelApprovalResponse;
+#[cfg(feature = "memory-postgres")]
+use {parking_lot::Mutex, std::collections::HashMap};
 
 /// Default wall-clock budget for the operator to answer an
 /// `approval_request` frame before the channel auto-denies. Mirrors the
@@ -248,6 +250,63 @@ fn is_safe_agent_alias(alias: &str) -> bool {
 /// tenants (enterprise codes) still connect normally.
 fn uuid_namespace_gate_passes(require_uuid: bool, schema_key: &str) -> bool {
     !require_uuid || uuid::Uuid::parse_str(schema_key).is_ok()
+}
+
+/// Process-wide cache of per-namespace Postgres session backends, keyed by
+/// tenant namespace.
+///
+/// Each backend owns a dedicated OS thread + one long-lived Postgres connection
+/// and runs schema/table DDL on init. Creating one per WebSocket connection
+/// would exhaust the RDS connection limit and thrash `CREATE TABLE IF NOT
+/// EXISTS` locks under concurrency. A pod serves a bounded set of tenants, so a
+/// backend is effectively a singleton per `(process, namespace)`: build it once
+/// on first use and share the `Arc` across every connection for that tenant.
+/// The backend self-heals a dropped connection internally, so a cached entry
+/// stays valid across DB restarts and never needs eviction.
+#[cfg(feature = "memory-postgres")]
+static NAMESPACE_SESSION_BACKENDS: std::sync::OnceLock<
+    Mutex<HashMap<String, Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>>,
+> = std::sync::OnceLock::new();
+
+/// Fetch (or lazily build) the cached per-namespace session backend. Returns
+/// `None` when storage is not Postgres / has no placeholder (caller falls back
+/// to the global store) or when init fails (logged once per failed attempt).
+#[cfg(feature = "memory-postgres")]
+fn get_or_init_namespace_session_backend(
+    config: &zeroclaw_config::schema::Config,
+    namespace: &str,
+) -> Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>> {
+    let cache = NAMESPACE_SESSION_BACKENDS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(existing) = cache.lock().get(namespace) {
+        return Some(Arc::clone(existing));
+    }
+    // Build outside the lock is not required (creation is per-namespace-once and
+    // the lock is process-wide short-lived), but we keep the lock to make the
+    // check-then-insert atomic so two racing connections don't both connect.
+    let mut guard = cache.lock();
+    if let Some(existing) = guard.get(namespace) {
+        return Some(Arc::clone(existing));
+    }
+    match zeroclaw_memory::create_session_backend_for_namespace(config, namespace) {
+        Ok(Some(backend)) => {
+            guard.insert(namespace.to_string(), Arc::clone(&backend));
+            Some(backend)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "namespace": namespace,
+                        "error": format!("{e:#}"),
+                    })),
+                "WS per-namespace session backend init failed; using global session store"
+            );
+            None
+        }
+    }
 }
 
 /// GET /ws/chat — WebSocket upgrade for agent chat
@@ -458,22 +517,7 @@ async fn handle_socket(
     #[cfg(feature = "memory-postgres")]
     let ws_session_backend: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>> =
         match namespace.as_deref() {
-            Some(ns) => match zeroclaw_memory::create_session_backend_for_namespace(&config, ns) {
-                Ok(backend) => backend,
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "namespace": ns,
-                                "error": format!("{e:#}"),
-                            })),
-                        "WS per-namespace session backend init failed; using global session store"
-                    );
-                    None
-                }
-            },
+            Some(ns) => get_or_init_namespace_session_backend(&config, ns),
             None => None,
         };
     #[cfg(not(feature = "memory-postgres"))]
