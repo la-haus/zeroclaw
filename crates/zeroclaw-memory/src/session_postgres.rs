@@ -242,7 +242,25 @@ impl SessionBackend for PostgresSessionBackend {
                         created_at: Some(row.get::<_, DateTime<Utc>>("created_at")),
                     })
                     .collect(),
-                Err(_) => Vec::new(),
+                // A transient query error must not silently masquerade as an
+                // empty (new) session — the gateway would report `resumed=false`
+                // and the user would perceive the agent as having forgotten the
+                // conversation. We can't propagate (the trait returns a plain
+                // Vec), but we log loudly so a "lost history" incident is
+                // traceable to a query blip rather than real data loss.
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "session_key": &key,
+                                "error": format!("{e}"),
+                            })),
+                        "PostgreSQL session load failed; returning empty history (session will look new — likely a query blip, not deletion)"
+                    );
+                    Vec::new()
+                }
             },
             Vec::new(),
         )

@@ -252,6 +252,23 @@ fn uuid_namespace_gate_passes(require_uuid: bool, schema_key: &str) -> bool {
     !require_uuid || uuid::Uuid::parse_str(schema_key).is_ok()
 }
 
+/// One cache slot for a namespace's session backend.
+#[cfg(feature = "memory-postgres")]
+enum CachedSessionBackend {
+    /// Successfully built and shared across connections for the tenant.
+    Ready(Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+    /// Last init attempt failed at this instant. Short-circuits retries for
+    /// `NEGATIVE_CACHE_TTL` so a down RDS doesn't make every incoming WS
+    /// re-spawn a thread and block on a doomed connect+DDL.
+    Failed(std::time::Instant),
+}
+
+/// How long a failed init is remembered before the next connection retries.
+/// Short so recovery is fast once RDS is back, long enough to stop a
+/// connection-storm from hammering a down database.
+#[cfg(feature = "memory-postgres")]
+const NEGATIVE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Process-wide cache of per-namespace Postgres session backends, keyed by
 /// tenant namespace.
 ///
@@ -261,39 +278,51 @@ fn uuid_namespace_gate_passes(require_uuid: bool, schema_key: &str) -> bool {
 /// EXISTS` locks under concurrency. A pod serves a bounded set of tenants, so a
 /// backend is effectively a singleton per `(process, namespace)`: build it once
 /// on first use and share the `Arc` across every connection for that tenant.
-/// The backend self-heals a dropped connection internally, so a cached entry
-/// stays valid across DB restarts and never needs eviction.
+/// The backend self-heals a dropped connection internally, so a cached success
+/// stays valid across DB restarts. Failures are cached negatively with a short
+/// TTL (see [`CachedSessionBackend::Failed`]) so an outage can't turn every
+/// connection into a blocking connect+DDL retry.
 #[cfg(feature = "memory-postgres")]
 static NAMESPACE_SESSION_BACKENDS: std::sync::OnceLock<
-    Mutex<HashMap<String, Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>>,
+    Mutex<HashMap<String, CachedSessionBackend>>,
 > = std::sync::OnceLock::new();
 
 /// Fetch (or lazily build) the cached per-namespace session backend. Returns
 /// `None` when storage is not Postgres / has no placeholder (caller falls back
-/// to the global store) or when init fails (logged once per failed attempt).
+/// to the global store), when a recent init failed (negative-cached), or when
+/// this attempt fails.
 #[cfg(feature = "memory-postgres")]
 fn get_or_init_namespace_session_backend(
     config: &zeroclaw_config::schema::Config,
     namespace: &str,
 ) -> Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>> {
     let cache = NAMESPACE_SESSION_BACKENDS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(existing) = cache.lock().get(namespace) {
-        return Some(Arc::clone(existing));
-    }
-    // Build outside the lock is not required (creation is per-namespace-once and
-    // the lock is process-wide short-lived), but we keep the lock to make the
-    // check-then-insert atomic so two racing connections don't both connect.
+    // Hold the lock across check-then-insert so a connection storm for the same
+    // namespace only triggers one connect attempt (the rest see Ready/Failed).
     let mut guard = cache.lock();
-    if let Some(existing) = guard.get(namespace) {
-        return Some(Arc::clone(existing));
+    match guard.get(namespace) {
+        Some(CachedSessionBackend::Ready(backend)) => return Some(Arc::clone(backend)),
+        Some(CachedSessionBackend::Failed(at)) if at.elapsed() < NEGATIVE_CACHE_TTL => {
+            return None;
+        }
+        _ => {}
     }
     match zeroclaw_memory::create_session_backend_for_namespace(config, namespace) {
         Ok(Some(backend)) => {
-            guard.insert(namespace.to_string(), Arc::clone(&backend));
+            guard.insert(
+                namespace.to_string(),
+                CachedSessionBackend::Ready(Arc::clone(&backend)),
+            );
             Some(backend)
         }
+        // Not a failure: storage isn't Postgres / has no placeholder. Don't
+        // negative-cache (it's a cheap config check with no connection).
         Ok(None) => None,
         Err(e) => {
+            guard.insert(
+                namespace.to_string(),
+                CachedSessionBackend::Failed(std::time::Instant::now()),
+            );
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -301,8 +330,9 @@ fn get_or_init_namespace_session_backend(
                     .with_attrs(::serde_json::json!({
                         "namespace": namespace,
                         "error": format!("{e:#}"),
+                        "retry_after_secs": NEGATIVE_CACHE_TTL.as_secs(),
                     })),
-                "WS per-namespace session backend init failed; using global session store"
+                "WS per-namespace session backend init failed; using global session store (negative-cached)"
             );
             None
         }
