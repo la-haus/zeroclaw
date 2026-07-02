@@ -89,6 +89,9 @@ default = ["schema-export", "a2a"]
 # no a2a-rs/protobuf footprint.
 a2a = []
 plugins-wasm = ["dep:zeroclaw-plugins"]
+# Per-tenant Postgres session persistence: routes WS sessions to the enterprise
+# schema (cx_<namespace>) via zeroclaw-memory's PostgresSessionBackend.
+memory-postgres = ["zeroclaw-memory/memory-postgres"]
 webauthn = ["zeroclaw-runtime/webauthn"]
 observability-prometheus = ["zeroclaw-runtime/observability-prometheus"]
 channel-acp-server = ["zeroclaw-channels/channel-acp-server"]
