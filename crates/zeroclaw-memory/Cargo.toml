@@ -11,6 +11,10 @@ zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-spawn.workspace = true
+# Session backend trait (SessionBackend/SessionMetadata/SessionState). Optional
+# so the base build doesn't pull rusqlite; enabled with `memory-postgres` where
+# `PostgresSessionBackend` implements the trait.
+zeroclaw-infra = { workspace = true, optional = true }
 zeroclaw-config = { workspace = true, default-features = false }
 anyhow = "1.0"
 async-trait = "0.1"
@@ -33,6 +37,7 @@ memory-postgres = [
     "dep:postgres",
     "dep:native-tls",
     "dep:postgres-native-tls",
+    "dep:zeroclaw-infra",
     "zeroclaw-config/memory-postgres",
 ]
 

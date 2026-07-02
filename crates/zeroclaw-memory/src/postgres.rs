@@ -30,13 +30,13 @@ const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 /// clean-shutdown message. That panics if called from inside an existing Tokio
 /// runtime. Wrapping the `Arc<Mutex<Client>>` in this type ensures the final
 /// drop always happens on a plain OS thread.
-struct DropOnThread<T: Send + 'static>(Option<T>);
+pub(crate) struct DropOnThread<T: Send + 'static>(Option<T>);
 
 impl<T: Send + 'static> DropOnThread<T> {
-    fn new(value: T) -> Self {
+    pub(crate) fn new(value: T) -> Self {
         Self(Some(value))
     }
-    fn get(&self) -> &T {
+    pub(crate) fn get(&self) -> &T {
         self.0.as_ref().expect("DropOnThread value already taken")
     }
 }
@@ -359,7 +359,7 @@ where
     })?
 }
 
-fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
+pub(crate) fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
     if value.is_empty() {
         anyhow::bail!("{field_name} must not be empty");
     }
@@ -382,7 +382,7 @@ fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn quote_identifier(value: &str) -> String {
+pub(crate) fn quote_identifier(value: &str) -> String {
     format!("\"{value}\"")
 }
 
@@ -393,7 +393,7 @@ fn quote_identifier(value: &str) -> String {
 /// an optional CA from `PGSSLROOTCERT` (e.g. the Amazon RDS global bundle). Set
 /// `ZEROCLAW_PG_TLS_INSECURE=1` to encrypt without verifying the server cert
 /// (testing only — do not use in production).
-fn connect_postgres(config: &postgres::Config) -> Result<Client> {
+pub(crate) fn connect_postgres(config: &postgres::Config) -> Result<Client> {
     use postgres::config::SslMode;
 
     if matches!(config.get_ssl_mode(), SslMode::Disable) {
@@ -460,7 +460,7 @@ fn split_pem_certificates(pem: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-fn env_is_truthy(key: &str) -> bool {
+pub(crate) fn env_is_truthy(key: &str) -> bool {
     std::env::var(key)
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
