@@ -45,6 +45,8 @@ pub mod postgres;
 pub mod qdrant;
 pub mod response_cache;
 pub mod retrieval;
+#[cfg(feature = "memory-postgres")]
+pub mod session_postgres;
 pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
@@ -71,6 +73,9 @@ pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
 pub use retrieval::{RetrievalConfig, RetrievalPipeline};
+#[cfg(feature = "memory-postgres")]
+#[allow(unused_imports)]
+pub use session_postgres::PostgresSessionBackend;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
@@ -519,7 +524,7 @@ pub fn create_memory_for_migration(
 /// leading `_` when the first char is not a letter/underscore, so an agent
 /// alias (e.g. a UUID with hyphens) is a valid PostgreSQL schema identifier
 /// component. `d8bf4a82-e9c5-...` -> `d8bf4a82_e9c5_...`.
-fn sanitize_schema_ident(alias: &str) -> String {
+pub(crate) fn sanitize_schema_ident(alias: &str) -> String {
     let mut s: String = alias
         .chars()
         .map(|c| {
@@ -670,6 +675,37 @@ pub async fn create_memory_for_agent_in_namespace(
 
     let scoped = AgentScopedMemory::new(inner_arc, bound_id, allowlist_ids);
     Ok(Arc::new(scoped))
+}
+
+/// Build a per-tenant Postgres session backend scoped to `namespace`.
+///
+/// Mirrors [`create_memory_for_agent_in_namespace`]: when the active storage is
+/// Postgres and its schema carries the `{namespace}`/`{alias}` placeholder, the
+/// session tables land in the same per-enterprise schema `cx_<namespace>` so
+/// sessions are tenant-isolated and survive pod restarts. Returns `Ok(None)`
+/// when storage is not Postgres (caller keeps the local/default backend), or
+/// when the schema has no placeholder (no per-tenant routing requested).
+#[cfg(feature = "memory-postgres")]
+pub fn create_session_backend_for_namespace(
+    config: &zeroclaw_config::schema::Config,
+    namespace: &str,
+) -> anyhow::Result<Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>> {
+    use zeroclaw_config::schema::ActiveStorage;
+    let ActiveStorage::Postgres(pg) = config.resolve_active_storage() else {
+        return Ok(None);
+    };
+    if !(pg.schema.contains("{namespace}") || pg.schema.contains("{alias}")) {
+        return Ok(None);
+    }
+    let db_url = pg
+        .db_url
+        .as_deref()
+        .filter(|u| !u.trim().is_empty())
+        .context("Postgres storage selected but `db_url` is empty")?;
+    let schema = substitute_schema_placeholder(&pg.schema, namespace);
+    let backend =
+        session_postgres::PostgresSessionBackend::new(db_url, &schema, pg.connect_timeout_secs)?;
+    Ok(Some(Arc::new(backend)))
 }
 
 /// Factory: create an optional response cache from config.

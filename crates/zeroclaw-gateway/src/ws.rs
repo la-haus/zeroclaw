@@ -81,6 +81,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::ChannelApprovalResponse;
+#[cfg(feature = "memory-postgres")]
+use {parking_lot::Mutex, std::collections::HashMap};
 
 /// Default wall-clock budget for the operator to answer an
 /// `approval_request` frame before the channel auto-denies. Mirrors the
@@ -248,6 +250,93 @@ fn is_safe_agent_alias(alias: &str) -> bool {
 /// tenants (enterprise codes) still connect normally.
 fn uuid_namespace_gate_passes(require_uuid: bool, schema_key: &str) -> bool {
     !require_uuid || uuid::Uuid::parse_str(schema_key).is_ok()
+}
+
+/// One cache slot for a namespace's session backend.
+#[cfg(feature = "memory-postgres")]
+enum CachedSessionBackend {
+    /// Successfully built and shared across connections for the tenant.
+    Ready(Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+    /// Last init attempt failed at this instant. Short-circuits retries for
+    /// `NEGATIVE_CACHE_TTL` so a down RDS doesn't make every incoming WS
+    /// re-spawn a thread and block on a doomed connect+DDL.
+    Failed(std::time::Instant),
+}
+
+/// How long a failed init is remembered before the next connection retries.
+/// Short so recovery is fast once RDS is back, long enough to stop a
+/// connection-storm from hammering a down database.
+#[cfg(feature = "memory-postgres")]
+const NEGATIVE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Process-wide cache of per-namespace Postgres session backends, keyed by
+/// tenant namespace.
+///
+/// Each backend owns a dedicated OS thread + one long-lived Postgres connection
+/// and runs schema/table DDL on init. Creating one per WebSocket connection
+/// would exhaust the RDS connection limit and thrash `CREATE TABLE IF NOT
+/// EXISTS` locks under concurrency. A pod serves a bounded set of tenants, so a
+/// backend is effectively a singleton per `(process, namespace)`: build it once
+/// on first use and share the `Arc` across every connection for that tenant.
+/// The backend self-heals a dropped connection internally, so a cached success
+/// stays valid across DB restarts. Failures are cached negatively with a short
+/// TTL (see [`CachedSessionBackend::Failed`]) so an outage can't turn every
+/// connection into a blocking connect+DDL retry.
+#[cfg(feature = "memory-postgres")]
+static NAMESPACE_SESSION_BACKENDS: std::sync::OnceLock<
+    Mutex<HashMap<String, CachedSessionBackend>>,
+> = std::sync::OnceLock::new();
+
+/// Fetch (or lazily build) the cached per-namespace session backend. Returns
+/// `None` when storage is not Postgres / has no placeholder (caller falls back
+/// to the global store), when a recent init failed (negative-cached), or when
+/// this attempt fails.
+#[cfg(feature = "memory-postgres")]
+fn get_or_init_namespace_session_backend(
+    config: &zeroclaw_config::schema::Config,
+    namespace: &str,
+) -> Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>> {
+    let cache = NAMESPACE_SESSION_BACKENDS.get_or_init(|| Mutex::new(HashMap::new()));
+    // Hold the lock across check-then-insert so a connection storm for the same
+    // namespace only triggers one connect attempt (the rest see Ready/Failed).
+    let mut guard = cache.lock();
+    match guard.get(namespace) {
+        Some(CachedSessionBackend::Ready(backend)) => return Some(Arc::clone(backend)),
+        Some(CachedSessionBackend::Failed(at)) if at.elapsed() < NEGATIVE_CACHE_TTL => {
+            return None;
+        }
+        _ => {}
+    }
+    match zeroclaw_memory::create_session_backend_for_namespace(config, namespace) {
+        Ok(Some(backend)) => {
+            guard.insert(
+                namespace.to_string(),
+                CachedSessionBackend::Ready(Arc::clone(&backend)),
+            );
+            Some(backend)
+        }
+        // Not a failure: storage isn't Postgres / has no placeholder. Don't
+        // negative-cache (it's a cheap config check with no connection).
+        Ok(None) => None,
+        Err(e) => {
+            guard.insert(
+                namespace.to_string(),
+                CachedSessionBackend::Failed(std::time::Instant::now()),
+            );
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "namespace": namespace,
+                        "error": format!("{e:#}"),
+                        "retry_after_secs": NEGATIVE_CACHE_TTL.as_secs(),
+                    })),
+                "WS per-namespace session backend init failed; using global session store (negative-cached)"
+            );
+            None
+        }
+    }
 }
 
 /// GET /ws/chat — WebSocket upgrade for agent chat
@@ -449,6 +538,26 @@ async fn handle_socket(
         config.agents.insert(agent_alias.clone(), derived);
     }
     let config = config;
+    // Per-tenant session persistence: when a namespace is set and storage is
+    // Postgres, route this connection's session to the enterprise schema
+    // (`cx_<namespace>.sessions`) instead of the process-global (local/SQLite)
+    // store, so sessions survive pod restarts and stay tenant-isolated. Falls
+    // back to the global backend when not applicable (no namespace, non-Postgres
+    // storage, or the per-namespace init fails).
+    #[cfg(feature = "memory-postgres")]
+    let ws_session_backend: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>> =
+        match namespace.as_deref() {
+            Some(ns) => get_or_init_namespace_session_backend(&config, ns),
+            None => None,
+        };
+    #[cfg(not(feature = "memory-postgres"))]
+    let ws_session_backend: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>> = None;
+    // Effective session store for this connection: per-namespace when available,
+    // else the process-global backend.
+    let session_backend = ws_session_backend
+        .as_ref()
+        .or(state.session_backend.as_ref());
+
     let ws_memory =
         match resolve_ws_memory_handle(&config, &agent_alias, namespace.as_deref()).await {
             Ok(memory) => memory,
@@ -470,7 +579,7 @@ async fn handle_socket(
     let mut message_count: usize = 0;
     let mut effective_name: Option<String> = None;
     let mut stored_messages = Vec::new();
-    if let Some(ref backend) = state.session_backend {
+    if let Some(backend) = session_backend {
         let messages = backend.load(&session_key);
         if !messages.is_empty() {
             message_count = messages.len();
@@ -733,6 +842,7 @@ async fn handle_socket(
                         &mut approval_event_rx,
                         &pending_approvals,
                         &ws_memory,
+                        session_backend,
                         &content,
                         &session_key,
                     )
@@ -743,9 +853,9 @@ async fn handle_socket(
                 match state.session_queue.acquire(&session_key).await {
                     Ok(_session_guard) => {
                         handle_notification_frame(
-                            &state,
                             &mut agent,
                             &mut sender,
+                            session_backend,
                             &session_key,
                             &parsed,
                         )
@@ -868,9 +978,9 @@ async fn handle_socket(
                         }
                     };
                     handle_notification_frame(
-                        &state,
                         &mut agent,
                         &mut sender,
+                            session_backend,
                         &session_key,
                         &parsed,
                     )
@@ -931,6 +1041,7 @@ async fn handle_socket(
                     &mut approval_event_rx,
                     &pending_approvals,
                     &ws_memory,
+                        session_backend,
                     &content,
                     &session_key,
                 )
@@ -1152,9 +1263,9 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
 /// `auto_save` path is bypassed entirely — `turn_streamed` is never called,
 /// so brain.db stays clean.
 async fn handle_notification_frame(
-    state: &AppState,
     agent: &mut zeroclaw_runtime::agent::Agent,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    session_backend: Option<&Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
     session_key: &str,
     parsed: &serde_json::Value,
 ) {
@@ -1179,7 +1290,7 @@ async fn handle_notification_frame(
     agent.seed_history(std::slice::from_ref(&msg));
 
     let mut persisted = false;
-    if let Some(ref backend) = state.session_backend
+    if let Some(backend) = session_backend
         && backend.append(session_key, &msg).is_ok()
     {
         persisted = true;
@@ -1204,6 +1315,7 @@ async fn process_chat_message(
     approval_event_rx: &mut tokio::sync::mpsc::Receiver<zeroclaw_api::agent::TurnEvent>,
     pending_approvals: &PendingApprovals,
     ws_memory: &Option<Arc<dyn zeroclaw_memory::Memory>>,
+    session_backend: Option<&Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
     content: &str,
     session_key: &str,
 ) {
@@ -1241,7 +1353,7 @@ async fn process_chat_message(
 
     // Set session state to running
     let turn_id = uuid::Uuid::new_v4().to_string();
-    if let Some(ref backend) = state.session_backend {
+    if let Some(backend) = session_backend {
         let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
     }
 
@@ -1535,7 +1647,7 @@ async fn process_chat_message(
     };
 
     if was_cancelled {
-        if let Some(ref backend) = state.session_backend {
+        if let Some(backend) = session_backend {
             // #7126: `DELETE /api/sessions/{id}` cancels the token and then
             // synchronously wipes the session row. The streaming task then
             // wakes up here with `was_cancelled = true`. If we blindly
@@ -1601,7 +1713,7 @@ async fn process_chat_message(
         // so on a deleted session it's a harmless no-op (0 rows updated)
         // for SQLite but we still guard for cheap consistency with the
         // append path above.
-        if let Some(ref backend) = state.session_backend
+        if let Some(backend) = session_backend
             && backend.session_exists(session_key)
         {
             let _ = backend.set_session_state(session_key, "idle", None);
@@ -1636,7 +1748,7 @@ async fn process_chat_message(
 
     match result {
         Ok(outcome) => {
-            if let Some(ref backend) = state.session_backend {
+            if let Some(backend) = session_backend {
                 persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
             }
 
@@ -1705,7 +1817,7 @@ async fn process_chat_message(
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
             // Set session state to idle
-            if let Some(ref backend) = state.session_backend {
+            if let Some(backend) = session_backend {
                 let _ = backend.set_session_state(session_key, "idle", None);
             }
 
@@ -1737,14 +1849,14 @@ async fn process_chat_message(
             );
         }
         Err(e) => {
-            if let Some(ref backend) = state.session_backend
+            if let Some(backend) = session_backend
                 && !e.new_messages.is_empty()
             {
                 persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
             }
 
             // Set session state to error
-            if let Some(ref backend) = state.session_backend {
+            if let Some(backend) = session_backend {
                 let _ = backend.set_session_state(session_key, "error", Some(&turn_id));
             }
 
