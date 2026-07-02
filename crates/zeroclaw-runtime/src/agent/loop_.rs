@@ -382,6 +382,7 @@ pub fn filter_by_allowed_tools(
 }
 
 // Re-export from zeroclaw-types for backwards compatibility.
+pub use zeroclaw_api::TOOL_LOOP_NAMESPACE;
 pub use zeroclaw_api::TOOL_LOOP_SESSION_KEY;
 pub use zeroclaw_api::TOOL_LOOP_THREAD_ID;
 
@@ -414,6 +415,17 @@ where
     F: std::future::Future,
 {
     TOOL_LOOP_SESSION_KEY.scope(session_key, future).await
+}
+
+/// Run a future with the tenant namespace set in task-local storage.
+/// The scope wraps the entire agent turn, so every tool invoked during the
+/// turn sees the connection's namespace. The shell tools read this to expose
+/// `ZEROCLAW_NAMESPACE` to skills for per-tenant filtering.
+pub async fn scope_namespace<F>(namespace: Option<String>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TOOL_LOOP_NAMESPACE.scope(namespace, future).await
 }
 
 /// Computes the list of MCP tool names that should be excluded for a given turn

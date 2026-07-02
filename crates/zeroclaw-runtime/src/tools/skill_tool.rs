@@ -132,6 +132,20 @@ fn get_session_id() -> Option<String> {
         .filter(|key| !key.is_empty())
 }
 
+/// Name of the environment variable that carries the turn's tenant namespace
+/// into skill shell tools, so skills filter downstream services by tenant.
+const NAMESPACE_ENV_VAR: &str = "ZEROCLAW_NAMESPACE";
+
+/// The tenant namespace for the current turn, or `None` when unscoped /
+/// single-tenant. Empty values are treated as absent.
+fn get_namespace() -> Option<String> {
+    zeroclaw_api::TOOL_LOOP_NAMESPACE
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .filter(|ns| !ns.is_empty())
+}
+
 /// A tool derived from a skill's `[[tools]]` section that executes shell commands.
 pub struct SkillShellTool {
     tool_name: String,
@@ -281,6 +295,10 @@ impl Tool for SkillShellTool {
         // Injected after env_clear so it survives; absent when the turn is unscoped.
         if let Some(session_id) = get_session_id() {
             cmd.env(SESSION_ID_ENV_VAR, session_id);
+        }
+        // Tenant namespace for per-tenant filtering; absent for single-tenant turns.
+        if let Some(namespace) = get_namespace() {
+            cmd.env(NAMESPACE_ENV_VAR, namespace);
         }
 
         let result =

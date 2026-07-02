@@ -258,6 +258,18 @@ fn get_session_id() -> Option<String> {
         .filter(|key| !key.is_empty())
 }
 
+/// Name of the environment variable that carries the turn's tenant namespace
+/// into shell tools, so skills can filter downstream services by tenant.
+pub(crate) const NAMESPACE_ENV_VAR: &str = "ZEROCLAW_NAMESPACE";
+
+fn get_namespace() -> Option<String> {
+    zeroclaw_api::TOOL_LOOP_NAMESPACE
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .filter(|ns| !ns.is_empty())
+}
+
 #[async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {
@@ -359,6 +371,11 @@ impl Tool for ShellTool {
         // Injected after env_clear so it survives; absent when the turn is unscoped.
         if let Some(session_id) = get_session_id() {
             cmd.env(SESSION_ID_ENV_VAR, session_id);
+        }
+        // Tenant namespace for per-tenant filtering in a multi-tenant pod; absent
+        // when the turn has no namespace (single-tenant).
+        if let Some(namespace) = get_namespace() {
+            cmd.env(NAMESPACE_ENV_VAR, namespace);
         }
 
         // Overlay TUI env on top of the safe-env snapshot. TUI vars win on
@@ -572,6 +589,28 @@ mod tests {
     async fn get_session_id_none_for_empty_session_key() {
         let got =
             crate::agent::loop_::scope_session_key(Some(String::new()), async { get_session_id() })
+                .await;
+        assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn get_namespace_returns_scoped_namespace() {
+        let got = crate::agent::loop_::scope_namespace(Some("cx_acme".to_string()), async {
+            get_namespace()
+        })
+        .await;
+        assert_eq!(got, Some("cx_acme".to_string()));
+    }
+
+    #[test]
+    fn get_namespace_none_outside_a_scoped_turn() {
+        assert_eq!(get_namespace(), None);
+    }
+
+    #[tokio::test]
+    async fn get_namespace_none_for_empty_value() {
+        let got =
+            crate::agent::loop_::scope_namespace(Some(String::new()), async { get_namespace() })
                 .await;
         assert_eq!(got, None);
     }

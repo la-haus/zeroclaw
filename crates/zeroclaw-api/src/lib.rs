@@ -46,6 +46,14 @@ tokio::task_local! {
     /// Scoped by gateway and channel turns, read by SessionsCurrentTool.
     pub static TOOL_LOOP_SESSION_KEY: Option<String>;
 
+    /// Tenant namespace for the currently active turn (the schema-isolation key
+    /// from the WebSocket `?namespace=` param, decoupled from the agent alias).
+    /// Scoped per gateway turn, read by the shell tools to expose
+    /// `ZEROCLAW_NAMESPACE` to skills so they filter downstream services
+    /// (Snowflake, backend APIs) by the connection's tenant in a multi-tenant
+    /// pod. `None` for single-tenant / non-namespaced turns.
+    pub static TOOL_LOOP_NAMESPACE: Option<String>;
+
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.
     pub static NATIVE_THINKING_OVERRIDE: Option<crate::model_provider::NativeThinkingParams>;
