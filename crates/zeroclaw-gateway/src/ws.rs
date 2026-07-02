@@ -1381,6 +1381,10 @@ async fn process_chat_message(
     // from the other branch.
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
+    // Clone before the scope so the borrow ends before `agent` is used mutably
+    // inside the turn future. Threads the connection's tenant namespace to every
+    // tool for the whole turn (shell tools expose it as `ZEROCLAW_NAMESPACE`).
+    let turn_namespace = agent.namespace.clone();
     let turn_fut = async {
         use ::zeroclaw_log::Instrument as _;
         let span = ::zeroclaw_log::info_span!(
@@ -1392,20 +1396,23 @@ async fn process_chat_message(
             model = %turn_model,
             channel = "wss",
         );
-        zeroclaw_runtime::agent::loop_::scope_session_key(
-            Some(session_key_owned.clone()),
-            zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
-                turn_usage.clone(),
-                zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                    cost_tracking_context.clone(),
-                    agent
-                        .turn_streamed_with_steering_state(
-                            &content_owned,
-                            event_tx,
-                            Some(cancel_token.clone()),
-                            Some(&mut steering_rx),
-                        )
-                        .instrument(span),
+        zeroclaw_runtime::agent::loop_::scope_namespace(
+            turn_namespace.clone(),
+            zeroclaw_runtime::agent::loop_::scope_session_key(
+                Some(session_key_owned.clone()),
+                zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+                    turn_usage.clone(),
+                    zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                        cost_tracking_context.clone(),
+                        agent
+                            .turn_streamed_with_steering_state(
+                                &content_owned,
+                                event_tx,
+                                Some(cancel_token.clone()),
+                                Some(&mut steering_rx),
+                            )
+                            .instrument(span),
+                    ),
                 ),
             ),
         )
