@@ -938,11 +938,8 @@ async fn resolve_memory_handle(
         Some(a) => a,
         None => {
             if namespace.is_some() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error":
-                        "`namespace` requires `agent` (no per-agent backend to scope)"
-                    })),
+                return Err(bad_request(
+                    "`namespace` requires `agent` (no per-agent backend to scope)",
                 ));
             }
             return Ok(state.mem.clone());
