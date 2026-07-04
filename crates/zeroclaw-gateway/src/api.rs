@@ -74,6 +74,11 @@ pub struct MemoryQuery {
     /// etc.). Omit for the install-wide view.
     #[serde(default)]
     pub agent: Option<String>,
+    /// Tenant/namespace selecting the per-tenant storage schema
+    /// (`cx_<namespace>`) on a multi-tenant pod. Requires `agent`; decouples
+    /// the tenant boundary from the agent identity.
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -85,6 +90,10 @@ pub struct MemoryStoreBody {
     /// to the install-wide memory backend (no per-agent attribution).
     #[serde(default)]
     pub agent: Option<String>,
+    /// Tenant/namespace selecting the per-tenant storage schema. Requires
+    /// `agent`. See [`MemoryQuery::namespace`].
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -93,6 +102,10 @@ pub struct MemoryDeleteQuery {
     /// backend.
     #[serde(default)]
     pub agent: Option<String>,
+    /// Tenant/namespace selecting the per-tenant storage schema. Requires
+    /// `agent`. See [`MemoryQuery::namespace`].
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -904,17 +917,36 @@ pub async fn handle_api_doctor(
 
 /// Resolve a memory handle for the request. When `agent` names a
 /// configured `[agents.<alias>]` entry the handle is built via
-/// `zeroclaw_memory::create_memory_for_agent` so SQL backends filter by
-/// the agent's UUID, Markdown reads only that agent's directory, etc.
+/// `zeroclaw_memory::create_memory_for_agent_in_namespace` so SQL backends
+/// filter by the agent's UUID, Markdown reads only that agent's directory, etc.
 /// Otherwise the install-wide `state.mem` handle is returned (the
 /// dashboard's legacy cross-agent view).
+///
+/// `namespace` decouples the tenant boundary from the agent identity: on a
+/// multi-tenant pod (one alias, N namespaces) it selects the per-tenant storage
+/// schema `cx_<namespace>`, so callers can inspect a specific tenant's memory
+/// through the single service. It only applies when `agent` is also set — a
+/// namespace without an agent has no per-agent backend to scope, so it is
+/// rejected rather than silently returning the cross-agent view.
 async fn resolve_memory_handle(
     state: &AppState,
     agent_alias: Option<&str>,
+    namespace: Option<&str>,
 ) -> Result<std::sync::Arc<dyn zeroclaw_memory::Memory>, (StatusCode, Json<serde_json::Value>)> {
+    let namespace = namespace.map(str::trim).filter(|s| !s.is_empty());
     let alias = match agent_alias.map(str::trim).filter(|s| !s.is_empty()) {
         Some(a) => a,
-        None => return Ok(state.mem.clone()),
+        None => {
+            if namespace.is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":
+                        "`namespace` requires `agent` (no per-agent backend to scope)"
+                    })),
+                ));
+            }
+            return Ok(state.mem.clone());
+        }
     };
     let config = state.config.read().clone();
     if config.agent(alias).is_none() {
@@ -928,16 +960,19 @@ async fn resolve_memory_handle(
     let api_key = config
         .resolved_model_provider_for_agent(alias)
         .and_then(|(_, _, cfg)| cfg.api_key.clone());
-    zeroclaw_memory::create_memory_for_agent(&config, alias, api_key.as_deref())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::json!({"error": format!("Failed to build per-agent memory: {e:#}")}),
-                ),
-            )
-        })
+    zeroclaw_memory::create_memory_for_agent_in_namespace(
+        &config,
+        alias,
+        namespace,
+        api_key.as_deref(),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to build per-agent memory: {e:#}")})),
+        )
+    })
 }
 
 /// GET /api/memory — list or search memory entries
@@ -950,10 +985,13 @@ pub async fn handle_api_memory_list(
         return e.into_response();
     }
 
-    let mem = match resolve_memory_handle(&state, params.agent.as_deref()).await {
-        Ok(m) => m,
-        Err(e) => return e.into_response(),
-    };
+    let mem =
+        match resolve_memory_handle(&state, params.agent.as_deref(), params.namespace.as_deref())
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => return e.into_response(),
+        };
 
     // Use recall when query or time range is provided
     if params.query.is_some() || params.since.is_some() || params.until.is_some() {
@@ -1055,7 +1093,9 @@ pub async fn handle_api_memory_store(
         })
         .unwrap_or(zeroclaw_memory::MemoryCategory::Core);
 
-    let mem = match resolve_memory_handle(&state, body.agent.as_deref()).await {
+    let mem = match resolve_memory_handle(&state, body.agent.as_deref(), body.namespace.as_deref())
+        .await
+    {
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
@@ -1081,10 +1121,13 @@ pub async fn handle_api_memory_delete(
         return e.into_response();
     }
 
-    let mem = match resolve_memory_handle(&state, query.agent.as_deref()).await {
-        Ok(m) => m,
-        Err(e) => return e.into_response(),
-    };
+    let mem =
+        match resolve_memory_handle(&state, query.agent.as_deref(), query.namespace.as_deref())
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => return e.into_response(),
+        };
 
     match mem.forget(&key).await {
         Ok(deleted) => {
@@ -2249,6 +2292,7 @@ mod tests {
                 since: None,
                 until: None,
                 agent: None,
+                namespace: None,
             }),
         )
         .await
@@ -2262,6 +2306,37 @@ mod tests {
         assert_eq!(json["entries"][0]["key"], "huge-memory");
         assert_eq!(json["entries"][0]["category"], "conversation");
         assert_ne!(content, huge);
+    }
+
+    #[tokio::test]
+    async fn resolve_memory_handle_rejects_namespace_without_agent() {
+        // A namespace with no agent has no per-agent backend to scope, so it is
+        // rejected rather than silently returning the cross-agent view.
+        let state = test_state_with_memory(zeroclaw_config::schema::Config::default(), vec![]);
+        match resolve_memory_handle(&state, None, Some("d8bf4a82")).await {
+            Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
+            Ok(_) => panic!("namespace without agent must be a 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_memory_handle_without_agent_or_namespace_is_install_wide() {
+        // Legacy behavior: no agent + no namespace returns the install-wide handle.
+        let state = test_state_with_memory(zeroclaw_config::schema::Config::default(), vec![]);
+        let mem = resolve_memory_handle(&state, None, None)
+            .await
+            .expect("install-wide handle must resolve");
+        assert!(Arc::ptr_eq(&mem, &state.mem));
+    }
+
+    #[tokio::test]
+    async fn resolve_memory_handle_blank_namespace_is_ignored() {
+        // A whitespace-only namespace is treated as absent (no agent → install-wide).
+        let state = test_state_with_memory(zeroclaw_config::schema::Config::default(), vec![]);
+        let mem = resolve_memory_handle(&state, None, Some("   "))
+            .await
+            .expect("blank namespace must not trigger the guard");
+        assert!(Arc::ptr_eq(&mem, &state.mem));
     }
 
     #[tokio::test]
@@ -2280,6 +2355,7 @@ mod tests {
                 since: None,
                 until: None,
                 agent: None,
+                namespace: None,
             }),
         )
         .await
