@@ -135,7 +135,11 @@ impl Observer for DatadogLogObserver {
                     attrs["message_id"] = json!(mid);
                 }
                 if let Some(ns) = namespace {
+                    // Mirror the span tags (`namespace` + `enterprise_code`) onto
+                    // the structured log so log↔trace correlation facets on the
+                    // same tenant key across both surfaces.
                     attrs["namespace"] = json!(ns);
+                    attrs["enterprise_code"] = json!(ns);
                 }
                 if let Some(ch) = channel {
                     attrs["channel"] = json!(ch);

@@ -341,9 +341,14 @@ impl Observer for OtelObserver {
                     span_attrs.push(KeyValue::new("message.id", mid.clone()));
                 }
                 if let Some(ns) = namespace {
-                    // Per-tenant span attribute — filterable in Datadog APM and
+                    // Per-tenant span attributes — filterable in Datadog APM and
                     // any generic OTLP backend (Langfuse reads span attributes).
-                    span_attrs.push(KeyValue::new("zeroclaw.namespace", ns.clone()));
+                    // `namespace` is the flat tag the existing Datadog dashboards
+                    // facet on (`@namespace`); `enterprise_code` is emitted as an
+                    // alias so the pre-multi-tenant `@enterprise_code` facet keeps
+                    // working without a dashboard migration.
+                    span_attrs.push(KeyValue::new("namespace", ns.clone()));
+                    span_attrs.push(KeyValue::new("enterprise_code", ns.clone()));
                 }
                 if langsmith_compat_enabled() {
                     span_attrs.push(KeyValue::new("langsmith.span.kind", "chain"));
@@ -363,7 +368,14 @@ impl Observer for OtelObserver {
                             .push(KeyValue::new("langsmith.metadata.message_id", mid.clone()));
                     }
                     if let Some(ns) = namespace {
-                        span_attrs.push(KeyValue::new("langsmith.metadata.namespace", ns.clone()));
+                        // LangSmith groups per-tenant runs by
+                        // `metadata.enterprise_code` (the same key the old static
+                        // ZEROCLAW_OTEL_METADATA per-pod env used to emit), so keep
+                        // that exact metadata key for dashboard continuity.
+                        span_attrs.push(KeyValue::new(
+                            "langsmith.metadata.enterprise_code",
+                            ns.clone(),
+                        ));
                     }
                     if let Some(ch) = channel {
                         span_attrs.push(KeyValue::new("langsmith.metadata.channel", ch.clone()));
