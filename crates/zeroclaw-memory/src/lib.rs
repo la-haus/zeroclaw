@@ -775,8 +775,10 @@ mod tests {
 
     #[test]
     fn namespace_fallback_forbidden_gates_only_flagged_multi_tenant_schemas() {
-        let mut pg = zeroclaw_config::schema::PostgresStorageConfig::default();
-        pg.schema = "cx_{namespace}".to_string();
+        let mut pg = zeroclaw_config::schema::PostgresStorageConfig {
+            schema: "cx_{namespace}".to_string(),
+            ..Default::default()
+        };
 
         // Default (flag off) preserves the historical alias fallback.
         assert!(!namespace_fallback_forbidden(&pg, None));
