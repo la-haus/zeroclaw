@@ -954,6 +954,21 @@ async fn resolve_memory_handle(
             )})),
         ));
     }
+    // Mirror the WS upgrade's tenant gate on the REST surface: with
+    // `[gateway].require_uuid_namespace` enabled, the effective schema key
+    // (namespace, else the agent alias fallback) must be a well-formed UUID.
+    // Without this, `/api/memory?agent=<alias>` with no namespace would
+    // CREATE SCHEMA cx_<alias> — one schema silently shared across tenants.
+    if config.gateway.require_uuid_namespace {
+        let schema_key = namespace.unwrap_or(alias);
+        if uuid::Uuid::parse_str(schema_key).is_err() {
+            return Err(bad_request(
+                "Invalid tenant namespace — `[gateway].require_uuid_namespace` is enabled, \
+                 so `namespace` (or `agent` when no namespace is given) must be a valid \
+                 UUID; the agent-alias schema fallback is disabled",
+            ));
+        }
+    }
     let api_key = config
         .resolved_model_provider_for_agent(alias)
         .and_then(|(_, _, cfg)| cfg.api_key.clone());

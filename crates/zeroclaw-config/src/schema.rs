@@ -10060,6 +10060,14 @@ pub struct PostgresStorageConfig {
     pub vector_enabled: bool,
     /// Vector dimensions for pgvector embeddings.
     pub vector_dimensions: usize,
+    /// Fail closed on a missing tenant namespace when `schema` is
+    /// multi-tenant (contains `{namespace}`/`{alias}`): refuse to build a
+    /// per-agent memory instead of falling back to the agent alias as the
+    /// schema key. The fallback silently routes every caller that forgets
+    /// the namespace into ONE schema shared across tenants (e.g.
+    /// `cx_onboarding`) — a cross-tenant leak that surfaces as a stray
+    /// schema, never as an error. Off by default (upstream behavior).
+    pub require_namespace: bool,
 }
 
 impl Default for PostgresStorageConfig {
@@ -10071,6 +10079,7 @@ impl Default for PostgresStorageConfig {
             connect_timeout_secs: None,
             vector_enabled: false,
             vector_dimensions: default_pgvector_dimensions(),
+            require_namespace: false,
         }
     }
 }

@@ -555,6 +555,20 @@ fn substitute_schema_placeholder(schema: &str, key: &str) -> String {
         .replace("{alias}", &ident)
 }
 
+/// Whether a per-agent memory build must be refused: the storage schema is
+/// multi-tenant (`{namespace}`/`{alias}` placeholder), no tenant namespace
+/// was given, and `require_namespace` forbids the agent-alias fallback.
+/// Fail-closed guard: the fallback silently routes the caller into one
+/// schema shared across tenants, which never surfaces as an error.
+fn namespace_fallback_forbidden(
+    pg: &zeroclaw_config::schema::PostgresStorageConfig,
+    namespace: Option<&str>,
+) -> bool {
+    namespace.is_none()
+        && pg.require_namespace
+        && (pg.schema.contains("{namespace}") || pg.schema.contains("{alias}"))
+}
+
 /// Build the per-agent memory wrapper for `agent_alias`.
 ///
 /// Wraps the appropriate inner backend with `AgentScopedMemory` (for
@@ -643,6 +657,16 @@ pub async fn create_memory_for_agent_in_namespace(
         zeroclaw_config::schema::ActiveStorage::Postgres(pg)
             if pg.schema.contains("{namespace}") || pg.schema.contains("{alias}") =>
         {
+            if namespace_fallback_forbidden(pg, namespace) {
+                anyhow::bail!(
+                    "multi-tenant storage schema {:?} requires an explicit tenant \
+                     namespace ([storage.postgres].require_namespace = true): refusing \
+                     the agent-alias fallback for agent {:?} — it would route this \
+                     turn's memory into a schema shared by every tenant",
+                    pg.schema,
+                    agent_alias
+                );
+            }
             let mut cloned = pg.clone();
             cloned.schema = substitute_schema_placeholder(&pg.schema, schema_key);
             pg_scoped = cloned;
@@ -748,6 +772,27 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::schema::EmbeddingRouteConfig;
+
+    #[test]
+    fn namespace_fallback_forbidden_gates_only_flagged_multi_tenant_schemas() {
+        let mut pg = zeroclaw_config::schema::PostgresStorageConfig::default();
+        pg.schema = "cx_{namespace}".to_string();
+
+        // Default (flag off) preserves the historical alias fallback.
+        assert!(!namespace_fallback_forbidden(&pg, None));
+
+        pg.require_namespace = true;
+        assert!(namespace_fallback_forbidden(&pg, None));
+        // An explicit namespace always passes.
+        assert!(!namespace_fallback_forbidden(
+            &pg,
+            Some("d8bf4a82-e9c5-491e-946f-1326ffa7f5e4")
+        ));
+
+        // Non-templated schema (single-tenant install) is never gated.
+        pg.schema = "zeroclaw".to_string();
+        assert!(!namespace_fallback_forbidden(&pg, None));
+    }
 
     #[test]
     fn sanitize_schema_ident_maps_uuid_to_snake() {
