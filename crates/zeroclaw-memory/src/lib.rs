@@ -561,9 +561,23 @@ fn namespace_fallback_forbidden(
     pg: &zeroclaw_config::schema::PostgresStorageConfig,
     namespace: Option<&str>,
 ) -> bool {
-    namespace.is_none()
+    namespace.map(str::trim).filter(|s| !s.is_empty()).is_none()
         && pg.require_namespace
         && (pg.schema.contains("{namespace}") || pg.schema.contains("{alias}"))
+}
+
+/// True when the active storage forces an explicit tenant namespace:
+/// Postgres, multi-tenant schema template, and `require_namespace = true`.
+/// Gateways use it to reject namespace-less requests with a clear 400
+/// BEFORE the memory factory turns them into an opaque 500.
+pub fn tenant_namespace_required(config: &zeroclaw_config::schema::Config) -> bool {
+    match config.resolve_active_storage() {
+        zeroclaw_config::schema::ActiveStorage::Postgres(pg) => {
+            pg.require_namespace
+                && (pg.schema.contains("{namespace}") || pg.schema.contains("{alias}"))
+        }
+        _ => false,
+    }
 }
 
 /// Build the per-agent memory wrapper for `agent_alias`.
@@ -647,6 +661,8 @@ pub async fn create_memory_for_agent_in_namespace(
     // identity (agent_id) — one schema, many agents. Falls back to the agent
     // alias, preserving one-alias-one-schema. One pod serves many tenants,
     // schema-isolated, with no per-tenant provisioning (Terraform or code).
+    // Blank namespaces are treated as missing (mirrors the gateways' trim).
+    let namespace = namespace.map(str::trim).filter(|s| !s.is_empty());
     let schema_key = namespace.unwrap_or(agent_alias);
     let active_storage = config.resolve_active_storage();
     let pg_scoped;
@@ -782,6 +798,8 @@ mod tests {
 
         pg.require_namespace = true;
         assert!(namespace_fallback_forbidden(&pg, None));
+        // Blank counts as missing — future callers may skip the trim.
+        assert!(namespace_fallback_forbidden(&pg, Some("  ")));
         // An explicit namespace always passes.
         assert!(!namespace_fallback_forbidden(
             &pg,

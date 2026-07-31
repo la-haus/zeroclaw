@@ -1039,6 +1039,7 @@ impl Agent {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
             agent_alias,
+            None,
             session_cwd,
             initialize_mcp,
             false,
@@ -1074,6 +1075,39 @@ impl Agent {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
             agent_alias,
+            None,
+            session_cwd,
+            initialize_mcp,
+            true,
+            exclude_memory,
+            None,
+            sop_engine,
+            sop_audit,
+            canvas_store,
+        )
+        .await
+    }
+
+    /// Like [`Self::from_config_with_session_cwd_and_mcp_backchannel`] but
+    /// tenant-scoped: `namespace` drives the per-tenant storage schema of the
+    /// agent's OPERATIVE memory (`cx_<namespace>`), not just the post-turn
+    /// consolidation handle. Gateway WS sessions use this so in-turn memory
+    /// writes land in the tenant schema instead of the alias fallback.
+    pub async fn from_config_in_namespace_with_backchannel(
+        config: &Config,
+        agent_alias: &str,
+        namespace: Option<&str>,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
+    ) -> Result<Self> {
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            config,
+            agent_alias,
+            namespace,
             session_cwd,
             initialize_mcp,
             true,
@@ -1103,6 +1137,7 @@ impl Agent {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
             agent_alias,
+            None,
             session_cwd,
             initialize_mcp,
             true,
@@ -1115,9 +1150,11 @@ impl Agent {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn from_config_with_session_cwd_and_mcp_approval_mode(
         config: &Config,
         agent_alias: &str,
+        namespace: Option<&str>,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
         approval_backchannel: bool,
@@ -1200,9 +1237,10 @@ impl Agent {
                     );
                 }
             };
-        let memory: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
+        let memory: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent_in_namespace(
             config,
             agent_alias,
+            namespace,
             agent_model_provider.and_then(|e| e.api_key.as_deref()),
         )
         .await?;
@@ -1226,7 +1264,13 @@ impl Agent {
             (Some(engine), Some(audit)) => (Some(engine), Some(audit)),
             (None, None) if config.sop.sops_dir.is_some() => {
                 let mem: Arc<dyn zeroclaw_memory::Memory> =
-                    zeroclaw_memory::create_memory_for_agent(config, agent_alias, None).await?;
+                    zeroclaw_memory::create_memory_for_agent_in_namespace(
+                        config,
+                        agent_alias,
+                        namespace,
+                        None,
+                    )
+                    .await?;
                 let (engine, audit) =
                     crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, mem);
                 (Some(engine), Some(audit))

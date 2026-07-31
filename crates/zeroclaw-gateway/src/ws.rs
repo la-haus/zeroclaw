@@ -248,7 +248,7 @@ fn is_safe_agent_alias(alias: &str) -> bool {
 /// passes, so an attacker cannot flood the shared database with `CREATE SCHEMA`
 /// for enumerated `tenant-1..N` namespaces (catalog-bloat DoS); UUID-keyed
 /// tenants (enterprise codes) still connect normally.
-fn uuid_namespace_gate_passes(require_uuid: bool, schema_key: &str) -> bool {
+pub(crate) fn uuid_namespace_gate_passes(require_uuid: bool, schema_key: &str) -> bool {
     !require_uuid || uuid::Uuid::parse_str(schema_key).is_ok()
 }
 
@@ -419,6 +419,18 @@ pub async fn handle_ws_chat(
             )
                 .into_response();
         }
+    }
+    // Fail closed BEFORE agent construction: with a multi-tenant schema and
+    // `[storage.postgres].require_namespace`, a namespace-less connection
+    // would only die inside Agent init (opaque AGENT_INIT_FAILED / 1011) and
+    // its sessions would fall back to the process-global store. Reject with
+    // a clear 400 here instead.
+    if namespace.is_none() && zeroclaw_memory::tenant_namespace_required(&state.config.read()) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "Missing tenant namespace — the storage schema is multi-tenant and `[storage.postgres].require_namespace` is enabled, so `?namespace=` is required.",
+        )
+            .into_response();
     }
     {
         // Accept the upgrade when the alias is either explicitly configured
@@ -697,9 +709,10 @@ async fn handle_socket(
     // the per-connection `config` above carries the template-derived entry for
     // on-demand aliases.
     let mut agent =
-        match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd_and_mcp_backchannel(
+        match zeroclaw_runtime::agent::Agent::from_config_in_namespace_with_backchannel(
             &config,
             &agent_alias,
+            namespace.as_deref(),
             Some(&session_cwd),
             true,
             false,
