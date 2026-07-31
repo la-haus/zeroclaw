@@ -555,11 +555,8 @@ fn substitute_schema_placeholder(schema: &str, key: &str) -> String {
         .replace("{alias}", &ident)
 }
 
-/// Whether a per-agent memory build must be refused: the storage schema is
-/// multi-tenant (`{namespace}`/`{alias}` placeholder), no tenant namespace
-/// was given, and `require_namespace` forbids the agent-alias fallback.
-/// Fail-closed guard: the fallback silently routes the caller into one
-/// schema shared across tenants, which never surfaces as an error.
+/// True when the schema is multi-tenant, no namespace was given, and
+/// `require_namespace` forbids the agent-alias fallback (fail-closed).
 fn namespace_fallback_forbidden(
     pg: &zeroclaw_config::schema::PostgresStorageConfig,
     namespace: Option<&str>,

@@ -954,11 +954,8 @@ async fn resolve_memory_handle(
             )})),
         ));
     }
-    // Mirror the WS upgrade's tenant gate on the REST surface: with
-    // `[gateway].require_uuid_namespace` enabled, the effective schema key
-    // (namespace, else the agent alias fallback) must be a well-formed UUID.
-    // Without this, `/api/memory?agent=<alias>` with no namespace would
-    // CREATE SCHEMA cx_<alias> — one schema silently shared across tenants.
+    // Same tenant gate as the WS upgrade: without it, `agent` with no
+    // namespace would CREATE SCHEMA cx_<alias> — shared across tenants.
     if config.gateway.require_uuid_namespace {
         let schema_key = namespace.unwrap_or(alias);
         if uuid::Uuid::parse_str(schema_key).is_err() {
