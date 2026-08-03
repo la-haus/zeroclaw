@@ -10060,6 +10060,10 @@ pub struct PostgresStorageConfig {
     pub vector_enabled: bool,
     /// Vector dimensions for pgvector embeddings.
     pub vector_dimensions: usize,
+    /// Fail closed when `schema` is multi-tenant (`{namespace}`/`{alias}`):
+    /// refuse per-agent memory builds with no namespace instead of falling
+    /// back to the agent alias (one schema silently shared across tenants).
+    pub require_namespace: bool,
 }
 
 impl Default for PostgresStorageConfig {
@@ -10071,6 +10075,7 @@ impl Default for PostgresStorageConfig {
             connect_timeout_secs: None,
             vector_enabled: false,
             vector_dimensions: default_pgvector_dimensions(),
+            require_namespace: false,
         }
     }
 }

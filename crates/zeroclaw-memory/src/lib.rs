@@ -555,6 +555,31 @@ fn substitute_schema_placeholder(schema: &str, key: &str) -> String {
         .replace("{alias}", &ident)
 }
 
+/// True when the schema is multi-tenant, no namespace was given, and
+/// `require_namespace` forbids the agent-alias fallback (fail-closed).
+fn namespace_fallback_forbidden(
+    pg: &zeroclaw_config::schema::PostgresStorageConfig,
+    namespace: Option<&str>,
+) -> bool {
+    namespace.map(str::trim).filter(|s| !s.is_empty()).is_none()
+        && pg.require_namespace
+        && (pg.schema.contains("{namespace}") || pg.schema.contains("{alias}"))
+}
+
+/// True when the active storage forces an explicit tenant namespace:
+/// Postgres, multi-tenant schema template, and `require_namespace = true`.
+/// Gateways use it to reject namespace-less requests with a clear 400
+/// BEFORE the memory factory turns them into an opaque 500.
+pub fn tenant_namespace_required(config: &zeroclaw_config::schema::Config) -> bool {
+    match config.resolve_active_storage() {
+        zeroclaw_config::schema::ActiveStorage::Postgres(pg) => {
+            pg.require_namespace
+                && (pg.schema.contains("{namespace}") || pg.schema.contains("{alias}"))
+        }
+        _ => false,
+    }
+}
+
 /// Build the per-agent memory wrapper for `agent_alias`.
 ///
 /// Wraps the appropriate inner backend with `AgentScopedMemory` (for
@@ -636,6 +661,8 @@ pub async fn create_memory_for_agent_in_namespace(
     // identity (agent_id) — one schema, many agents. Falls back to the agent
     // alias, preserving one-alias-one-schema. One pod serves many tenants,
     // schema-isolated, with no per-tenant provisioning (Terraform or code).
+    // Blank namespaces are treated as missing (mirrors the gateways' trim).
+    let namespace = namespace.map(str::trim).filter(|s| !s.is_empty());
     let schema_key = namespace.unwrap_or(agent_alias);
     let active_storage = config.resolve_active_storage();
     let pg_scoped;
@@ -643,6 +670,16 @@ pub async fn create_memory_for_agent_in_namespace(
         zeroclaw_config::schema::ActiveStorage::Postgres(pg)
             if pg.schema.contains("{namespace}") || pg.schema.contains("{alias}") =>
         {
+            if namespace_fallback_forbidden(pg, namespace) {
+                anyhow::bail!(
+                    "multi-tenant storage schema {:?} requires an explicit tenant \
+                     namespace ([storage.postgres].require_namespace = true): refusing \
+                     the agent-alias fallback for agent {:?} — it would route this \
+                     turn's memory into a schema shared by every tenant",
+                    pg.schema,
+                    agent_alias
+                );
+            }
             let mut cloned = pg.clone();
             cloned.schema = substitute_schema_placeholder(&pg.schema, schema_key);
             pg_scoped = cloned;
@@ -748,6 +785,31 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::schema::EmbeddingRouteConfig;
+
+    #[test]
+    fn namespace_fallback_forbidden_gates_only_flagged_multi_tenant_schemas() {
+        let mut pg = zeroclaw_config::schema::PostgresStorageConfig {
+            schema: "cx_{namespace}".to_string(),
+            ..Default::default()
+        };
+
+        // Default (flag off) preserves the historical alias fallback.
+        assert!(!namespace_fallback_forbidden(&pg, None));
+
+        pg.require_namespace = true;
+        assert!(namespace_fallback_forbidden(&pg, None));
+        // Blank counts as missing — future callers may skip the trim.
+        assert!(namespace_fallback_forbidden(&pg, Some("  ")));
+        // An explicit namespace always passes.
+        assert!(!namespace_fallback_forbidden(
+            &pg,
+            Some("d8bf4a82-e9c5-491e-946f-1326ffa7f5e4")
+        ));
+
+        // Non-templated schema (single-tenant install) is never gated.
+        pg.schema = "zeroclaw".to_string();
+        assert!(!namespace_fallback_forbidden(&pg, None));
+    }
 
     #[test]
     fn sanitize_schema_ident_maps_uuid_to_snake() {

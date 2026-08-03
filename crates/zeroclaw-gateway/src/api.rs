@@ -954,6 +954,26 @@ async fn resolve_memory_handle(
             )})),
         ));
     }
+    // Same tenant gate as the WS upgrade (shared helper so they can't drift):
+    // without it, `agent` with no namespace would CREATE SCHEMA cx_<alias>.
+    if !crate::ws::uuid_namespace_gate_passes(
+        config.gateway.require_uuid_namespace,
+        namespace.unwrap_or(alias),
+    ) {
+        return Err(bad_request(
+            "Invalid tenant namespace — `[gateway].require_uuid_namespace` is enabled, \
+             so `namespace` (or `agent` when no namespace is given) must be a valid \
+             UUID; the agent-alias schema fallback is disabled",
+        ));
+    }
+    // Client mistake, not a server fault: refuse before the memory build so
+    // `require_namespace` surfaces as a 400 instead of the factory's 500.
+    if namespace.is_none() && zeroclaw_memory::tenant_namespace_required(&config) {
+        return Err(bad_request(
+            "Missing tenant namespace — the storage schema is multi-tenant and \
+             `[storage.postgres].require_namespace` is enabled, so `namespace` is required.",
+        ));
+    }
     let api_key = config
         .resolved_model_provider_for_agent(alias)
         .and_then(|(_, _, cfg)| cfg.api_key.clone());
