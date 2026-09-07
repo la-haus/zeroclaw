@@ -1234,15 +1234,9 @@ fn create_model_provider_inner(
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
 
-    // Resolve the effective endpoint URL once, up front — it drives BOTH the
-    // pre-flight below and the factory dispatch. Precedence: `api_url` parameter
-    // (operator-set base.uri), then `options.provider_api_url` (pre-resolved
-    // alias/family endpoint URI: a proxy like LiteLLM, or multi-endpoint
-    // families' `*Endpoint::uri()`). Routed/fallback providers pass
-    // `api_url = None` and carry their endpoint in `options.provider_api_url`
-    // (via `options_for_provider_ref`), so anything gating on "is a custom
-    // endpoint set?" MUST consult both — otherwise the pre-flight below wrongly
-    // rejects a proxy virtual key whose prefix doesn't match the wire family.
+    // Effective endpoint URL, shared by the pre-flight below and the factory
+    // dispatch. `api_url` (operator base.uri) first, then `options.provider_api_url`
+    // (alias uri; routed/fallback providers carry their endpoint here with url=None).
     let resolved_url: Option<&str> =
         api_url
             .map(str::trim)
@@ -1255,10 +1249,8 @@ fn create_model_provider_inner(
                     .filter(|v| !v.is_empty())
             });
 
-    // Pre-flight: catch obvious API-key / model_provider mismatches early.
-    // Skipped when a custom endpoint is configured (via `api_url` OR
-    // `options.provider_api_url`) — a proxy legitimately uses a key whose prefix
-    // doesn't match the wire family (e.g. a LiteLLM virtual key on `anthropic`).
+    // Pre-flight: catch obvious API-key / model_provider mismatches early. Skipped
+    // when a custom endpoint is set — a proxy may use a key of a different family.
     if let Some(key_value) = key {
         let is_custom =
             provider_kind.starts_with("custom:") || provider_kind.starts_with("anthropic-custom:");
@@ -3388,11 +3380,8 @@ mod tests {
 
     #[test]
     fn key_prefix_check_skipped_when_options_has_provider_api_url() {
-        // An openai-style key on the `anthropic` family would normally trip the
-        // pre-flight mismatch check, but a configured endpoint carried in
-        // `options.provider_api_url` (e.g. a LiteLLM proxy) must exempt it —
-        // exactly as an explicit `api_url` already does. Regression for the
-        // pre-flight ignoring `options.provider_api_url`.
+        // A custom endpoint in options.provider_api_url (e.g. a proxy) exempts the
+        // key-prefix check, same as an explicit api_url does.
         let options = ModelProviderRuntimeOptions {
             provider_api_url: Some("https://litellm.example/v1".into()),
             ..ModelProviderRuntimeOptions::default()
@@ -3408,9 +3397,7 @@ mod tests {
 
     #[test]
     fn key_prefix_check_still_fires_without_any_endpoint() {
-        // Guardrail preserved: an openai-style key on `anthropic` with NO
-        // endpoint override (neither `api_url` nor `options.provider_api_url`)
-        // must still fail fast with the mismatch error.
+        // Guardrail: a mismatched-prefix key with no endpoint anywhere still bails.
         let result = create_model_provider_with_options(
             "anthropic",
             Some("sk-proj-openai-style"),
@@ -3429,13 +3416,9 @@ mod tests {
 
     #[test]
     fn routed_non_primary_with_uri_skips_key_prefix_check() {
-        // Regression for the real incident: a routed (non-primary) provider
-        // whose alias has a configured `uri` (LiteLLM proxy) but a virtual key
-        // that "looks like openai" must NOT abort init. The routed loop passes
-        // `url = None` for non-primary refs and the endpoint travels in
-        // `options.provider_api_url` (resolved by `options_for_provider_ref`);
-        // before the fix the pre-flight ignored it and bailed with
-        // "API key prefix mismatch".
+        // Regression: a routed non-primary alias with a configured uri (endpoint in
+        // options.provider_api_url, url=None) and a mismatched-prefix key must not
+        // trip the pre-flight — the incident that broke agent init under LiteLLM.
         use zeroclaw_config::schema::{
             AnthropicModelProviderConfig, Config, ModelProviderConfig, ModelRouteConfig,
             ReliabilityConfig,
