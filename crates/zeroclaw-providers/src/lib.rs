@@ -1234,11 +1234,35 @@ fn create_model_provider_inner(
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
 
+    // Resolve the effective endpoint URL once, up front — it drives BOTH the
+    // pre-flight below and the factory dispatch. Precedence: `api_url` parameter
+    // (operator-set base.uri), then `options.provider_api_url` (pre-resolved
+    // alias/family endpoint URI: a proxy like LiteLLM, or multi-endpoint
+    // families' `*Endpoint::uri()`). Routed/fallback providers pass
+    // `api_url = None` and carry their endpoint in `options.provider_api_url`
+    // (via `options_for_provider_ref`), so anything gating on "is a custom
+    // endpoint set?" MUST consult both — otherwise the pre-flight below wrongly
+    // rejects a proxy virtual key whose prefix doesn't match the wire family.
+    let resolved_url: Option<&str> =
+        api_url
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                options
+                    .provider_api_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+            });
+
     // Pre-flight: catch obvious API-key / model_provider mismatches early.
+    // Skipped when a custom endpoint is configured (via `api_url` OR
+    // `options.provider_api_url`) — a proxy legitimately uses a key whose prefix
+    // doesn't match the wire family (e.g. a LiteLLM virtual key on `anthropic`).
     if let Some(key_value) = key {
         let is_custom =
             provider_kind.starts_with("custom:") || provider_kind.starts_with("anthropic-custom:");
-        let has_custom_url = api_url.map(str::trim).filter(|u| !u.is_empty()).is_some();
+        let has_custom_url = resolved_url.is_some();
         if !is_custom
             && !has_custom_url
             && let Some(likely_model_provider) = check_api_key_prefix(provider_kind, key_value)
@@ -1263,22 +1287,6 @@ fn create_model_provider_inner(
     // `api_url` operator override or fall back to the family's localhost
     // default. Codex variant routing is handled by `create_model_provider_with_options`
     // via `options.requires_openai_auth` before this function is called.
-
-    // Resolve the effective endpoint URL for the dispatch arms below.
-    // Precedence: `api_url` parameter (operator-set base.uri), then
-    // `options.provider_api_url` (pre-resolved family endpoint URI from the
-    // typed alias's `*Endpoint::uri()` for multi-endpoint families).
-    let resolved_url: Option<&str> =
-        api_url
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .or_else(|| {
-                options
-                    .provider_api_url
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-            });
 
     if legacy_kimi_code {
         let base_url = match resolved_url {
@@ -3376,6 +3384,115 @@ mod tests {
         // Keys without a recognisable prefix should never flag a mismatch.
         assert_eq!(check_api_key_prefix("openai", "my-custom-key-123"), None);
         assert_eq!(check_api_key_prefix("anthropic", "some-random-key"), None);
+    }
+
+    #[test]
+    fn key_prefix_check_skipped_when_options_has_provider_api_url() {
+        // An openai-style key on the `anthropic` family would normally trip the
+        // pre-flight mismatch check, but a configured endpoint carried in
+        // `options.provider_api_url` (e.g. a LiteLLM proxy) must exempt it —
+        // exactly as an explicit `api_url` already does. Regression for the
+        // pre-flight ignoring `options.provider_api_url`.
+        let options = ModelProviderRuntimeOptions {
+            provider_api_url: Some("https://litellm.example/v1".into()),
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let result =
+            create_model_provider_with_options("anthropic", Some("sk-proj-openai-style"), &options);
+        assert!(
+            result.is_ok(),
+            "options.provider_api_url should exempt the key-prefix pre-flight: {}",
+            result.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn key_prefix_check_still_fires_without_any_endpoint() {
+        // Guardrail preserved: an openai-style key on `anthropic` with NO
+        // endpoint override (neither `api_url` nor `options.provider_api_url`)
+        // must still fail fast with the mismatch error.
+        let result = create_model_provider_with_options(
+            "anthropic",
+            Some("sk-proj-openai-style"),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_err(),
+            "prefix mismatch without any custom endpoint should still bail"
+        );
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("API key prefix mismatch"),
+            "expected prefix-mismatch error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn routed_non_primary_with_uri_skips_key_prefix_check() {
+        // Regression for the real incident: a routed (non-primary) provider
+        // whose alias has a configured `uri` (LiteLLM proxy) but a virtual key
+        // that "looks like openai" must NOT abort init. The routed loop passes
+        // `url = None` for non-primary refs and the endpoint travels in
+        // `options.provider_api_url` (resolved by `options_for_provider_ref`);
+        // before the fix the pre-flight ignored it and bailed with
+        // "API key prefix mismatch".
+        use zeroclaw_config::schema::{
+            AnthropicModelProviderConfig, Config, ModelProviderConfig, ModelRouteConfig,
+            ReliabilityConfig,
+        };
+
+        let mut config = Config::default();
+        // Primary: normal Anthropic-style key.
+        config.providers.models.anthropic.insert(
+            "default".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-ant-api03-primary".into()),
+                    model: Some("claude-sonnet-4-6".into()),
+                    uri: Some("https://litellm.example/v1".into()),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        // Route target (non-primary): LiteLLM virtual key that looks like openai
+        // but points at the proxy via `uri`.
+        config.providers.models.anthropic.insert(
+            "fast".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-proj-litellm-virtual-key".into()),
+                    model: Some("claude-haiku-4-5".into()),
+                    uri: Some("https://litellm.example/v1".into()),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        let reliability = ReliabilityConfig::default();
+        let routes = [ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.fast".into(),
+            model: "claude-haiku-4-5".into(),
+            api_key: None,
+        }];
+        let options = provider_runtime_options_for_alias(&config, "anthropic", "default");
+
+        let result = create_routed_model_provider_with_options(
+            &config,
+            "anthropic.default",
+            None,
+            None,
+            &reliability,
+            &routes,
+            "claude-sonnet-4-6",
+            &options,
+        );
+        assert!(
+            result.is_ok(),
+            "routed non-primary anthropic alias with a configured uri must not trip the \
+             key-prefix pre-flight: {}",
+            result.err().map(|e| e.to_string()).unwrap_or_default()
+        );
     }
 
     #[test]
