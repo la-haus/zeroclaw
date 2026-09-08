@@ -60,6 +60,11 @@ ignore = [
     { id = "RUSTSEC-2026-0094", reason = "wasmtime Winch table.grow return value; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; tracking TBD" },
     { id = "RUSTSEC-2026-0095", reason = "wasmtime Winch aarch64 sandbox escape (critical); extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; Winch backend not used in production; tracking TBD" },
     { id = "RUSTSEC-2026-0096", reason = "wasmtime Cranelift aarch64 sandbox escape (critical); extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; default Cranelift backend on x86-64 unaffected; tracking TBD" },
+    # lru -- use-after-free unsoundness in LruCache::pop() when a stored key's
+    # Drop panics; fixed in lru 0.18.2. Tree has lru 0.16.4 via ratatui 0.30
+    # (ratatui-core requires ^0.16); 0.18.2 is semver-incompatible and blocked
+    # on a ratatui upgrade. Not exercised: our LruCache keys have no panicking Drop.
+    { id = "RUSTSEC-2026-0253", reason = "lru LruCache::pop() use-after-free on panicking key Drop; 0.16.4 via ratatui 0.30 (^0.16); 0.18.2 semver-incompatible; awaiting ratatui upgrade" },
 ]
 
 [licenses]
