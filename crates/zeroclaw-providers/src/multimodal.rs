@@ -826,8 +826,9 @@ async fn prepare_messages_inner(
             cache.as_deref_mut(),
         )
         .await;
+        let text_with_refs = append_image_url_refs(&cleaned_text, &normalized.loaded_refs);
         let content = compose_multimodal_content(
-            &cleaned_text,
+            &text_with_refs,
             &normalized.data_uris,
             normalized.skipped_count,
             refs.len(),
@@ -1193,7 +1194,34 @@ fn compose_multimodal_message(text: &str, data_uris: &[String]) -> String {
 
 struct NormalizedImageReferences {
     data_uris: Vec<String>,
+    /// Original references that produced a data URI, in `data_uris` order.
+    loaded_refs: Vec<String>,
     skipped_count: usize,
+}
+
+/// Preserve the original remote URLs of loaded images as text — mirrors what
+/// `compose_with_documents` does for documents — so the model can reference
+/// the file (forward it to a skill, store it as an attachment). Only http(s)
+/// references qualify: local paths and data URIs stay private.
+fn append_image_url_refs(text: &str, loaded_refs: &[String]) -> String {
+    let url_refs: Vec<String> = loaded_refs
+        .iter()
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+        .map(|url| format!("- Attached image: {url}"))
+        .collect();
+    if url_refs.is_empty() {
+        return text.to_string();
+    }
+
+    let mut content = String::new();
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+        content.push_str(trimmed);
+        content.push_str("\n\n");
+    }
+    content.push_str("Attachments:\n");
+    content.push_str(&url_refs.join("\n"));
+    content
 }
 
 /// Context attached to image-skip log events so callers can be identified.
@@ -1213,6 +1241,7 @@ async fn normalize_image_references(
     mut cache: Option<&mut LocalImageCache>,
 ) -> NormalizedImageReferences {
     let mut data_uris = Vec::with_capacity(refs.len());
+    let mut loaded_refs = Vec::with_capacity(refs.len());
     let mut skipped_count = 0usize;
 
     for reference in refs {
@@ -1225,7 +1254,10 @@ async fn normalize_image_references(
         )
         .await
         {
-            Ok(data_uri) => data_uris.push(data_uri),
+            Ok(data_uri) => {
+                data_uris.push(data_uri);
+                loaded_refs.push(reference.clone());
+            }
             Err(error) => {
                 skipped_count += 1;
                 let error_reason = multimodal_error_reason(&error);
@@ -1282,6 +1314,7 @@ async fn normalize_image_references(
 
     NormalizedImageReferences {
         data_uris,
+        loaded_refs,
         skipped_count,
     }
 }
@@ -2056,6 +2089,74 @@ mod ssrf_fetch_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_image_url_refs_keeps_only_remote_urls_as_text() {
+        let out = append_image_url_refs(
+            "Look",
+            &[
+                "https://cdn.example.com/photo.jpg".to_string(),
+                "/tmp/local.png".to_string(),
+                "data:image/png;base64,AAAA".to_string(),
+            ],
+        );
+        assert_eq!(
+            out,
+            "Look\n\nAttachments:\n- Attached image: https://cdn.example.com/photo.jpg"
+        );
+        assert_eq!(
+            append_image_url_refs("Look", &["/tmp/local.png".to_string()]),
+            "Look"
+        );
+        assert_eq!(
+            append_image_url_refs("", &["https://x.test/a.png".to_string()]),
+            "Attachments:\n- Attached image: https://x.test/a.png"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_remote_image_url_as_text() {
+        use axum::http::header;
+        use axum::routing::get;
+
+        let app = axum::Router::new().route(
+            "/photo.png",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "image/png")],
+                    vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let _server = zeroclaw_spawn::spawn!(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{addr}/photo.png");
+        let messages = vec![ChatMessage::user(format!("Mira [IMAGE:{url}]"))];
+        let config = MultimodalConfig {
+            allow_remote_fetch: true,
+            remote_fetch_allowed_hosts: vec!["127.0.0.1".to_string()],
+            ..Default::default()
+        };
+
+        let prepared = prepare_messages_for_provider(&messages, &config)
+            .await
+            .unwrap();
+
+        assert!(prepared.contains_images);
+        let (cleaned, refs) = parse_image_markers(&prepared.messages[0].content);
+        assert_eq!(
+            cleaned,
+            format!("Mira\n\nAttachments:\n- Attached image: {url}")
+        );
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].starts_with("data:image/png;base64,"));
+    }
 
     #[test]
     fn strip_media_markers_replaces_image_local_path() {
