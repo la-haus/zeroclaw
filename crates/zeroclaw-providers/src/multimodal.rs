@@ -904,11 +904,17 @@ async fn prepare_messages_inner(
 
 /// Index of the first message that is *not* older than `max_turns` user
 /// turns from the end of `messages`. Messages at index < cutoff are "too old".
-/// Mirrors the cutoff used by `trim_images_by_age`.
+///
+/// A "turn" is a real user message. Tool results that the runtime injects
+/// with role `user` (`[Tool results]…`, prompt/XML tool mode and the native
+/// fallback without `tool_call_id`) are NOT turns: counting them would age a
+/// document in the middle of the very turn that is processing it (first tool
+/// call → next provider call → document already "two turns old").
+/// Shared by the image and document age trims.
 fn history_age_cutoff(messages: &[ChatMessage], max_turns: usize) -> usize {
     let mut user_turn_count = 0usize;
     for (i, m) in messages.iter().enumerate().rev() {
-        if m.role == "user" {
+        if m.role == "user" && !is_prompt_tool_result_message(m) {
             user_turn_count += 1;
             if user_turn_count > max_turns {
                 return i + 1;
@@ -1178,19 +1184,8 @@ fn compose_with_documents(
 /// messages and strips them from all earlier ones.  Tool-result images are
 /// handled by the stale-tool-result mechanism and are left untouched.
 fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMessage> {
-    // Count user messages from the end to find the cutoff index.
-    let mut user_turn_count = 0usize;
-    let mut cutoff = 0usize; // messages at index < cutoff are "too old"
-    for (i, m) in messages.iter().enumerate().rev() {
-        if m.role == "user" {
-            user_turn_count += 1;
-            if user_turn_count > max_turns {
-                // Everything up to and including this index is too old.
-                cutoff = i + 1;
-                break;
-            }
-        }
-    }
+    // Messages at index < cutoff are "too old" (tool results are not turns).
+    let cutoff = history_age_cutoff(messages, max_turns);
 
     if cutoff == 0 {
         return messages.to_vec();
@@ -3452,6 +3447,62 @@ mod tests {
         assert!(old.contains("- Attached document: https://files.example.com/old.pdf"));
         assert!(old.contains("- Attached document (removed from history)"));
         assert_eq!(prepared.messages[2].content, "what is the name?");
+    }
+
+    #[tokio::test]
+    async fn tool_results_do_not_age_the_document_of_the_current_turn() {
+        // Prompt/XML tool mode: tool results come back as `user` messages.
+        // Within one turn: user+DOC → assistant(tool call) → "[Tool results]".
+        // The document must still be attached on the next provider call.
+        let temp = tempfile::tempdir().unwrap();
+        let pdf_path = temp.path().join("current.pdf");
+        std::fs::write(&pdf_path, b"%PDF-1.4 minimal").unwrap();
+
+        let messages = vec![
+            ChatMessage::user("hola"),
+            ChatMessage::assistant("¿en qué te ayudo?"),
+            ChatMessage::user(format!("brochure [DOCUMENT:{}]", pdf_path.display())),
+            ChatMessage::assistant("<tool_call>get_state</tool_call>"),
+            ChatMessage::user("[Tool results]\n<tool_result name=\"get_state\">ok</tool_result>"),
+        ];
+        let config = MultimodalConfig {
+            max_document_turns: 1,
+            ..Default::default()
+        };
+
+        let prepared = prepare_messages_for_provider(&messages, &config)
+            .await
+            .unwrap();
+
+        assert!(prepared.contains_documents);
+        let (_, doc_refs) = parse_document_markers(&prepared.messages[2].content);
+        assert_eq!(
+            doc_refs.len(),
+            1,
+            "the current turn's document stays attached"
+        );
+        assert!(doc_refs[0].starts_with("data:application/pdf;base64,"));
+        assert!(prepared.messages[4].content.starts_with("[Tool results]"));
+    }
+
+    #[test]
+    fn history_age_cutoff_counts_only_real_user_turns() {
+        let messages = vec![
+            ChatMessage::user("turn 1"),
+            ChatMessage::assistant("a"),
+            ChatMessage::user("turn 2"),
+            ChatMessage::assistant("<tool_call>x</tool_call>"),
+            ChatMessage::user("[Tool results]\nok"),
+            ChatMessage::assistant("<tool_call>y</tool_call>"),
+            ChatMessage::user("[Tool results]\nok"),
+        ];
+        // Keep 1 turn: "turn 1" (index 0) is the first too-old user message,
+        // so the cutoff lands right after it; the tool results never count.
+        assert_eq!(history_age_cutoff(&messages, 1), 1);
+        // Keep 2 turns: nothing is too old.
+        assert_eq!(history_age_cutoff(&messages, 2), 0);
+        // Keep 0 turns: even "turn 2" (index 2) is too old.
+        assert_eq!(history_age_cutoff(&messages, 0), 3);
     }
 
     #[tokio::test]
