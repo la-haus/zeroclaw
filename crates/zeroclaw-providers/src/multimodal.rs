@@ -902,9 +902,57 @@ async fn prepare_messages_inner(
     })
 }
 
+/// Index of the first message that is *not* older than `max_turns` user
+/// turns from the end of `messages`. Messages at index < cutoff are "too old".
+/// Mirrors the cutoff used by `trim_images_by_age`.
+fn history_age_cutoff(messages: &[ChatMessage], max_turns: usize) -> usize {
+    let mut user_turn_count = 0usize;
+    for (i, m) in messages.iter().enumerate().rev() {
+        if m.role == "user" {
+            user_turn_count += 1;
+            if user_turn_count > max_turns {
+                return i + 1;
+            }
+        }
+    }
+    0
+}
+
+/// Replace the `[DOCUMENT:]` markers of an old user message with plain-text
+/// references. The model keeps the original URLs (so it can still quote or
+/// store them) but the document bodies are not re-fetched nor re-attached.
+fn document_markers_as_text(content: &str) -> String {
+    let (cleaned, refs) = parse_document_markers(content);
+    let mut out = String::new();
+    let trimmed = cleaned.trim();
+    if !trimmed.is_empty() {
+        out.push_str(trimmed);
+        out.push_str("\n\n");
+    }
+    out.push_str(
+        "Attachments (from an earlier turn, already reviewed; content not re-attached):\n",
+    );
+    for reference in &refs {
+        if reference.starts_with("http://") || reference.starts_with("https://") {
+            out.push_str(&format!("- Attached document: {reference}\n"));
+        } else {
+            out.push_str("- Attached document (removed from history)\n");
+        }
+    }
+    out.trim_end().to_string()
+}
+
 /// Process `[DOCUMENT:]` markers in user messages. Returns the rewritten
 /// messages and whether any document was successfully attached. Image-typed
 /// "documents" are reclassified and routed through the image pipeline.
+///
+/// Two caps keep a long session from replaying every document on every turn:
+/// - `max_document_turns`: documents in user messages older than that many
+///   user turns are reduced to text references (never downloaded).
+/// - `max_document_payload_mb`: a per-request budget over the base64 payload
+///   of the documents that are attached. Messages are processed newest-first
+///   so the current turn's documents are allocated before older ones; what
+///   does not fit is reported in `Skipped attachments`.
 async fn apply_document_processing(
     messages: Vec<ChatMessage>,
     config: &MultimodalConfig,
@@ -917,17 +965,34 @@ async fn apply_document_processing(
         &config.remote_fetch_allowed_hosts,
     );
     let mut has_documents = false;
-    let mut out = Vec::with_capacity(messages.len());
+    let mut out = messages;
 
-    for message in messages {
-        if message.role != "user" {
-            out.push(message);
+    // Age trim: old user messages keep only text references to their documents.
+    let age_cutoff = if config.max_document_turns > 0 {
+        history_age_cutoff(&out, config.max_document_turns)
+    } else {
+        0
+    };
+    let mut age_trimmed_documents = 0usize;
+
+    // Payload budget (bytes of base64 data URIs), allocated newest-first.
+    let mut budget_remaining: Option<usize> = (config.max_document_payload_mb > 0)
+        .then(|| config.max_document_payload_mb.saturating_mul(1024 * 1024));
+    let mut budget_skipped_documents = 0usize;
+
+    for index in (0..out.len()).rev() {
+        if out[index].role != "user" {
             continue;
         }
 
-        let (text_after_docs, doc_refs) = parse_document_markers(&message.content);
+        let (text_after_docs, doc_refs) = parse_document_markers(&out[index].content);
         if doc_refs.is_empty() {
-            out.push(message);
+            continue;
+        }
+
+        if index < age_cutoff {
+            age_trimmed_documents += doc_refs.len();
+            out[index].content = document_markers_as_text(&out[index].content);
             continue;
         }
 
@@ -937,7 +1002,24 @@ async fn apply_document_processing(
 
         for reference in &doc_refs {
             match normalize_remote_document(reference, config, &remote_client).await {
-                Ok(data_uri) => normalized_doc_uris.push(data_uri),
+                Ok(data_uri) => {
+                    if let Some(remaining) = budget_remaining.as_mut() {
+                        if data_uri.len() > *remaining {
+                            budget_skipped_documents += 1;
+                            skipped.push(SkippedAttachment {
+                                url: reference.clone(),
+                                kind: "document",
+                                reason: format!(
+                                    "document payload budget exceeded ({} MiB per request)",
+                                    config.max_document_payload_mb
+                                ),
+                            });
+                            continue;
+                        }
+                        *remaining -= data_uri.len();
+                    }
+                    normalized_doc_uris.push(data_uri);
+                }
                 Err(error) => {
                     // Reclassify: a "document" with an image MIME type (e.g. a
                     // .webp marked type=document by the messaging platform) is
@@ -979,17 +1061,38 @@ async fn apply_document_processing(
             has_documents = true;
         }
 
-        let content = compose_with_documents(
+        out[index].content = compose_with_documents(
             &text_after_docs,
             &doc_refs,
             &reclassified_image_uris,
             &normalized_doc_uris,
             &skipped,
         );
-        out.push(ChatMessage {
-            role: message.role,
-            content,
-        });
+    }
+
+    if age_trimmed_documents > 0 {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "max_document_turns": config.max_document_turns,
+                    "documents_reduced_to_text": age_trimmed_documents,
+                })
+            ),
+            "multimodal: age-trimmed old documents from conversation history"
+        );
+    }
+    if budget_skipped_documents > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "max_document_payload_mb": config.max_document_payload_mb,
+                    "documents_skipped": budget_skipped_documents,
+                })),
+            "multimodal: document payload budget exceeded — skipped oldest documents"
+        );
     }
 
     (out, has_documents)
@@ -3314,6 +3417,142 @@ mod tests {
         let (_, doc_refs) = parse_document_markers(&prepared.messages[0].content);
         assert_eq!(doc_refs.len(), 1);
         assert!(doc_refs[0].starts_with("data:application/pdf;base64,"));
+    }
+
+    #[tokio::test]
+    async fn documents_older_than_max_document_turns_become_text_refs() {
+        let temp = tempfile::tempdir().unwrap();
+        let pdf_path = temp.path().join("old.pdf");
+        std::fs::write(&pdf_path, b"%PDF-1.4 minimal").unwrap();
+
+        let messages = vec![
+            ChatMessage::user(format!(
+                "brochure [DOCUMENT:{}] [DOCUMENT:https://files.example.com/old.pdf]",
+                pdf_path.display()
+            )),
+            ChatMessage::assistant("thanks"),
+            ChatMessage::user("what is the name?"),
+        ];
+        let config = MultimodalConfig {
+            max_document_turns: 1,
+            ..Default::default()
+        };
+
+        let prepared = prepare_messages_for_provider(&messages, &config)
+            .await
+            .unwrap();
+
+        assert!(!prepared.contains_documents);
+        let old = &prepared.messages[0].content;
+        assert!(
+            !old.contains("[DOCUMENT:"),
+            "old document must not be re-attached: {old}"
+        );
+        assert!(old.starts_with("brochure"));
+        assert!(old.contains("- Attached document: https://files.example.com/old.pdf"));
+        assert!(old.contains("- Attached document (removed from history)"));
+        assert_eq!(prepared.messages[2].content, "what is the name?");
+    }
+
+    #[tokio::test]
+    async fn max_document_turns_zero_replays_old_documents() {
+        let temp = tempfile::tempdir().unwrap();
+        let pdf_path = temp.path().join("old.pdf");
+        std::fs::write(&pdf_path, b"%PDF-1.4 minimal").unwrap();
+
+        let messages = vec![
+            ChatMessage::user(format!("brochure [DOCUMENT:{}]", pdf_path.display())),
+            ChatMessage::assistant("thanks"),
+            ChatMessage::user("what is the name?"),
+        ];
+        let config = MultimodalConfig {
+            max_document_turns: 0,
+            ..Default::default()
+        };
+
+        let prepared = prepare_messages_for_provider(&messages, &config)
+            .await
+            .unwrap();
+
+        assert!(prepared.contains_documents);
+        let (_, doc_refs) = parse_document_markers(&prepared.messages[0].content);
+        assert_eq!(doc_refs.len(), 1);
+        assert!(doc_refs[0].starts_with("data:application/pdf;base64,"));
+    }
+
+    #[tokio::test]
+    async fn document_payload_budget_keeps_newest_and_skips_oldest() {
+        let temp = tempfile::tempdir().unwrap();
+        // ~700 KiB each → ~933 KiB base64 each; only one fits in a 1 MiB budget.
+        let mut body = b"%PDF-1.4 ".to_vec();
+        body.resize(700 * 1024, b'x');
+        let old_pdf = temp.path().join("old.pdf");
+        let new_pdf = temp.path().join("new.pdf");
+        std::fs::write(&old_pdf, &body).unwrap();
+        std::fs::write(&new_pdf, &body).unwrap();
+
+        let messages = vec![
+            ChatMessage::user(format!("first [DOCUMENT:{}]", old_pdf.display())),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user(format!("second [DOCUMENT:{}]", new_pdf.display())),
+        ];
+        let config = MultimodalConfig {
+            max_document_turns: 0,
+            max_document_payload_mb: 1,
+            ..Default::default()
+        };
+
+        let prepared = prepare_messages_for_provider(&messages, &config)
+            .await
+            .unwrap();
+
+        assert!(prepared.contains_documents);
+        let (_, newest_refs) = parse_document_markers(&prepared.messages[2].content);
+        assert_eq!(
+            newest_refs.len(),
+            1,
+            "the current turn's document is attached"
+        );
+        let (_, oldest_refs) = parse_document_markers(&prepared.messages[0].content);
+        assert!(
+            oldest_refs.is_empty(),
+            "the oldest document is dropped first"
+        );
+        assert!(prepared.messages[0].content.contains("Skipped attachments"));
+        assert!(
+            prepared.messages[0]
+                .content
+                .contains("payload budget exceeded")
+        );
+    }
+
+    #[tokio::test]
+    async fn document_payload_budget_zero_is_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut body = b"%PDF-1.4 ".to_vec();
+        body.resize(700 * 1024, b'x');
+        let pdf_a = temp.path().join("a.pdf");
+        let pdf_b = temp.path().join("b.pdf");
+        std::fs::write(&pdf_a, &body).unwrap();
+        std::fs::write(&pdf_b, &body).unwrap();
+
+        let messages = vec![ChatMessage::user(format!(
+            "both [DOCUMENT:{}] [DOCUMENT:{}]",
+            pdf_a.display(),
+            pdf_b.display()
+        ))];
+        let config = MultimodalConfig {
+            max_document_payload_mb: 0,
+            ..Default::default()
+        };
+
+        let prepared = prepare_messages_for_provider(&messages, &config)
+            .await
+            .unwrap();
+
+        let (_, refs) = parse_document_markers(&prepared.messages[0].content);
+        assert_eq!(refs.len(), 2);
+        assert!(!prepared.messages[0].content.contains("Skipped attachments"));
     }
 
     // ── URL extraction from plain text ──────────────────────────
