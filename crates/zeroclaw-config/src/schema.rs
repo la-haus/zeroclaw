@@ -5844,6 +5844,36 @@ pub struct MultimodalConfig {
     /// only evicted by the `max_images` count cap.
     #[serde(default)]
     pub max_image_turns: usize,
+    /// Maximum age of documents in conversation turns.
+    ///
+    /// When non-zero, `[DOCUMENT:...]` markers in user messages that are more
+    /// than this many user turns back from the end of history are not
+    /// downloaded nor re-attached: the message keeps a plain-text reference
+    /// to each original URL instead. Without this, every document ever sent
+    /// in a session is re-fetched and re-encoded on every turn, and a couple
+    /// of large PDFs push the request past the provider's size limit.
+    ///
+    /// Tool results injected with role `user` (`[Tool results]…`) are not
+    /// counted as turns, so a document stays attached across the tool calls
+    /// of the turn that is processing it.
+    ///
+    /// `0` (the default, like `max_image_turns`) disables age-based trimming:
+    /// documents are replayed on every turn and only the payload budget
+    /// below bounds them. Opt in per deployment (e.g. `1`).
+    #[serde(default)]
+    pub max_document_turns: usize,
+    /// Budget, in MiB of base64 payload, for the documents attached to a
+    /// single provider request. Documents are allocated newest-first; when the
+    /// budget runs out, older documents are skipped with a note.
+    ///
+    /// Only documents count against it: images (`max_images` ×
+    /// `max_image_size_mb`) and text go into the same request, and the
+    /// provider's limit applies to the whole request (Anthropic: 32 MB), so
+    /// leave headroom for them. The default (24) leaves ~8 MB.
+    ///
+    /// `0` disables the budget.
+    #[serde(default = "default_multimodal_max_document_payload_mb")]
+    pub max_document_payload_mb: usize,
     /// Allow fetching remote image URLs (http/https). Disabled by default.
     #[serde(default)]
     pub allow_remote_fetch: bool,
@@ -5882,6 +5912,10 @@ fn default_multimodal_max_image_size_mb() -> usize {
     5
 }
 
+fn default_multimodal_max_document_payload_mb() -> usize {
+    24
+}
+
 impl MultimodalConfig {
     /// Clamp configured values to safe runtime bounds.
     pub fn effective_limits(&self) -> (usize, usize) {
@@ -5897,6 +5931,8 @@ impl Default for MultimodalConfig {
             max_images: default_multimodal_max_images(),
             max_image_size_mb: default_multimodal_max_image_size_mb(),
             max_image_turns: 0,
+            max_document_turns: 0,
+            max_document_payload_mb: default_multimodal_max_document_payload_mb(),
             allow_remote_fetch: false,
             remote_fetch_allowed_hosts: Vec::new(),
             vision_model_provider: None,
